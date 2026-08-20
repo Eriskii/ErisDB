@@ -1,0 +1,463 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>bezel · lists</title>
+<style>
+  :root {
+    --bg: #f6f5f2; --card: #ffffff; --ink: #1c1b19; --muted: #8a8578;
+    --line: #e5e2da; --accent: #7a5af5; --danger: #c94f3d; --ok: #3d8b5f;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #17161a; --card: #201f24; --ink: #e8e6e1; --muted: #918c80;
+      --line: #2e2d33; --accent: #9d85ff; --danger: #e07a68; --ok: #6cbf92;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 16px/1.5 system-ui, sans-serif;
+    display: flex; justify-content: center; padding: 2rem 1rem;
+  }
+  main { width: 100%; max-width: 38rem; }
+  h1 { font-size: 1.1rem; letter-spacing: .04em; display: flex; align-items: baseline; gap: .5rem; }
+  h1 .status { font-size: .75rem; color: var(--muted); font-weight: normal; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 1rem; margin-bottom: 1rem; }
+  input, textarea, button {
+    font: inherit; color: inherit; background: var(--bg);
+    border: 1px solid var(--line); border-radius: 8px; padding: .45rem .6rem;
+  }
+  input:focus, textarea:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+  button { cursor: pointer; }
+  button.primary { background: var(--accent); color: #fff; border-color: transparent; }
+  /* list chips */
+  .chips { display: flex; gap: .4rem; flex-wrap: wrap; }
+  .chip {
+    border: 1px solid var(--line); border-radius: 999px; padding: .2rem .75rem;
+    font-size: .85rem; background: var(--card); color: var(--muted);
+  }
+  .chip.active { background: var(--accent); color: #fff; border-color: transparent; }
+  .chip .n { opacity: .7; font-size: .75rem; margin-left: .3rem; }
+  /* add form */
+  form.add { display: flex; gap: .5rem; flex-wrap: wrap; }
+  #f-list { flex: 0 1 9rem; }
+  #f-name { flex: 1 1 12rem; }
+  /* entries */
+  ul { list-style: none; margin: 0; padding: 0; }
+  li.entry { border-bottom: 1px solid var(--line); }
+  li.entry:last-child { border-bottom: none; }
+  .row { display: flex; align-items: baseline; gap: .6rem; padding: .55rem .2rem; cursor: pointer; }
+  .row .nm { flex: 0 0 auto; }
+  .row .nm a { color: var(--accent); text-decoration: none; }
+  .row .nm a:hover { text-decoration: underline; }
+  .row .desc { flex: 1; color: var(--muted); font-size: .85rem;
+               white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .row .in { color: var(--muted); font-size: .75rem; white-space: nowrap; }
+  .attrs { display: flex; gap: .3rem; flex-wrap: wrap; padding: 0 .2rem .5rem; }
+  .attr { font-size: .72rem; border: 1px solid var(--line); border-radius: 6px;
+          padding: .05rem .4rem; color: var(--muted); }
+  .attr b { color: var(--ink); font-weight: 500; }
+  /* editor */
+  .editor { display: flex; flex-direction: column; gap: .5rem; padding: .3rem .2rem .8rem; }
+  .editor textarea { min-height: 4.5rem; resize: vertical; font-family: ui-monospace, monospace; font-size: .85rem; }
+  .editor .dates { font-size: .72rem; color: var(--muted); }
+  .editor .buttons { display: flex; gap: .5rem; }
+  .editor .buttons .spacer { flex: 1; }
+  button.danger { color: var(--danger); border-color: var(--danger); background: none; }
+  .hint { font-size: .72rem; color: var(--muted); }
+  details.settings summary { cursor: pointer; color: var(--muted); font-size: .85rem; }
+  details.settings .row-s { display: flex; flex-direction: column; gap: .5rem; margin-top: .7rem; }
+  .empty { color: var(--muted); text-align: center; padding: 1.5rem 0; }
+</style>
+</head>
+<body>
+<main>
+  <h1>bezel · lists <span class="status" id="status">offline</span></h1>
+
+  <div class="card"><div class="chips" id="chips"></div></div>
+
+  <div class="card">
+    <form class="add" id="addform">
+      <input id="f-list" placeholder="list" autocomplete="off" required>
+      <input id="f-name" placeholder="name" autocomplete="off" required>
+      <button class="primary">Add</button>
+    </form>
+  </div>
+
+  <div class="card"><ul id="entries"></ul><div class="empty" id="empty">nothing yet</div></div>
+
+  <div class="card">
+    <details class="settings" id="settings">
+      <summary>connection</summary>
+      <div class="row-s">
+        <input id="cfg-url" placeholder="core url, e.g. http://127.0.0.1:7700">
+        <input id="cfg-token" placeholder="capability token (bz1.…)" type="password">
+        <button id="cfg-save">Connect</button>
+      </div>
+    </details>
+  </div>
+</main>
+
+<script>
+"use strict";
+const FACET = "lists/v1";
+const CLIENT = "Lists (Web) v0.1"; // stamped into every write's source
+const LS = {
+  config: "bezel.lists.config",
+  items: "bezel.lists.items",
+  cursor: "bezel.lists.cursor",
+  selected: "bezel.lists.selected",
+};
+const load = (k, d) => JSON.parse(localStorage.getItem(k) ?? JSON.stringify(d));
+const save = (k, v) => localStorage.setItem(k, JSON.stringify(v));
+
+let config = load(LS.config, null);      // {url, token}
+let items = load(LS.items, {});          // id -> item (server shape)
+let cursor = load(LS.cursor, null);      // change-feed seq, client-held
+let selected = load(LS.selected, null);  // list name filter, null = all
+let editing = null;                      // id of the expanded entry
+
+// ---------------------------------------------------------------- core client
+
+async function api(method, path, body) {
+  const res = await fetch(config.url + path, {
+    method,
+    headers: {
+      "Authorization": "Bearer " + config.token,
+      "X-Bezel-Client": CLIENT,
+      ...(body !== undefined ? { "Content-Type": "application/json" } : {}),
+    },
+    body: body !== undefined ? JSON.stringify(body) : undefined,
+  });
+  if (res.status === 204) return { status: 204, body: null };
+  let json = null;
+  try { json = await res.json(); } catch {}
+  return { status: res.status, body: json };
+}
+
+// Register the lists facet; 409 means it already exists, 403 means a
+// narrower token — both fine. Timestamps live on the item envelope
+// (created_at / updated_at), so the body carries none.
+async function ensureFacet() {
+  await api("POST", "/v1/items", {
+    facet: "facet",
+    body: {
+      name: FACET,
+      strict: true,
+      schema: {
+        type: "object",
+        required: ["list", "name"],
+        properties: {
+          list: { type: "string", minLength: 1 },
+          name: { type: "string", minLength: 1 },
+          description: { type: "string" },
+          link: { type: "string" },
+          attributes: {
+            type: "object",
+            additionalProperties: {
+              anyOf: [
+                { type: ["string", "number", "boolean", "null"] },
+                { type: "array" },
+              ],
+            },
+          },
+        },
+        additionalProperties: false,
+      },
+    },
+  });
+}
+
+// ---------------------------------------------------------------- sync engine
+// Local cache first; the change feed (cursor held client-side) keeps it true.
+
+let syncing = false;
+async function sync() {
+  if (!config || syncing) return;
+  syncing = true;
+  try {
+    if (cursor === null) await seed();
+    const { status, body } = await api("GET",
+      `/v1/changes?since=${cursor}&facet=${encodeURIComponent(FACET)}&limit=500`);
+    if (status !== 200) throw new Error("changes " + status);
+    // Change rows carry the full snapshot: apply the feed directly,
+    // no per-item refetch.
+    for (const ch of body.changes) {
+      if (ch.op === "deleted") {
+        delete items[ch.item_id];
+      } else {
+        items[ch.item_id] = {
+          id: ch.item_id, facet: ch.facet, body: ch.body, revision: ch.revision,
+          created_at: items[ch.item_id]?.created_at ?? ch.at,
+          updated_at: ch.at, source: ch.source,
+        };
+      }
+    }
+    cursor = body.next;
+    persist();
+    setStatus("synced " + new Date().toLocaleTimeString());
+  } catch (e) {
+    setStatus("offline · cached");
+  } finally {
+    syncing = false;
+    render();
+  }
+}
+
+// First contact: bulk-load items, then start the cursor at the feed's head.
+async function seed() {
+  const r = await api("GET", `/v1/items?facet=${encodeURIComponent(FACET)}&limit=1000`);
+  if (r.status !== 200) throw new Error("seed " + r.status);
+  items = Object.fromEntries(r.body.items.map(i => [i.id, i]));
+  const feed = await api("GET", `/v1/changes?since=0&facet=${encodeURIComponent(FACET)}&limit=5000`);
+  cursor = feed.status === 200 ? feed.body.next : 0;
+  persist();
+}
+
+function persist() {
+  save(LS.items, items); save(LS.cursor, cursor); save(LS.selected, selected);
+}
+
+// ---------------------------------------------------------------- actions
+
+async function addEntry(list, name) {
+  const r = await api("POST", "/v1/items", { facet: FACET, body: { list, name } });
+  if (r.status === 201) { items[r.body.id] = r.body; persist(); render(); }
+  sync();
+}
+
+// Revision-checked write; on conflict, take the server's version and retry once.
+async function mutate(id, body, retried) {
+  const item = items[id];
+  if (!item) return;
+  const r = await api("PUT", "/v1/items/" + id, { body, revision: item.revision });
+  if (r.status === 200) { items[id] = r.body; persist(); render(); }
+  else if (r.status === 409 && !retried) {
+    const fresh = await api("GET", "/v1/items/" + id);
+    if (fresh.status === 200) { items[id] = fresh.body; await mutate(id, body, true); }
+  } else if (r.status === 422) {
+    setStatus("rejected: " + (r.body?.detail ?? "schema violation"));
+    return;
+  }
+  sync();
+}
+
+async function removeEntry(id) {
+  const r = await api("DELETE", "/v1/items/" + id);
+  if (r.status === 204 || r.status === 404) {
+    delete items[id];
+    if (editing === id) editing = null;
+    persist(); render();
+  }
+  sync();
+}
+
+// ---------------------------------------------------------------- attributes
+// Frontmatter-style text: one `key: value` per line. Values parse as JSON
+// where they can (numbers, booleans, null, arrays) and fall back to string.
+
+function attrsToText(attrs) {
+  return Object.entries(attrs ?? {})
+    .map(([k, v]) => `${k}: ${typeof v === "string" ? v : JSON.stringify(v)}`)
+    .join("\n");
+}
+
+function textToAttrs(text) {
+  const attrs = {};
+  for (const line of text.split("\n")) {
+    if (!line.trim()) continue;
+    const i = line.indexOf(":");
+    if (i < 1) throw new Error(`bad attribute line: ${line}`);
+    const key = line.slice(0, i).trim();
+    const raw = line.slice(i + 1).trim();
+    let value = raw;
+    try {
+      const parsed = JSON.parse(raw);
+      if (parsed === null || ["number", "boolean", "string"].includes(typeof parsed)
+          || Array.isArray(parsed)) value = parsed;
+    } catch {}
+    attrs[key] = value;
+  }
+  return attrs;
+}
+
+// ---------------------------------------------------------------- ui
+
+const $ = s => document.querySelector(s);
+function setStatus(s) { $("#status").textContent = s; }
+
+function listNames() {
+  const counts = {};
+  for (const item of Object.values(items)) {
+    counts[item.body.list] = (counts[item.body.list] ?? 0) + 1;
+  }
+  return counts;
+}
+
+function fmtDate(ts) { return new Date(ts).toLocaleString(); }
+
+function renderChips() {
+  const counts = listNames();
+  const names = Object.keys(counts).sort();
+  const chip = (label, value, count) => {
+    const b = document.createElement("button");
+    b.className = "chip" + (selected === value ? " active" : "");
+    b.textContent = label;
+    if (count !== undefined) {
+      const n = document.createElement("span");
+      n.className = "n"; n.textContent = count;
+      b.append(n);
+    }
+    b.onclick = () => { selected = value; editing = null; persist(); render(); };
+    return b;
+  };
+  const all = chip("all", null, Object.values(counts).reduce((a, b) => a + b, 0));
+  $("#chips").replaceChildren(all, ...names.map(n => chip(n, n, counts[n])));
+  // A vanished selection (last entry deleted) falls back to all.
+  if (selected !== null && !(selected in counts)) { selected = null; persist(); }
+  $("#f-list").value = selected ?? $("#f-list").value;
+}
+
+function renderEditor(item) {
+  const b = item.body;
+  const ed = document.createElement("div");
+  ed.className = "editor";
+
+  const desc = document.createElement("input");
+  desc.placeholder = "description"; desc.value = b.description ?? "";
+  const link = document.createElement("input");
+  link.placeholder = "link"; link.value = b.link ?? "";
+  const list = document.createElement("input");
+  list.placeholder = "list"; list.value = b.list;
+  const attrs = document.createElement("textarea");
+  attrs.placeholder = "attributes, one per line:  author: Susanna Clarke";
+  attrs.value = attrsToText(b.attributes);
+  const hint = document.createElement("div");
+  hint.className = "hint";
+  hint.textContent = "key: value · numbers, true/false, and [arrays] are typed; anything else is a string";
+
+  const dates = document.createElement("div");
+  dates.className = "dates";
+  const by = item.source
+    ? " by " + [item.source.user, item.source.client].filter(Boolean).join(" · ")
+    : "";
+  dates.textContent = `added ${fmtDate(item.created_at)} · modified ${fmtDate(item.updated_at)}${by}`;
+
+  const saveBtn = document.createElement("button");
+  saveBtn.className = "primary"; saveBtn.textContent = "Save";
+  saveBtn.onclick = () => {
+    let parsed;
+    try { parsed = textToAttrs(attrs.value); }
+    catch (e) { setStatus(e.message); return; }
+    const body = { list: list.value.trim(), name: b.name };
+    if (desc.value.trim()) body.description = desc.value.trim();
+    if (link.value.trim()) body.link = link.value.trim();
+    if (Object.keys(parsed).length) body.attributes = parsed;
+    editing = null;
+    mutate(item.id, body);
+  };
+  const del = document.createElement("button");
+  del.className = "danger"; del.textContent = "Delete";
+  del.onclick = () => removeEntry(item.id);
+  const spacer = document.createElement("span");
+  spacer.className = "spacer";
+  const buttons = document.createElement("div");
+  buttons.className = "buttons";
+  buttons.append(saveBtn, del, spacer);
+
+  ed.append(list, desc, link, attrs, hint, dates, buttons);
+  return ed;
+}
+
+function render() {
+  renderChips();
+  const shown = Object.values(items)
+    .filter(i => selected === null || i.body.list === selected)
+    .sort((a, b) => a.body.name.localeCompare(b.body.name));
+  $("#empty").style.display = shown.length ? "none" : "block";
+  $("#entries").replaceChildren(...shown.map(item => {
+    const b = item.body;
+    const li = document.createElement("li");
+    li.className = "entry";
+
+    const row = document.createElement("div");
+    row.className = "row";
+    const nm = document.createElement("span");
+    nm.className = "nm";
+    if (b.link) {
+      const a = document.createElement("a");
+      a.href = b.link; a.textContent = b.name;
+      a.target = "_blank"; a.rel = "noopener";
+      a.onclick = e => e.stopPropagation();
+      nm.append(a);
+    } else {
+      nm.textContent = b.name;
+    }
+    row.append(nm);
+    if (b.description) {
+      const d = document.createElement("span");
+      d.className = "desc"; d.textContent = b.description;
+      row.append(d);
+    }
+    if (selected === null) {
+      const inList = document.createElement("span");
+      inList.className = "in"; inList.textContent = b.list;
+      row.append(inList);
+    }
+    row.onclick = () => { editing = editing === item.id ? null : item.id; render(); };
+    li.append(row);
+
+    if (editing === item.id) {
+      li.append(renderEditor(item));
+    } else if (b.attributes && Object.keys(b.attributes).length) {
+      const bar = document.createElement("div");
+      bar.className = "attrs";
+      for (const [k, v] of Object.entries(b.attributes)) {
+        const chip = document.createElement("span");
+        chip.className = "attr";
+        const key = document.createElement("b");
+        key.textContent = k;
+        chip.append(key, " " + (typeof v === "string" ? v : JSON.stringify(v)));
+        bar.append(chip);
+      }
+      li.append(bar);
+    }
+    return li;
+  }));
+}
+
+$("#addform").onsubmit = e => {
+  e.preventDefault();
+  const list = $("#f-list").value.trim();
+  const name = $("#f-name").value.trim();
+  if (!list || !name || !config) return;
+  addEntry(list, name);
+  $("#f-name").value = "";
+};
+
+$("#cfg-save").onclick = async () => {
+  config = { url: $("#cfg-url").value.trim().replace(/\/$/, ""), token: $("#cfg-token").value.trim() };
+  save(LS.config, config);
+  items = {}; cursor = null; persist();
+  await ensureFacet();
+  sync();
+};
+
+// ---------------------------------------------------------------- boot
+
+if (config) {
+  $("#cfg-url").value = config.url; $("#cfg-token").value = config.token;
+} else {
+  $("#settings").open = true;
+}
+render();          // cache renders instantly, before any network
+sync();            // then the feed trues it up
+setInterval(sync, 10_000);
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible") sync();
+});
+</script>
+</body>
+</html>

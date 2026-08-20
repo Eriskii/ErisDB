@@ -1,0 +1,8 @@
+# One poke. The timer supplies the cadence.
+[Unit]
+Description=Poke the bezel tick endpoint
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/bezel/poker.env
+ExecStart=/usr/local/bin/poke.sh
