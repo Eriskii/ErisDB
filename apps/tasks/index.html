@@ -26,7 +26,7 @@
   h1 .status { font-size: .75rem; color: var(--muted); font-weight: normal; }
   .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 1rem; margin-bottom: 1rem; }
   form.add { display: flex; gap: .5rem; flex-wrap: wrap; }
-  input, button {
+  input, select, button {
     font: inherit; color: inherit; background: var(--bg);
     border: 1px solid var(--line); border-radius: 8px; padding: .45rem .6rem;
   }
@@ -60,6 +60,13 @@
     <form class="add" id="addform">
       <input id="title" placeholder="What needs doing?" autocomplete="off" required>
       <input id="due" type="datetime-local">
+      <select id="repeat" title="repeat">
+        <option value="">once</option>
+        <option value="day">daily</option>
+        <option value="week">weekly</option>
+        <option value="month">monthly</option>
+        <option value="year">yearly</option>
+      </select>
       <button class="primary">Add</button>
     </form>
   </div>
@@ -162,28 +169,42 @@ function expired() {
   $("#settings").open = true;
 }
 
-// Register the tasks facet; 409 means it already exists, 403 means a
-// narrower token — both fine.
-async function ensureFacet() {
-  await api("POST", "/v1/items", {
-    facet: "facet",
-    body: {
-      name: FACET,
-      strict: true,
-      schema: {
+// Register the tasks facet — or upgrade a registration that predates
+// `repeat`. 403 means a narrower token; fine either way.
+const FACET_BODY = {
+  name: FACET,
+  strict: true,
+  schema: {
+    type: "object",
+    required: ["title", "done"],
+    properties: {
+      title: { type: "string", minLength: 1 },
+      done: { type: "boolean" },
+      due: { type: "string", format: "date-time" },
+      notes: { type: "string" },
+      repeat: {
         type: "object",
-        required: ["title", "done"],
+        required: ["n", "unit"],
         properties: {
-          title: { type: "string", minLength: 1 },
-          done: { type: "boolean" },
-          due: { type: "string", format: "date-time" },
-          notes: { type: "string" },
+          n: { type: "integer", minimum: 1 },
+          unit: { enum: ["day", "week", "month", "year"] },
         },
         additionalProperties: false,
       },
-      lapse: { due: "due", done: "done" },
     },
-  });
+    additionalProperties: false,
+  },
+  lapse: { due: "due", done: "done" },
+};
+
+async function ensureFacet() {
+  const r = await api("POST", "/v1/items", { facet: "facet", body: FACET_BODY });
+  if (r.status !== 409) return;
+  const facets = await api("GET", "/v1/items?facet=facet&limit=1000");
+  if (facets.status !== 200) return;
+  const reg = facets.body.items.find(i => i.body.name === FACET);
+  if (!reg || reg.body.schema?.properties?.repeat) return;
+  await api("PUT", "/v1/items/" + reg.id, { body: FACET_BODY, revision: reg.revision });
 }
 
 // ---------------------------------------------------------------- sync engine
@@ -360,10 +381,47 @@ function localDueCheck() {
   }
 }
 
+// ---------------------------------------------------------------- recurrence
+// A repeating task never goes done: completing it advances `due` by
+// n×unit until it lands in the future. Month/year steps clamp to the end
+// of shorter months.
+
+function stepDate(d, n, unit) {
+  const next = new Date(d);
+  if (unit === "day") next.setDate(next.getDate() + n);
+  else if (unit === "week") next.setDate(next.getDate() + 7 * n);
+  else {
+    const day = next.getDate();
+    next.setDate(1);
+    next.setMonth(next.getMonth() + (unit === "month" ? n : 12 * n));
+    const last = new Date(next.getFullYear(), next.getMonth() + 1, 0).getDate();
+    next.setDate(Math.min(day, last));
+  }
+  return next;
+}
+
+function advance(dueIso, n, unit, now = new Date()) {
+  let d = stepDate(new Date(dueIso), n, unit);
+  while (d <= now) d = stepDate(d, n, unit);
+  return d.toISOString();
+}
+
+/** The change a "complete" click applies, recurrence-aware. */
+function completion(t, checked) {
+  if (checked && t.repeat && t.due) {
+    return { due: advance(t.due, t.repeat.n, t.repeat.unit), done: false };
+  }
+  return { done: checked };
+}
+
+function fmtRepeat(rep) {
+  return "↻ every " + (rep.n === 1 ? rep.unit : `${rep.n} ${rep.unit}s`);
+}
+
 // ---------------------------------------------------------------- actions
 
-async function addTask(title, due) {
-  const body = { title, done: false, ...(due ? { due } : {}) };
+async function addTask(title, due, repeat) {
+  const body = { title, done: false, ...(due ? { due } : {}), ...(repeat ? { repeat } : {}) };
   const r = await api("POST", "/v1/items", { facet: FACET, body });
   if (r.status === 201) { items[r.body.id] = r.body; persist(); render(); }
   sync();
@@ -419,10 +477,16 @@ function render() {
     li.className = "task" + (t.done ? " done" : "");
     const box = document.createElement("input");
     box.type = "checkbox"; box.checked = t.done;
-    box.onchange = () => mutate(item.id, { done: box.checked });
+    box.onchange = () => mutate(item.id, completion(t, box.checked));
     const span = document.createElement("span");
     span.className = "t"; span.textContent = t.title;
     li.append(box, span);
+    if (t.repeat) {
+      const rep = document.createElement("span");
+      rep.className = "due";
+      rep.textContent = fmtRepeat(t.repeat);
+      li.append(rep);
+    }
     if (t.due) {
       const due = document.createElement("span");
       const overdue = !t.done && new Date(t.due) <= new Date();
@@ -443,8 +507,12 @@ $("#addform").onsubmit = e => {
   const title = $("#title").value.trim();
   if (!title || !config) return;
   const dueRaw = $("#due").value;
-  addTask(title, dueRaw ? new Date(dueRaw).toISOString() : null);
-  $("#title").value = ""; $("#due").value = "";
+  const unit = $("#repeat").value;
+  // A repeat without a due has nothing to advance from: default to now.
+  const due = dueRaw ? new Date(dueRaw).toISOString()
+    : unit ? new Date().toISOString() : null;
+  addTask(title, due, unit ? { n: 1, unit } : null);
+  $("#title").value = ""; $("#due").value = ""; $("#repeat").value = "";
 };
 
 $("#cfg-save").onclick = async () => {
