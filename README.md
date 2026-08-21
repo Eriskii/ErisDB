@@ -19,7 +19,9 @@ The personal server, in three pieces that match the architecture:
   Android.
 - **`apps/lists-android/`** — the lists client as an Android app over
   `bezel-client`: no IP, no port, just the server's iroh endpoint id and
-  a token. See its README.
+  a token. Lives in its own repo
+  ([Isolyth/bezel-lists-android](https://github.com/Isolyth/bezel-lists-android)),
+  cloned here and gitignored; see its README.
 
 ## Wiring it up
 

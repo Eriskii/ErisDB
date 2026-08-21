@@ -1,2 +1,3 @@
 target/
+# its own repo, not part of this one: https://github.com/Isolyth/bezel-lists-android
 apps/lists-android/
