@@ -1,0 +1,21 @@
+[package]
+name = "bezel-mcp"
+version = "0.1.0"
+edition = "2021"
+description = "A bezel client speaking MCP over stdio: the core's API as tools."
+
+[dependencies]
+anyhow = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rmcp = { version = "3.1.4", features = ["server", "transport-io", "macros"] }
+schemars = "1.2.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+
+[dev-dependencies]
+axum = { version = "0.8", features = ["json"] }
+bezel = { path = "../bezel" }
+sqlx = { version = "0.9", features = ["runtime-tokio", "tls-rustls", "postgres", "migrate"] }
+testcontainers-modules = { version = "0.15", features = ["postgres"] }
+tokio = { version = "1", features = ["full"] }

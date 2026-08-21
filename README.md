@@ -17,6 +17,9 @@ The personal server, in three pieces that match the architecture:
 - **`bezel-client/`** — a Rust client that dials a bezel over Iroh by
   endpoint id; async core, blocking facade for FFI, JNI bindings for
   Android.
+- **`bezel-mcp/`** — the core's API as MCP tools over stdio, for wiring a
+  bezel into Claude and friends: read, search, write, delete, history,
+  revert, the change feed, and token minting. See its README.
 - **`apps/lists-android/`** — the lists client as an Android app over
   `bezel-client`: no IP, no port, just the server's iroh endpoint id and
   a token. Lives in its own repo
