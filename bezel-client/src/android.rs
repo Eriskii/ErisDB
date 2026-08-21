@@ -1,5 +1,6 @@
-//! JNI surface for the Android lists app. Thin by design: strings in,
-//! JSON strings out, all real work in [`crate::blocking`].
+//! JNI surface for Android apps, bound to `dev.bezel.client.Bezel` so any
+//! app can load it. Thin by design: strings in, JSON strings out, all real
+//! work in [`crate::blocking`].
 
 use jni::objects::{JClass, JString};
 use jni::sys::{jlong, jstring};
@@ -16,7 +17,7 @@ fn out(env: &JNIEnv, s: &str) -> jstring {
 /// Connect (or reconnect) the process-wide client.
 /// Returns "" on success, an error message otherwise.
 #[no_mangle]
-pub extern "system" fn Java_com_example_bezellists_Bezel_nativeConfigure(
+pub extern "system" fn Java_dev_bezel_client_Bezel_nativeConfigure(
     mut env: JNIEnv,
     _class: JClass,
     server: JString,
@@ -39,7 +40,7 @@ pub extern "system" fn Java_com_example_bezellists_Bezel_nativeConfigure(
 
 /// One API call; returns the blocking facade's JSON envelope.
 #[no_mangle]
-pub extern "system" fn Java_com_example_bezellists_Bezel_nativeRequest(
+pub extern "system" fn Java_dev_bezel_client_Bezel_nativeRequest(
     mut env: JNIEnv,
     _class: JClass,
     method: JString,
@@ -57,7 +58,7 @@ pub extern "system" fn Java_com_example_bezellists_Bezel_nativeRequest(
 /// expiry; returns the blocking facade's JSON envelope. The app persists
 /// the returned token itself.
 #[no_mangle]
-pub extern "system" fn Java_com_example_bezellists_Bezel_nativeRefreshCapability(
+pub extern "system" fn Java_dev_bezel_client_Bezel_nativeRefreshCapability(
     env: JNIEnv,
     _class: JClass,
     ttl_secs: jlong,
@@ -69,7 +70,7 @@ pub extern "system" fn Java_com_example_bezellists_Bezel_nativeRefreshCapability
 /// Open a change-feed subscription from `since`; `facet` may be null for
 /// the whole feed. Returns the handle, or 0 on failure.
 #[no_mangle]
-pub extern "system" fn Java_com_example_bezellists_Bezel_nativeSubscribeChanges(
+pub extern "system" fn Java_dev_bezel_client_Bezel_nativeSubscribeChanges(
     mut env: JNIEnv,
     _class: JClass,
     since: jlong,
@@ -83,7 +84,7 @@ pub extern "system" fn Java_com_example_bezellists_Bezel_nativeSubscribeChanges(
 /// facade's JSON envelope. Call it from a background thread in a loop,
 /// remembering each change's `seq` as the resume cursor.
 #[no_mangle]
-pub extern "system" fn Java_com_example_bezellists_Bezel_nativeNextChange(
+pub extern "system" fn Java_dev_bezel_client_Bezel_nativeNextChange(
     env: JNIEnv,
     _class: JClass,
     handle: jlong,
@@ -95,7 +96,7 @@ pub extern "system" fn Java_com_example_bezellists_Bezel_nativeNextChange(
 
 /// Close a subscription and its stream.
 #[no_mangle]
-pub extern "system" fn Java_com_example_bezellists_Bezel_nativeCloseSubscription(
+pub extern "system" fn Java_dev_bezel_client_Bezel_nativeCloseSubscription(
     _env: JNIEnv,
     _class: JClass,
     handle: jlong,
