@@ -249,7 +249,7 @@ impl BezelMcp {
         Self::result(Ok((200, json!({ "items": hits }))))
     }
 
-    #[tool(description = "Create an item in a facet. To register a NEW facet, create an item in the meta-facet \"facet\" with body {name, strict, schema?}.")]
+    #[tool(description = "Create an item in a facet. To register a NEW facet, create an item in the meta-facet \"facet\" with body {name, strict, schema?} — but check list_facets first and reuse an existing facet when one fits; never register a duplicate or near-duplicate.")]
     async fn create_item(&self, Parameters(p): Parameters<CreateItem>) -> Result<CallToolResult, McpError> {
         let body = json!({ "facet": p.facet, "body": p.body });
         Self::result(self.call(reqwest::Method::POST, "/v1/items", &[], Some(&body)).await)
