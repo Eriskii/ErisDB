@@ -2,7 +2,7 @@
 //! JSON strings out, all real work in [`crate::blocking`].
 
 use jni::objects::{JClass, JString};
-use jni::sys::jstring;
+use jni::sys::{jlong, jstring};
 use jni::JNIEnv;
 
 fn jstr(env: &mut JNIEnv, s: &JString) -> String {
@@ -51,6 +51,56 @@ pub extern "system" fn Java_com_example_bezellists_Bezel_nativeRequest(
     let body = if body.is_null() { None } else { Some(jstr(&mut env, &body)) };
     let response = crate::blocking::request(&method, &path, body.as_deref());
     out(&env, &response)
+}
+
+/// Trade the current token for one with the same scope and a fresh
+/// expiry; returns the blocking facade's JSON envelope. The app persists
+/// the returned token itself.
+#[no_mangle]
+pub extern "system" fn Java_com_example_bezellists_Bezel_nativeRefreshCapability(
+    env: JNIEnv,
+    _class: JClass,
+    ttl_secs: jlong,
+) -> jstring {
+    let response = crate::blocking::refresh_capability(ttl_secs);
+    out(&env, &response)
+}
+
+/// Open a change-feed subscription from `since`; `facet` may be null for
+/// the whole feed. Returns the handle, or 0 on failure.
+#[no_mangle]
+pub extern "system" fn Java_com_example_bezellists_Bezel_nativeSubscribeChanges(
+    mut env: JNIEnv,
+    _class: JClass,
+    since: jlong,
+    facet: JString,
+) -> jlong {
+    let facet = if facet.is_null() { None } else { Some(jstr(&mut env, &facet)) };
+    crate::blocking::subscribe_changes(since, facet.as_deref()).unwrap_or(0) as jlong
+}
+
+/// Block up to `timeout_ms` for the next change; returns the blocking
+/// facade's JSON envelope. Call it from a background thread in a loop,
+/// remembering each change's `seq` as the resume cursor.
+#[no_mangle]
+pub extern "system" fn Java_com_example_bezellists_Bezel_nativeNextChange(
+    env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    timeout_ms: jlong,
+) -> jstring {
+    let response = crate::blocking::next_change(handle as u64, timeout_ms.max(0) as u64);
+    out(&env, &response)
+}
+
+/// Close a subscription and its stream.
+#[no_mangle]
+pub extern "system" fn Java_com_example_bezellists_Bezel_nativeCloseSubscription(
+    _env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+) {
+    crate::blocking::close_subscription(handle as u64);
 }
 
 fn decode_hex(s: &str) -> Option<Vec<u8>> {
