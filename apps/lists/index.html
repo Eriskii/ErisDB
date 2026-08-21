@@ -112,6 +112,7 @@ const LS = {
 };
 const load = (k, d) => JSON.parse(localStorage.getItem(k) ?? JSON.stringify(d));
 const save = (k, v) => localStorage.setItem(k, JSON.stringify(v));
+const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 let config = load(LS.config, null);      // {url, token}
 let items = load(LS.items, {});          // id -> item (server shape)
@@ -135,6 +136,52 @@ async function api(method, path, body) {
   let json = null;
   try { json = await res.json(); } catch {}
   return { status: res.status, body: json };
+}
+
+// ---------------------------------------------------------------- capability
+// A token is `bz1.<b64url(payload)>.<b64url(sig)>` and the payload is JSON
+// carrying an optional `exp` in unix seconds. The client reads exp to know
+// when to refresh; the signature is the core's business, and the token
+// goes nowhere but the API.
+
+function tokenExp(token) {
+  try {
+    const b64 = token.split(".")[1].replace(/-/g, "+").replace(/_/g, "/");
+    const exp = JSON.parse(atob(b64)).exp;
+    return typeof exp === "number" ? exp : null;   // null: never expires
+  } catch { return null; }
+}
+
+// Trade a still-valid token for one with the same scope and the same
+// lifetime the admin chose. Past the half-life, sync() calls this; one
+// refresh is in flight at a time and a failure simply waits for the next
+// sync. The open stream keeps its old, still-valid token and picks the
+// fresh one up when it reconnects.
+let refreshing = false;
+async function refreshToken() {
+  if (refreshing || !config?.ttl) return;
+  const exp = tokenExp(config.token);
+  if (exp === null || exp - Date.now() / 1000 >= config.ttl / 2) return;
+  refreshing = true;
+  try {
+    const r = await api("POST", "/v1/capabilities/refresh", { ttl_secs: config.ttl });
+    if (r.status === 201) {
+      config = { ...config, token: r.body.token };   // fresh exp rides in the token
+      save(LS.config, config);
+      $("#cfg-token").value = config.token;
+    } else if (r.status === 401) {
+      expired();
+    }
+  } catch (e) {
+  } finally {
+    refreshing = false;
+  }
+}
+
+// Refresh keeps a session alive; it cannot resurrect one.
+function expired() {
+  setStatus("token expired · paste a new one");
+  $("#settings").open = true;
 }
 
 // Register the lists facet; 409 means it already exists, 403 means a
@@ -173,31 +220,37 @@ async function ensureFacet() {
 // ---------------------------------------------------------------- sync engine
 // Local cache first; the change feed (cursor held client-side) keeps it true.
 
+// One change row applied to the cache. The cursor poll and the live
+// stream both land here — the feed is the only way items change.
+// Change rows carry the full snapshot: apply the feed directly, no
+// per-item refetch.
+function applyChange(ch) {
+  if (ch.op === "deleted") {
+    delete items[ch.item_id];
+  } else {
+    items[ch.item_id] = {
+      id: ch.item_id, facet: ch.facet, body: ch.body, revision: ch.revision,
+      created_at: items[ch.item_id]?.created_at ?? ch.at,
+      updated_at: ch.at, source: ch.source,
+    };
+  }
+}
+
 let syncing = false;
 async function sync() {
   if (!config || syncing) return;
   syncing = true;
   try {
+    await refreshToken();
     if (cursor === null) await seed();
     const { status, body } = await api("GET",
       `/v1/changes?since=${cursor}&facet=${encodeURIComponent(FACET)}&limit=500`);
+    if (status === 401) { expired(); return; }
     if (status !== 200) throw new Error("changes " + status);
-    // Change rows carry the full snapshot: apply the feed directly,
-    // no per-item refetch.
-    for (const ch of body.changes) {
-      if (ch.op === "deleted") {
-        delete items[ch.item_id];
-      } else {
-        items[ch.item_id] = {
-          id: ch.item_id, facet: ch.facet, body: ch.body, revision: ch.revision,
-          created_at: items[ch.item_id]?.created_at ?? ch.at,
-          updated_at: ch.at, source: ch.source,
-        };
-      }
-    }
-    cursor = body.next;
+    for (const ch of body.changes) applyChange(ch);
+    cursor = Math.max(cursor, body.next);   // the stream may be ahead
     persist();
-    setStatus("synced " + new Date().toLocaleTimeString());
+    setStatus((streamLive ? "live · " : "synced ") + new Date().toLocaleTimeString());
   } catch (e) {
     setStatus("offline · cached");
   } finally {
@@ -218,6 +271,89 @@ async function seed() {
 
 function persist() {
   save(LS.items, items); save(LS.cursor, cursor); save(LS.selected, selected);
+}
+
+// ---------------------------------------------------------------- live stream
+// GET /v1/changes/stream is SSE, woken by Postgres NOTIFY. The capability
+// rides an Authorization header, which EventSource cannot set, so the
+// stream is read off fetch's ReadableStream instead. The cursor stays
+// client-held: every connection opens at ?since=<cursor>, so a drop costs
+// nothing but a reconnect.
+
+let streamLive = false;
+let streamAbort = null;
+
+async function stream() {
+  const ctl = new AbortController();
+  streamAbort = ctl;
+  let connected = false;
+  try {
+    const res = await fetch(config.url +
+      `/v1/changes/stream?since=${cursor}&facet=${encodeURIComponent(FACET)}`, {
+      headers: { "Authorization": "Bearer " + config.token, "X-Bezel-Client": CLIENT },
+      signal: ctl.signal,
+    });
+    if (!res.ok || !res.body) throw new Error("stream " + res.status);
+    connected = true;
+    streamLive = true;
+    setStatus("live");
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = "";
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true }).replace(/\r\n/g, "\n");
+      // Frames are blank-line separated; keep-alive comments parse to nothing.
+      let i;
+      while ((i = buf.indexOf("\n\n")) >= 0) {
+        applyFrame(buf.slice(0, i));
+        buf = buf.slice(i + 2);
+      }
+    }
+  } catch (e) {
+    setStatus("stream lost · polling");
+  } finally {
+    streamLive = false;
+    streamAbort = null;
+  }
+  return connected;
+}
+
+function applyFrame(frame) {
+  let event = "message", data = "";
+  for (const line of frame.split("\n")) {
+    if (line.startsWith("event:")) event = line.slice(6).trim();
+    else if (line.startsWith("data:")) data += line.slice(5).replace(/^ /, "");
+  }
+  if (event !== "change" || !data) return;
+  const ch = JSON.parse(data);
+  applyChange(ch);
+  if (ch.seq > cursor) cursor = ch.seq;
+  persist();
+  render();
+  setStatus("live · " + new Date().toLocaleTimeString());
+}
+
+// Catch up on the cursor, then hold a stream open; on any drop, catch up
+// again and reconnect with backoff. One loop at a time — a reconfigure
+// aborts the open stream and the same loop picks the new config up.
+let streaming = false;
+async function streamLoop() {
+  if (streaming) return;
+  streaming = true;
+  let backoff = 1000;
+  try {
+    while (config) {
+      await sync();
+      if (cursor !== null && await stream()) backoff = 1000;
+      if (!config) break;
+      await sleep(backoff);
+      backoff = Math.min(backoff * 2, 30_000);
+    }
+  } finally {
+    streaming = false;
+  }
 }
 
 // ---------------------------------------------------------------- actions
@@ -438,11 +574,20 @@ $("#addform").onsubmit = e => {
 };
 
 $("#cfg-save").onclick = async () => {
-  config = { url: $("#cfg-url").value.trim().replace(/\/$/, ""), token: $("#cfg-token").value.trim() };
+  const token = $("#cfg-token").value.trim();
+  // The token's remaining life is the lifetime to keep renewing at; a
+  // token without an exp never expires, so it never refreshes.
+  const exp = tokenExp(token);
+  config = {
+    url: $("#cfg-url").value.trim().replace(/\/$/, ""),
+    token,
+    ttl: exp === null ? null : Math.max(1, Math.round(exp - Date.now() / 1000)),
+  };
   save(LS.config, config);
   items = {}; cursor = null; persist();
   await ensureFacet();
-  sync();
+  streamAbort?.abort();   // the loop reconnects against the new config
+  streamLoop();
 };
 
 // ---------------------------------------------------------------- boot
@@ -453,8 +598,12 @@ if (config) {
   $("#settings").open = true;
 }
 render();          // cache renders instantly, before any network
-sync();            // then the feed trues it up
-setInterval(sync, 10_000);
+streamLoop();      // then the feed trues it up: catch-up poll, then live
+// The stream is an optimization; the cursor poll is the source of
+// correctness, so it keeps running — every beat while the stream is down,
+// every minute while it holds.
+let beats = 0;
+setInterval(() => { if (!streamLive || ++beats % 6 === 0) sync(); }, 10_000);
 document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "visible") sync();
 });
