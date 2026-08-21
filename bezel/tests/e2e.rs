@@ -792,6 +792,55 @@ async fn minting_is_delegated_and_bounded() {
 }
 
 #[tokio::test]
+async fn refresh_extends_expiry_without_touching_scope() {
+    let (url, root, _pool) = setup().await;
+    let admin = Client::new(&url, &root);
+    register_tasks_facet(&admin).await;
+
+    // A plain, non-admin app token near the end of its life.
+    let old = bezel::auth::mint(SECRET, &["tasks/v1"], &["read", "write"], Some(30), Some("alice")).unwrap();
+    let old_cap = bezel::auth::verify(SECRET, &old).unwrap();
+    let app = Client::new(&url, &old);
+
+    // Any valid token can refresh itself — no admin verb required.
+    let (status, body) = app.post("/v1/capabilities/refresh", json!({"ttl_secs": 600})).await;
+    assert_eq!(status, 201, "{body}");
+    let fresh = body["token"].as_str().unwrap();
+
+    // Same scope, same signed user, later expiry. Nothing widens, nothing
+    // narrows: refresh moves time, not privilege.
+    let cap = bezel::auth::verify(SECRET, fresh).unwrap();
+    assert_eq!(cap.facets, old_cap.facets);
+    assert_eq!(cap.verbs, old_cap.verbs);
+    assert_eq!(cap.user, old_cap.user);
+    assert!(cap.exp.unwrap() > old_cap.exp.unwrap());
+
+    // The fresh token works, and carries the same limits.
+    let c = Client::new(&url, fresh);
+    let (status, _) = c
+        .post("/v1/items", json!({"facet": "tasks/v1", "body": {"title": "via fresh", "done": false}}))
+        .await;
+    assert_eq!(status, 201);
+    let (status, _) = c.post("/v1/capabilities", json!({"facets": ["tasks/v1"], "verbs": ["read"]})).await;
+    assert_eq!(status, 403); // still no admin
+
+    // An expired token is dead for refresh too: refresh keeps sessions
+    // alive, it does not resurrect them.
+    let expired = bezel::auth::mint(SECRET, &["tasks/v1"], &["read"], Some(-10), None).unwrap();
+    let e = Client::new(&url, &expired);
+    let (status, _) = e.post("/v1/capabilities/refresh", json!({"ttl_secs": 600})).await;
+    assert_eq!(status, 401);
+
+    // A never-expiring token refreshes into a bounded one if asked.
+    let eternal = bezel::auth::mint(SECRET, &["tasks/v1"], &["read"], None, None).unwrap();
+    let et = Client::new(&url, &eternal);
+    let (status, body) = et.post("/v1/capabilities/refresh", json!({"ttl_secs": 60})).await;
+    assert_eq!(status, 201, "{body}");
+    let cap = bezel::auth::verify(SECRET, body["token"].as_str().unwrap()).unwrap();
+    assert!(cap.exp.is_some());
+}
+
+#[tokio::test]
 async fn iroh_identity_is_derived_from_the_secret() -> Result<()> {
     // Same secret → same endpoint id, across restarts: clients hold one
     // address forever. Different secret → different identity.

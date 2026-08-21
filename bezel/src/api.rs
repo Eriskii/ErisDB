@@ -50,6 +50,7 @@ pub fn app(pool: PgPool, secret: Vec<u8>) -> Router {
         .route("/v1/changes/stream", get(stream_changes))
         .route("/v1/tick", post(tick))
         .route("/v1/capabilities", post(mint_capability))
+        .route("/v1/capabilities/refresh", post(refresh_capability))
         // Browser clients are first-class; auth is the token, not the origin.
         .layer(tower_http::cors::CorsLayer::permissive())
         .with_state(state)
@@ -654,5 +655,29 @@ async fn mint_capability(
         return Err(Error::Forbidden { facet: minted.facets.join(","), verb: minted.verbs.join(",") });
     }
     let token = auth::mint_capability(&st.secret, &minted)?;
+    Ok((axum::http::StatusCode::CREATED, Json(json!({ "token": token }))))
+}
+
+#[derive(Deserialize)]
+struct RefreshRequest {
+    ttl_secs: i64,
+}
+
+/// Trade a still-valid token for one with the same scope and a fresh
+/// expiry. Refresh moves time, not privilege: facets, verbs, and the
+/// signed user carry over untouched, and no admin verb is needed — this
+/// is how app tokens outlive their TTL without a human re-minting.
+/// Revocation stays what it is elsewhere: stop refreshing and the line
+/// dies at its expiry.
+async fn refresh_capability(
+    State(st): State<AppState>,
+    cap: Capability,
+    Json(req): Json<RefreshRequest>,
+) -> Result<impl IntoResponse> {
+    let fresh = Capability {
+        exp: Some(chrono::Utc::now().timestamp() + req.ttl_secs),
+        ..cap
+    };
+    let token = auth::mint_capability(&st.secret, &fresh)?;
     Ok((axum::http::StatusCode::CREATED, Json(json!({ "token": token }))))
 }

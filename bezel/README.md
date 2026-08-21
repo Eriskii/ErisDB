@@ -52,6 +52,7 @@ GET    /v1/changes?since=&facet=    cursor-paged change feed (bodies included)
 GET    /v1/changes/stream           SSE, live via Postgres NOTIFY
 POST   /v1/tick
 POST   /v1/capabilities             mint a narrower token (admin verb)
+POST   /v1/capabilities/refresh     {ttl_secs} — same scope, fresh expiry; any valid token
 ```
 
 The same router is served over plain TCP and over Iroh (ALPN `bezel/0`,
