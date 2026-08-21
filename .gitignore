@@ -3,3 +3,5 @@ target/
 apps/lists-android/
 # its own repo, not part of this one: https://github.com/Isolyth/bezel-mcp
 bezel-mcp/
+# its own repo, not part of this one: https://github.com/Isolyth/bezel-tasks-android
+apps/tasks-android/
