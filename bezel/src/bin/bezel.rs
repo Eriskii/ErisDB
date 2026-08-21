@@ -28,6 +28,11 @@ enum Command {
         #[arg(long)]
         no_iroh: bool,
     },
+    /// Print the iroh endpoint id a core with this secret serves under.
+    EndpointId {
+        #[arg(long, env = "BEZEL_SECRET", hide_env_values = true)]
+        secret: String,
+    },
     /// Mint a capability token from the shared secret.
     Mint {
         /// Comma-separated facet names, or `*`.
@@ -87,6 +92,9 @@ async fn main() -> Result<()> {
                     r = bezel::net::serve(ep, app) => r?,
                 }
             }
+        }
+        Command::EndpointId { secret } => {
+            println!("{}", bezel::net::endpoint_id(secret.as_bytes()));
         }
         Command::Mint { facets, verbs, ttl, user, secret } => {
             let facets: Vec<&str> = facets.split(',').map(str::trim).collect();
