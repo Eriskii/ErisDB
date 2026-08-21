@@ -19,7 +19,9 @@ The personal server, in three pieces that match the architecture:
   Android.
 - **`bezel-mcp/`** — the core's API as MCP tools over stdio, for wiring a
   bezel into Claude and friends: read, search, write, delete, history,
-  revert, the change feed, and token minting. See its README.
+  revert, the change feed, and token minting. Lives in its own repo
+  ([Isolyth/bezel-mcp](https://github.com/Isolyth/bezel-mcp)), cloned here
+  and gitignored; see its README.
 - **`apps/lists-android/`** — the lists client as an Android app over
   `bezel-client`: no IP, no port, just the server's iroh endpoint id and
   a token. Lives in its own repo
