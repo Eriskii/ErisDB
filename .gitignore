@@ -1,7 +1,7 @@
 target/
-# its own repo, not part of this one: https://github.com/Isolyth/bezel-lists-android
+# its own repo, not part of this one: https://github.com/Eriskii/bezel-lists-android
 apps/lists-android/
-# its own repo, not part of this one: https://github.com/Isolyth/bezel-mcp
+# its own repo, not part of this one: https://github.com/Eriskii/bezel-mcp
 bezel-mcp/
-# its own repo, not part of this one: https://github.com/Isolyth/bezel-tasks-android
+# its own repo, not part of this one: https://github.com/Eriskii/bezel-tasks-android
 apps/tasks-android/
