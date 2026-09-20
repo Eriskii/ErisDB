@@ -82,7 +82,7 @@ match erisdb_client::pair(
     Duration::from_secs(300),
     &cancel,
 ).await? {
-    Pairing::Approved { token, granted } => store(token, granted), // once!
+    Pairing::Approved { token, granted } => store(token, granted),
     Pairing::Denied    => "the operator said no",
     Pairing::TimedOut  => "nobody answered",
     Pairing::Cancelled => "the user closed the screen",

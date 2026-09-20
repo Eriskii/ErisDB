@@ -217,10 +217,10 @@ Then the app talks:
 2. A screen that says *waiting for approval on my-laptop…*, listing
    exactly what was asked for, with Cancel. It polls
    `GET /v1/pair/status` every 1.5 seconds.
-3. Approved, and the token comes back — **once**. Collecting it spends
-   the session, so it goes to the sealed store, with the core it opens,
-   before anything else in this app runs. Denied and expired say so in a
-   sentence and route back to pairing.
+3. Compare the fingerprint with the terminal. Collection is bound to this
+   installation’s persistent Iroh key and is repeatable while the ticket lives.
+   Save the access token in the sealed store before proceeding. Denied and
+   expired tickets return to pairing.
 4. `GET /v1/permissions`, because the approval may be narrower than the
    request. See **Permissions**.
 
@@ -290,3 +290,15 @@ grants back on the next connect.
 ## Licence
 
 MIT. See [LICENSE](LICENSE).
+
+## Registered access and device verification
+
+Paired access renews using the persistent Iroh identity, even after an offline
+period outlasts token expiry. Permissions are re-read during sync. Revocation
+stops renewal and clears available write controls. See [installation authority](../../docs/clients.md).
+
+Build both apps and their native libraries with `scripts/build-android.sh` from
+the repository root. `tests/android/run.sh` drives both actual APKs on an isolated
+emulator through ADB, using a real ErisDB/Iroh endpoint and disposable Postgres.
+Unit fixtures do not establish transport or security guarantees; the device and
+Rust integration suites exercise those boundaries.

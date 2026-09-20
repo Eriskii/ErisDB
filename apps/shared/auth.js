@@ -37,7 +37,7 @@ const ErisDBAuth = (() => {
         "Content-Type": "application/json",
         ...(registered ? { "X-ErisDB-Client-Proof": config.refreshSecret } : { "Authorization": "Bearer " + config.token }),
       },
-      body: JSON.stringify({ ttl_secs: config.ttl }),
+      body: JSON.stringify(registered ? {} : { ttl_secs: config.ttl }),
     });
     return { status: response.status, body: await response.json() };
   }

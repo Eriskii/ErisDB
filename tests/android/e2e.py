@@ -94,7 +94,7 @@ def run(app):
         pending = eventually(lambda: (v if (v := api('GET', path))['body']['status'] == 'requested' else None))
         eventually(lambda: has_text(pending['body']['fingerprint']))
         api('POST', path + '/approve', {'granted': [f'{app}:read', f'{app}:create'], 'ttl_secs': 5})
-        eventually(lambda: api('GET', '/v1/clients')['clients'])
+        eventually(lambda: any(client['id'] == session['id'] for client in api('GET', '/v1/clients')['clients']))
         client = api('GET', f"/v1/clients/{session['id']}")
         assert client['identity']['kind'] == 'iroh'
         button('add task' if app == 'tasks' else 'add entry')

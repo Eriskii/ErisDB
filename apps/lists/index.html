@@ -6,7 +6,7 @@
   Content-Security-Policy, inline because this is a single file served
   from anywhere — a file:// path, a static host, whatever.
 
-  script-src 'sha256-Wkdr99UyJoSm9a6z/iKAW4+KkGz0H4iUuiK+UpADKM4=' 'sha256-TRZqYn6rrpG1BLKwvO4iVd+V9O5pr7H9N2mjwt/799A='; recompute
+  script-src 'sha256-1XcSVYkQFxHQxfNe1yoxrx6TATRCNWlP31dIF//bgsQ=' 'sha256-m/YpEsbc2kwhmyVp/oS0lNbJWbUdrI83gEl66BivXtc='; recompute
   with:
 
     { printf '\n'; sed -n '/^<script>$/,/^<\/script>$/p' index.html \
@@ -23,7 +23,7 @@
   BarcodeDetector reads the <video> element directly with no canvas and
   no blob: URL in between.
 -->
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'sha256-Wkdr99UyJoSm9a6z/iKAW4+KkGz0H4iUuiK+UpADKM4=' 'sha256-TRZqYn6rrpG1BLKwvO4iVd+V9O5pr7H9N2mjwt/799A='; style-src 'unsafe-inline'; connect-src *; base-uri 'none'; form-action 'none'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'sha256-1XcSVYkQFxHQxfNe1yoxrx6TATRCNWlP31dIF//bgsQ=' 'sha256-m/YpEsbc2kwhmyVp/oS0lNbJWbUdrI83gEl66BivXtc='; style-src 'unsafe-inline'; connect-src *; base-uri 'none'; form-action 'none'">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>ErisDB · lists</title>
 <style>
@@ -204,7 +204,7 @@
   </div>
 </main>
 
-<script src="../shared/auth.js" integrity="sha256-Wkdr99UyJoSm9a6z/iKAW4+KkGz0H4iUuiK+UpADKM4="></script>
+<script src="../shared/auth.js" integrity="sha256-1XcSVYkQFxHQxfNe1yoxrx6TATRCNWlP31dIF//bgsQ="></script>
 <script>
 "use strict";
 // The facet name is the permission namespace, so it carries no version:
@@ -307,18 +307,25 @@ if (typeof selected !== "string") selected = null;
 
 // ---------------------------------------------------------------- core client
 
-async function api(method, path, body) {
+async function api(method, path, body, retry = true) {
   if (!config) throw new Error("not connected");
-  const res = await fetch(ErisDBAuth.baseURL(config.url) + path, {
+  const session = config;
+  const res = await fetch(ErisDBAuth.baseURL(session.url) + path, {
     redirect: "error", cache: "no-store",
     method,
     headers: {
-      "Authorization": "Bearer " + config.token,
+      "Authorization": "Bearer " + session.token,
       "X-Bezel-Client": CLIENT,
       ...(body !== undefined ? { "Content-Type": "application/json" } : {}),
     },
     body: body !== undefined ? JSON.stringify(body) : undefined,
   });
+  if (res.status === 401 && retry && config === session && session.refreshSecret) {
+    await refreshToken(true);
+    if (config?.url === session.url && config.refreshSecret === session.refreshSecret && config.token !== session.token) {
+      return api(method, path, body, false); // 401 precedes every server-side effect.
+    }
+  }
   if (res.status === 204) return { status: 204, body: null };
   let json = null;
   try { json = await res.json(); } catch {}
@@ -388,7 +395,8 @@ function can(action) {
  * on the answer, since an operator may have approved a subset. */
 async function loadPermissions() {
   const r = await api("GET", "/v1/permissions");
-  if (r.status !== 200 || !Array.isArray(r.body?.grants)) return false;
+  if (r.status === 401) { expired(); return false; }
+  if (r.status !== 200 || !Array.isArray(r.body?.grants)) throw new Error("permissions " + r.status);
   grants = r.body.grants;
   config = { ...config, grants };
   save(LS.config, config);
@@ -401,29 +409,29 @@ async function loadPermissions() {
 // refresh is in flight at a time and a failure simply waits for the next
 // sync. The open stream keeps its old, still-valid token and picks the
 // fresh one up when it reconnects.
-let refreshing = false;
-async function refreshToken() {
-  if (refreshing || !config?.ttl) return;
+let refreshing = null;
+function refreshToken(force = false) {
+  if (refreshing) return refreshing;
+  if (!config?.ttl && !config?.refreshSecret) return Promise.resolve();
   const exp = tokenExp(config.token);
-  if (exp === null || exp - Date.now() / 1000 >= config.ttl / 2) return;
-  refreshing = true;
-  try {
-    const session = config;
-    const r = await ErisDBAuth.renew(session);
-    if (config !== session) return;
-    if (r.status === 200 || r.status === 201) {
-      config = { ...config, token: r.body.token, grants: r.body.grants ?? config.grants };
-      grants = config.grants;
-      renderPermissions();   // fresh exp rides in the token
-      save(LS.config, config);
-      renderConfigState();
-    } else if (r.status === 401) {
-      expired();
-    }
-  } catch (e) {
-  } finally {
-    refreshing = false;
-  }
+  if (!force && (exp === null || exp - Date.now() / 1000 >= config.ttl / 2)) return Promise.resolve();
+  const session = config;
+  refreshing = (async () => {
+    try {
+      const r = await ErisDBAuth.renew(session);
+      if (config?.url !== session.url || config.token !== session.token || config.refreshSecret !== session.refreshSecret) return;
+      if (r.status === 200 || r.status === 201) {
+        config = { ...config, token: r.body.token, grants: r.body.grants ?? config.grants };
+        grants = config.grants;
+        renderPermissions();
+        save(LS.config, config);
+        renderConfigState();
+      } else if (r.status === 401) {
+        expired();
+      }
+    } catch {} // Offline credentials remain available for the next sync.
+  })().finally(() => { refreshing = null; });
+  return refreshing;
 }
 
 // Registered renewal can recover expired access. A refused installation
@@ -1145,7 +1153,7 @@ async function sync() {
     // and a refused write sends the app back to ask again. Everything the
     // screen offers or withholds follows from the answer.
     permsStale = false;
-    if (!await loadPermissions()) { expired(); return; }
+    if (!await loadPermissions()) return;
     await drainOutbox();
     if (cursor === null) await seed();
     const { status, body } = await api("GET",

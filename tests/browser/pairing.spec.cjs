@@ -61,6 +61,18 @@ for (const app of ["tasks", "lists"]) {
     expect(saved.refreshSecret).toHaveLength(43);
     // Wait for actual expiry; no simulated clock or intercepted responses.
     await expect.poll(() => Date.now() / 1000, { timeout: 6000 }).toBeGreaterThan(JSON.parse(Buffer.from(saved.token.split(".")[1], "base64url")).exp);
+    // An actual authorization failure can renew too, independent of the UI clock.
+    const rejection = page.waitForResponse(response => response.url().endsWith("/v1/permissions") &&
+      response.status() === 401 && response.request().headers().authorization === "Bearer " + saved.token);
+    const recovered = await page.evaluate(expiredToken => {
+      // Restore a genuinely issued, now expired credential, as an old backup would.
+      config = { ...config, token: expiredToken };
+      return api("GET", "/v1/permissions");
+    }, saved.token);
+    await rejection;
+    expect(recovered.status).toBe(200);
+    const recoveredToken = await page.evaluate(app => JSON.parse(localStorage.getItem(`bezel.${app}.config`)).token, app);
+    await expect.poll(() => Date.now() / 1000, { timeout: 6000 }).toBeGreaterThan(JSON.parse(Buffer.from(recoveredToken.split(".")[1], "base64url")).exp);
     const renewal = page.waitForResponse(response => response.url().endsWith(`/v1/clients/${session.id}/refresh`) && response.status() === 200);
     await page.reload();
     await renewal;

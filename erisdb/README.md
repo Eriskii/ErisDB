@@ -77,7 +77,7 @@ POST   /v1/pairings                 cut a pairing code                 meta:pair
 GET    /v1/pairings, /v1/pairings/{id}                                 meta:pairing:read
 POST   /v1/pairings/{id}/approve, /deny                                meta:pairing:approve
 POST   /v1/pair/redeem              {client, requested}                the code itself
-GET    /v1/pair/status              collect the token, once            the code itself
+GET    /v1/pair/status              collect with installation proof    the code and identity
 ```
 
 The core's own facets answer only to `meta:`: `facet` to
@@ -167,13 +167,15 @@ Tasks (Android) v0.3 wants:
   2. tasks:create
   3. tasks:update
 
-[a] approve as asked   [e] everything   [s] select   [d] deny
+[a] approve as asked   [s] select   [d] deny
 ```
 
 So a photographed screen is not a leaked capability — it gets an attacker
 as far as a prompt on your screen. Approve the narrowest set that works;
-`s` takes a comma-separated list of numbers. An approval cannot exceed the
-approver. The ticket format is in [docs/pairing.md](../docs/pairing.md) and
+`s` takes a comma-separated list of numbers. Compare the fingerprint with the app. Approval cannot exceed the request or
+the approver. Registered clients renew until revoked: `erisdb clients list`,
+`erisdb clients permissions ID --grant tasks:read`, `erisdb clients revoke ID`.
+See [registered installations](../docs/clients.md). The ticket format is in [docs/pairing.md](../docs/pairing.md) and
 the flow is in [docs/permissions.md](../docs/permissions.md#pairing).
 
 ## Tests
