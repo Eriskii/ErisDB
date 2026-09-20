@@ -25,6 +25,7 @@ use uuid::Uuid;
 use crate::auth::{self, Capability};
 use crate::error::{Error, Result};
 use crate::permission;
+use crate::installation::{self, Identity, Installation};
 use crate::plugin::{PluginRegistry, MAX_PLUGIN_REQUEST_BYTES};
 
 /// Facet reserved for core-emitted events (tick).
@@ -175,6 +176,10 @@ pub fn app_with_plugins(pool: PgPool, secret: Vec<u8>, plugins: PluginRegistry) 
         .route("/v1/capabilities", post(mint_capability))
         .route("/v1/capabilities/refresh", post(refresh_capability))
         .route("/v1/permissions", get(my_permissions))
+        .route("/v1/clients", get(list_clients))
+        .route("/v1/clients/{id}", get(get_client).put(update_client))
+        .route("/v1/clients/{id}/revoke", post(revoke_client))
+        .route("/v1/clients/{id}/refresh", post(renew_client))
         .route("/v1/server", get(server_state))
         .route("/v1/pairings", post(create_pairing).get(list_pairings))
         .route("/v1/pairings/{id}", get(get_pairing))
@@ -185,6 +190,10 @@ pub fn app_with_plugins(pool: PgPool, secret: Vec<u8>, plugins: PluginRegistry) 
         // Browser clients are first-class; auth is the token, not the origin.
         .layer(tower_http::cors::CorsLayer::permissive())
         .layer(tower_http::trace::TraceLayer::new_for_http())
+        .layer(axum::middleware::map_response(|mut response: axum::response::Response| async {
+            response.headers_mut().insert(axum::http::header::CACHE_CONTROL, axum::http::HeaderValue::from_static("no-store"));
+            response
+        }))
         .with_state(state)
 }
 
@@ -202,13 +211,16 @@ impl FromRequestParts<AppState> for Capability {
         let token = header.strip_prefix("Bearer ").ok_or(Error::Unauthorized)?;
         // A refused token is the one thing an operator most wants a record
         // of, and the only trace of someone probing.
-        auth::verify(&state.secret, token).inspect_err(|_| {
+        let mut cap = auth::verify(&state.secret, token).inspect_err(|_| {
             tracing::warn!(
                 path = %parts.uri.path(),
                 peer = parts.extensions.get::<PeerAddr>().map(|p| p.0.as_str()).unwrap_or("?"),
                 "rejected capability token"
             );
-        })
+        })?;
+        let peer = observed_peer(parts);
+        installation::authorize(&state.pool, &mut cap, peer.as_deref()).await?;
+        Ok(cap)
     }
 }
 
@@ -222,27 +234,26 @@ impl FromRequestParts<AppState> for Capability {
 #[derive(Clone)]
 pub struct PeerAddr(pub String);
 
+fn observed_peer(parts: &Parts) -> Option<String> {
+    parts.extensions.get::<PeerAddr>().map(|p| p.0.clone()).or_else(|| {
+        parts.extensions.get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+            .map(|address| address.0.to_string())
+    })
+}
+
 /// The connection-and-request half of a source; the capability supplies
 /// the user.
 struct SourceParts {
     addr: Option<String>,
     client: Option<String>,
+    proof: Option<String>,
 }
 
 impl<S: Send + Sync> FromRequestParts<S> for SourceParts {
     type Rejection = Error;
 
     async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self> {
-        let addr = parts
-            .extensions
-            .get::<PeerAddr>()
-            .map(|p| p.0.clone())
-            .or_else(|| {
-                parts
-                    .extensions
-                    .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
-                    .map(|ci| ci.0.to_string())
-            });
+        let addr = observed_peer(parts);
         // The claimed rung of the trust gradient, and the only one a caller
         // writes. It is copied into every change row, so it is bounded and
         // printable or it is refused.
@@ -263,20 +274,24 @@ impl<S: Send + Sync> FromRequestParts<S> for SourceParts {
                 Some(name.to_string())
             }
         };
-        Ok(SourceParts { addr, client })
+        let proof = parts.headers.get(installation::PROOF_HEADER)
+            .map(|v| v.to_str().map(str::to_string).map_err(|_| Error::Unauthorized))
+            .transpose()?;
+        Ok(SourceParts { addr, client, proof })
     }
 }
 
 impl SourceParts {
     /// The stamped source value: connection + token, never the body.
     fn stamp(&self, cap: &Capability) -> Value {
-        json!({ "addr": self.addr, "user": cap.user, "client": self.client })
+        json!({ "addr": self.addr, "user": cap.user, "client": self.client, "installation": cap.client })
     }
 
     /// The key a rate limit counts against: the observed address when there
     /// is one, since that is the rung a caller cannot forge.
-    fn rate_key(&self) -> &str {
-        self.addr.as_deref().unwrap_or("unknown")
+    fn rate_key(&self) -> String {
+        let addr = self.addr.as_deref().unwrap_or("unknown");
+        addr.parse::<std::net::SocketAddr>().map(|p| p.ip().to_string()).unwrap_or_else(|_| addr.to_string())
     }
 }
 
@@ -803,6 +818,7 @@ async fn list_changes(
 async fn stream_changes(
     State(st): State<AppState>,
     cap: Capability,
+    src: SourceParts,
     Query(q): Query<ChangesQuery>,
 ) -> Result<Sse<impl Stream<Item = std::result::Result<Event, Infallible>>>> {
     authorize_feed(&cap, q.facet.as_deref())?;
@@ -826,6 +842,8 @@ async fn stream_changes(
         /// checked once, at subscribe, so without this a token with a minute
         /// left holds an open firehose for as long as the process runs.
         expires_at: Option<i64>,
+        capability: Capability,
+        peer: Option<String>,
         _permit: tokio::sync::OwnedSemaphorePermit,
     }
     let feed = Feed {
@@ -835,12 +853,19 @@ async fn stream_changes(
         cursor: q.since,
         queue: VecDeque::new(),
         expires_at: cap.exp,
+        capability: cap,
+        peer: src.addr,
         _permit: permit,
     };
 
     let stream = futures::stream::unfold(feed, |mut s| async move {
         loop {
             if s.expires_at.is_some_and(|exp| chrono::Utc::now().timestamp() >= exp) {
+                return None;
+            }
+            if installation::authorize(&s.pool, &mut s.capability, s.peer.as_deref()).await.is_err()
+                || authorize_feed(&s.capability, s.facet.as_deref()).is_err()
+            {
                 return None;
             }
             if let Some(change) = s.queue.pop_front() {
@@ -941,7 +966,7 @@ async fn mint_capability(
     src: SourceParts,
     Json(req): Json<MintRequest>,
 ) -> Result<impl IntoResponse> {
-    st.check_mint_rate(src.rate_key())?;
+    st.check_mint_rate(&src.rate_key())?;
     cap.require("meta:capabilities:mint")?;
     auth::check_grants(&req.grants, req.user.as_deref())?;
     if req.ttl_secs <= 0 {
@@ -971,6 +996,7 @@ async fn mint_capability(
         user: req.user,
         max_exp: Some(chain_end),
         pair: None,
+        client: cap.client,
     };
     // Enclosure covers time as well as scope, so a token that dies in a
     // minute cannot hand out one that outlives it.
@@ -1001,7 +1027,7 @@ async fn refresh_capability(
     src: SourceParts,
     Json(req): Json<RefreshRequest>,
 ) -> Result<impl IntoResponse> {
-    st.check_mint_rate(src.rate_key())?;
+    st.check_mint_rate(&src.rate_key())?;
     if req.ttl_secs <= 0 {
         return Err(Error::BadRequest("ttl_secs must be positive".into()));
     }
@@ -1125,6 +1151,7 @@ async fn create_pairing(
             user: None,
             max_exp: Some(expires),
             pair: Some(id.to_string()),
+            client: None,
         },
     )?;
     Ok((
@@ -1150,6 +1177,8 @@ struct RedeemRequest {
     /// The permissions the client would like. Asking is free; the answer
     /// is a person.
     requested: Vec<String>,
+    /// Browser S256 commitment; native identity comes from the QUIC connection.
+    challenge: Option<String>,
 }
 
 async fn redeem_pairing(
@@ -1159,10 +1188,11 @@ async fn redeem_pairing(
     Json(req): Json<RedeemRequest>,
 ) -> Result<impl IntoResponse> {
     let id = code_session(&cap)?;
-    if req.client.is_empty() || req.client.len() > MAX_CLIENT_LEN {
+    if req.client.trim().is_empty() || req.client.len() > MAX_CLIENT_LEN || req.client.chars().any(char::is_control) {
         return Err(Error::BadRequest(format!("client must be 1..={MAX_CLIENT_LEN} characters")));
     }
     auth::check_grants(&req.requested, None)?;
+    let identity = Identity::enrollment(src.addr.as_deref(), req.challenge)?;
 
     let item = load_pairing(&st.pool, id).await?;
     pairing_is_live(&item.body)?;
@@ -1178,45 +1208,62 @@ async fn redeem_pairing(
     body["status"] = json!("requested");
     body["client"] = json!(req.client);
     body["requested"] = json!(req.requested);
+    body["fingerprint"] = json!(identity.fingerprint(id, &req.requested));
+    body["identity"] = json!(identity);
     let updated = write_pairing(&st, &item, body, &src.stamp(&cap)).await?;
     tracing::info!(client = %req.client, pairing = %id, "pairing requested");
     Ok(Json(public_pairing(&updated)))
 }
 
-/// The client's own view of its session, and the one place its token is
-/// ever handed out — once. Collecting clears it, so a replayed code cannot
-/// fetch the token a second time.
+/// Collection is bound to the redeemer and safely repeatable after a lost
+/// response. Only that installation can recover the issued access token.
 async fn pairing_status(State(st): State<AppState>, cap: Capability, src: SourceParts) -> Result<Json<Value>> {
     let id = code_session(&cap)?;
-    let item = load_pairing(&st.pool, id).await?;
-    let status = item.body.get("status").and_then(Value::as_str).unwrap_or("pending").to_string();
-    let granted = item.body.get("granted").cloned().unwrap_or(Value::Null);
-
+    let mut tx = st.pool.begin().await?;
+    let item = sqlx::query_as::<_, Item>(
+        "SELECT id, facet, body, revision, created_at, updated_at, source FROM items
+         WHERE id = $1 AND facet = $2 FOR UPDATE",
+    ).bind(id).bind(PAIR_FACET).fetch_optional(&mut *tx).await?.ok_or(Error::NotFound)?;
+    pairing_is_live(&item.body)?;
+    let status = item.body["status"].as_str().ok_or(Error::Unauthorized)?;
+    if status == "pending" {
+        return Ok(Json(json!({ "status": status })));
+    }
+    let identity: Identity = serde_json::from_value(item.body["identity"].clone())
+        .map_err(|_| Error::Unauthorized)?;
+    identity.prove(src.addr.as_deref(), src.proof.as_deref())?;
+    if !matches!(status, "approved" | "collected") {
+        return Ok(Json(json!({ "status": status, "fingerprint": item.body["fingerprint"] })));
+    }
+    let source = src.stamp(&cap);
     if status == "approved" {
-        let grants: Vec<String> = item
-            .body
-            .get("granted")
-            .and_then(Value::as_array)
-            .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
-            .unwrap_or_default();
-        let minted = Capability {
-            grants,
-            exp: item.body.get("exp").and_then(Value::as_i64),
-            user: item.body.get("user").and_then(Value::as_str).map(str::to_string),
-            max_exp: item.body.get("max_exp").and_then(Value::as_i64),
-            pair: None,
-        };
-        let token = auth::mint_capability(&st.secret, &minted)?;
-        // Spending the session before handing the token over: the write is
-        // revision-checked, so two clients racing the same code cannot both
-        // collect.
+        let requested: Vec<String> = serde_json::from_value(item.body["requested"].clone())
+            .map_err(|_| Error::Unauthorized)?;
+        let grants: Vec<String> = serde_json::from_value(item.body["granted"].clone())
+            .map_err(|_| Error::Unauthorized)?;
+        let client = sqlx::query_as::<_, Installation>(
+            "INSERT INTO clients (id, name, identity, requested, grants, user_name, access_ttl_secs, expires)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *",
+        ).bind(id).bind(item.body["client"].as_str().ok_or(Error::Unauthorized)?)
+            .bind(sqlx::types::Json(&identity)).bind(&requested).bind(&grants)
+            .bind(item.body["user"].as_str())
+            .bind(item.body["access_ttl_secs"].as_i64().ok_or(Error::Unauthorized)?)
+            .bind(item.body["max_exp"].as_i64())
+            .fetch_one(&mut *tx).await?;
         let mut body = item.body.clone();
         body["status"] = json!("collected");
-        write_pairing(&st, &item, body, &src.stamp(&cap)).await?;
-        tracing::info!(pairing = %id, "pairing token collected");
-        return Ok(Json(json!({ "status": "approved", "granted": granted, "token": token })));
+        write_revision(&mut tx, item.id, PAIR_FACET, &body, item.revision, &source).await?;
+        audit_client(&mut tx, &client, "created", &source).await?;
     }
-    Ok(Json(json!({ "status": status, "granted": granted })))
+    let client = sqlx::query_as::<_, Installation>("SELECT * FROM clients WHERE id = $1")
+        .bind(id).fetch_one(&mut *tx).await?;
+    let issued = client.capability(None)?;
+    let token = auth::mint_capability(&st.secret, &issued)?;
+    tx.commit().await?;
+    Ok(Json(json!({
+        "status": "approved", "granted": issued.grants, "token": token,
+        "client_id": client.id, "exp": issued.exp, "fingerprint": item.body["fingerprint"],
+    })))
 }
 
 async fn list_pairings(State(st): State<AppState>, cap: Capability) -> Result<Json<Value>> {
@@ -1249,80 +1296,47 @@ struct ApproveRequest {
 }
 
 async fn approve_pairing(
-    State(st): State<AppState>,
-    cap: Capability,
-    src: SourceParts,
-    Path(id): Path<Uuid>,
-    body: Option<Json<ApproveRequest>>,
+    State(st): State<AppState>, cap: Capability, src: SourceParts,
+    Path(id): Path<Uuid>, body: Option<Json<ApproveRequest>>,
 ) -> Result<Json<Value>> {
     cap.require("meta:pairing:approve")?;
     let req = body.map(|Json(b)| b).unwrap_or(ApproveRequest {
-        granted: None,
-        ttl_secs: None,
-        max_ttl_secs: None,
-        user: None,
+        granted: None, ttl_secs: None, max_ttl_secs: None, user: None,
     });
-
     let item = load_pairing(&st.pool, id).await?;
     pairing_is_live(&item.body)?;
-    if item.body.get("status").and_then(Value::as_str) != Some("requested") {
+    if item.body["status"] != "requested" {
         return Err(Error::Conflict("only a redeemed pairing code can be approved".into()));
     }
-
-    let asked: Vec<String> = item
-        .body
-        .get("requested")
-        .and_then(Value::as_array)
-        .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
-        .unwrap_or_default();
-    let granted = req.granted.unwrap_or(asked);
+    let asked: Vec<String> = serde_json::from_value(item.body["requested"].clone())
+        .map_err(|_| Error::Unauthorized)?;
+    let granted = req.granted.unwrap_or_else(|| asked.clone());
     auth::check_grants(&granted, req.user.as_deref())?;
-
+    if !permission::encloses(&asked, &granted) || !permission::encloses(&cap.grants, &granted) {
+        return Err(Error::Forbidden { permission: granted.join(",") });
+    }
     let ttl = req.ttl_secs.unwrap_or(PAIRED_TTL_SECS);
-    if ttl <= 0 {
-        return Err(Error::BadRequest("ttl_secs must be positive".into()));
+    if !(1..=installation::MAX_ACCESS_TTL).contains(&ttl) {
+        return Err(Error::BadRequest(format!("ttl_secs must be 1..={}", installation::MAX_ACCESS_TTL)));
     }
-    let exp = auth::deadline_from_now(ttl)?;
-    let chain = req.max_ttl_secs.unwrap_or(auth::DEFAULT_CHAIN_SECS).max(ttl);
-    if chain > auth::MAX_CHAIN_SECS {
-        return Err(Error::BadRequest(format!(
-            "max_ttl_secs exceeds the {} second ceiling",
-            auth::MAX_CHAIN_SECS
-        )));
-    }
-    let mut chain_end = auth::deadline_from_now(chain)?;
-    if req.max_ttl_secs.is_none() {
-        if let Some(parent_end) = cap.deadline() {
-            chain_end = chain_end.min(parent_end).max(exp);
+    let expires = req.max_ttl_secs.map(|secs| {
+        if !(1..=auth::MAX_CHAIN_SECS).contains(&secs) {
+            Err(Error::BadRequest("max_ttl_secs is outside the supported lifetime".into()))
+        } else {
+            auth::deadline_from_now(secs)
         }
-    }
-    let minted = Capability {
-        grants: granted.clone(),
-        exp: Some(exp),
-        user: req.user,
-        max_exp: Some(chain_end),
-        pair: None,
-    };
-    // Approving is minting, so it is bounded the same way: nobody hands out
-    // what they do not hold, in scope or in time.
-    if !cap.encloses(&minted) {
-        return Err(Error::Forbidden { permission: minted.grants.join(",") });
-    }
-    // What is stored is the *shape* of the token, never the token. The
-    // approve write lands on the change feed and stays there for good, so a
-    // credential written here would outlive the session that issued it and
-    // be readable by anyone holding `meta:feed:read` forever after. The
-    // token is minted at the moment it is collected, from this.
+    }).transpose()?;
+    // Enrollment creates durable, revocable authority. Its optional explicit
+    // deadline is independent of the token the administrator logged in with.
     let mut body = item.body.clone();
     body["status"] = json!("approved");
     body["granted"] = json!(granted);
-    body["exp"] = json!(exp);
-    body["max_exp"] = json!(chain_end);
-    if let Some(user) = &minted.user {
-        body["user"] = json!(user);
-    }
+    body["access_ttl_secs"] = json!(ttl);
+    body["exp"] = json!(auth::deadline_from_now(ttl)?);
+    if let Some(expires) = expires { body["max_exp"] = json!(expires); }
+    if let Some(user) = req.user { body["user"] = json!(user); }
     let updated = write_pairing(&st, &item, body, &src.stamp(&cap)).await?;
-    tracing::info!(pairing = %id, grants = ?granted, "pairing approved");
+    tracing::info!(pairing = %id, "pairing approved");
     Ok(Json(public_pairing(&updated)))
 }
 
@@ -1339,7 +1353,7 @@ async fn deny_pairing(
     // Once collected there is a live credential and denying is a lie.
     if item.body.get("status").and_then(Value::as_str) == Some("collected") {
         return Err(Error::Conflict(
-            "this pairing was already collected; expire or rotate the token instead".into(),
+            "this pairing was already collected; revoke its client registration instead".into(),
         ));
     }
     let mut body = item.body.clone();
@@ -1354,6 +1368,88 @@ async fn deny_pairing(
     Ok(Json(public_pairing(&updated)))
 }
 
+// ---------------------------------------------------------------- installations
+
+async fn audit_client(
+    tx: &mut Transaction<'_, Postgres>, client: &Installation, op: &str, source: &Value,
+) -> Result<()> {
+    let body = json!({ "event": "client", "client": client });
+    record_change(tx, None, SYSTEM_FACET, op, Some((&body, client.revision)), source).await?;
+    Ok(())
+}
+
+async fn list_clients(State(st): State<AppState>, cap: Capability) -> Result<Json<Value>> {
+    cap.require("meta:clients:read")?;
+    let clients = sqlx::query_as::<_, Installation>("SELECT * FROM clients ORDER BY created_at, id")
+        .fetch_all(&st.pool).await?;
+    Ok(Json(json!({ "clients": clients })))
+}
+
+async fn get_client(State(st): State<AppState>, cap: Capability, Path(id): Path<Uuid>) -> Result<Json<Installation>> {
+    cap.require("meta:clients:read")?;
+    let client = sqlx::query_as("SELECT * FROM clients WHERE id = $1")
+        .bind(id).fetch_optional(&st.pool).await?.ok_or(Error::NotFound)?;
+    Ok(Json(client))
+}
+
+#[derive(Deserialize)]
+struct ClientPermissions { grants: Vec<String>, revision: i64 }
+
+async fn update_client(
+    State(st): State<AppState>, cap: Capability, src: SourceParts,
+    Path(id): Path<Uuid>, Json(req): Json<ClientPermissions>,
+) -> Result<Json<Installation>> {
+    cap.require("meta:clients:write")?;
+    auth::check_grants(&req.grants, None)?;
+    if !permission::encloses(&cap.grants, &req.grants) {
+        return Err(Error::Forbidden { permission: req.grants.join(",") });
+    }
+    let mut tx = st.pool.begin().await?;
+    let current = sqlx::query_as::<_, Installation>("SELECT * FROM clients WHERE id = $1 FOR UPDATE")
+        .bind(id).fetch_optional(&mut *tx).await?.ok_or(Error::NotFound)?;
+    current.active()?;
+    if !permission::encloses(&current.requested, &req.grants) {
+        return Err(Error::Forbidden { permission: req.grants.join(",") });
+    }
+    let client = sqlx::query_as::<_, Installation>(
+        "UPDATE clients SET grants = $2, revision = revision + 1 WHERE id = $1 AND revision = $3 RETURNING *",
+    ).bind(id).bind(&req.grants).bind(req.revision)
+        .fetch_optional(&mut *tx).await?.ok_or(Error::RevisionConflict)?;
+    audit_client(&mut tx, &client, "updated", &src.stamp(&cap)).await?;
+    tx.commit().await?;
+    Ok(Json(client))
+}
+
+async fn revoke_client(
+    State(st): State<AppState>, cap: Capability, src: SourceParts, Path(id): Path<Uuid>,
+) -> Result<Json<Installation>> {
+    cap.require("meta:clients:revoke")?;
+    let mut tx = st.pool.begin().await?;
+    let current = sqlx::query_as::<_, Installation>("SELECT * FROM clients WHERE id = $1 FOR UPDATE")
+        .bind(id).fetch_optional(&mut *tx).await?.ok_or(Error::NotFound)?;
+    if current.revoked_at.is_some() { return Ok(Json(current)); }
+    let client = sqlx::query_as::<_, Installation>(
+        "UPDATE clients SET revoked_at = now(), revision = revision + 1 WHERE id = $1 RETURNING *",
+    ).bind(id).fetch_one(&mut *tx).await?;
+    audit_client(&mut tx, &client, "updated", &src.stamp(&cap)).await?;
+    tx.commit().await?;
+    Ok(Json(client))
+}
+
+#[derive(Deserialize)]
+struct ClientRenewal { ttl_secs: Option<i64> }
+
+async fn renew_client(
+    State(st): State<AppState>, src: SourceParts, Path(id): Path<Uuid>,
+    Json(req): Json<ClientRenewal>,
+) -> Result<Json<Value>> {
+    st.check_mint_rate(&src.rate_key())?;
+    let client = installation::authenticate(&st.pool, id, src.addr.as_deref(), src.proof.as_deref()).await?;
+    let cap = client.capability(req.ttl_secs)?;
+    let token = auth::mint_capability(&st.secret, &cap)?;
+    Ok(Json(json!({ "token": token, "exp": cap.exp, "grants": cap.grants, "client_id": id })))
+}
+
 // ---------------------------------------------------------------- dashboard
 
 /// What this token is. Needs no permission: a caller may always ask what it
@@ -1365,6 +1461,7 @@ async fn my_permissions(cap: Capability) -> Json<Value> {
         "exp": cap.exp,
         "max_exp": cap.max_exp,
         "user": cap.user,
+        "client_id": cap.client,
     }))
 }
 

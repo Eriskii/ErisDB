@@ -22,11 +22,6 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
 const SECRET: &str = "mcp-e2e-secret";
 
-const NO_CORE: &str = "SKIPPED: no erisdb binary, so no core to drive. \
-     Set ERISDB_BIN to one, put `erisdb` on PATH, or clone this repo inside a \
-     ErisDB checkout (as ErisDB/erisdb-mcp, next to erisdb/) and it \
-     will be built.";
-
 /// The erisdb binary to run a core with: `ERISDB_BIN` if the operator named
 /// one, a sibling `../erisdb` checkout built on demand, or `erisdb` on
 /// PATH. `None` means this machine cannot run a core right now.
@@ -75,9 +70,10 @@ impl Core {
         String::from_utf8_lossy(&out.stdout).trim().to_string()
     }
 
-    async fn api(&self, method: reqwest::Method, path: &str, token: &str, body: Value) -> Value {
+    async fn api(&self, method: reqwest::Method, path: &str, token: &str, mut body: Value) -> Value {
+        if path == "/v1/pair/redeem" { body["challenge"] = json!("tMNl5Xr1UF5oz0tLgctGskAAFN2mmd_MHTaUNW9LCww"); }
         let mut req =
-            reqwest::Client::new().request(method.clone(), format!("{}{path}", self.url)).bearer_auth(token);
+            reqwest::Client::new().request(method.clone(), format!("{}{path}", self.url)).bearer_auth(token).header("X-ErisDB-Client-Proof", "mcp-integration-browser-secret-not-used-outside-tests");
         if method != reqwest::Method::GET {
             req = req.json(&body);
         }
@@ -158,13 +154,12 @@ async fn spawn_core() -> Option<Core> {
 }
 
 /// A core, or a clear word about why there isn't one.
-macro_rules! core_or_skip {
+macro_rules! real_core {
     () => {
         match spawn_core().await {
             Some(core) => core,
             None => {
-                eprintln!("{NO_CORE}");
-                return;
+                panic!("a real ErisDB binary is required; build ../erisdb or set ERISDB_BIN");
             }
         }
     };
@@ -421,7 +416,7 @@ async fn denying_a_pairing_needs_no_switch() {
 
 #[tokio::test]
 async fn the_mcp_server_drives_a_erisdb() {
-    let core = core_or_skip!();
+    let core = real_core!();
     let root = core.mint("*", 3600);
     let mut mcp = Mcp::spawn(&core.url, &root);
     mcp.start().await;
@@ -515,7 +510,7 @@ async fn the_mcp_server_drives_a_erisdb() {
 /// there. A model looping over a facet has to say so, item by item.
 #[tokio::test]
 async fn deleting_takes_confirmation_and_offers_a_dry_run() {
-    let core = core_or_skip!();
+    let core = real_core!();
     let root = core.mint("*", 3600);
     let mut mcp = Mcp::spawn(&core.url, &root);
     mcp.start().await;
@@ -544,7 +539,7 @@ async fn deleting_takes_confirmation_and_offers_a_dry_run() {
 /// ceiling on how much work one call can ask for.
 #[tokio::test]
 async fn search_matches_ids_case_insensitively_and_stays_bounded() {
-    let core = core_or_skip!();
+    let core = real_core!();
     let root = core.mint("*", 3600);
     let mut mcp = Mcp::spawn(&core.url, &root);
     mcp.start().await;
@@ -589,7 +584,7 @@ async fn search_matches_ids_case_insensitively_and_stays_bounded() {
 /// process environment by everything else on the machine.
 #[tokio::test]
 async fn the_token_can_come_from_a_file() {
-    let core = core_or_skip!();
+    let core = real_core!();
     let token = core.mint("meta:facets:read", 3600);
     let path = std::env::temp_dir().join(format!("erisdb-mcp-token-{}", std::process::id()));
     std::fs::write(&path, format!("{token}\n")).expect("write token file");
@@ -606,7 +601,7 @@ async fn the_token_can_come_from_a_file() {
 /// the operator's ceiling, whatever the model asks for.
 #[tokio::test]
 async fn minting_when_allowed_is_capped() {
-    let core = core_or_skip!();
+    let core = real_core!();
     let root = core.mint("*", 3600);
     let mut mcp = Mcp::spawn_with(
         &core.url,
@@ -658,7 +653,7 @@ async fn minting_when_allowed_is_capped() {
 /// agent should ask before it does anything else.
 #[tokio::test]
 async fn the_agent_can_read_the_server_and_its_own_grants() {
-    let core = core_or_skip!();
+    let core = real_core!();
     let mut mcp = Mcp::spawn(&core.url, &core.mint("meta:server:read,notes:*", 3600));
     mcp.start().await;
 
@@ -683,7 +678,7 @@ async fn the_agent_can_read_the_server_and_its_own_grants() {
 /// the client collects exactly that.
 #[tokio::test]
 async fn an_allowed_agent_answers_a_pairing_request() {
-    let core = core_or_skip!();
+    let core = real_core!();
     let root = core.mint("*", 3600);
     let mut mcp = Mcp::spawn_with(
         &core.url,
@@ -736,7 +731,7 @@ async fn an_allowed_agent_answers_a_pairing_request() {
 /// screen, not something an agent hands out on request.
 #[tokio::test]
 async fn an_agent_cannot_approve_a_master_key() {
-    let core = core_or_skip!();
+    let core = real_core!();
     let root = core.mint("*", 3600);
     let mut mcp = Mcp::spawn_with(
         &core.url,
@@ -748,7 +743,7 @@ async fn an_agent_cannot_approve_a_master_key() {
     core.redeem(&code, "Greedy v0", &["*"]).await;
 
     let err = mcp.tool_err("approve_pairing", json!({"id": id, "granted": ["*"]})).await;
-    assert!(err.contains("erisdb pair"), "the refusal says where that is done: {err}");
+    assert!(err.contains("erisdb mint"), "the refusal says where that is done: {err}");
 
     // The session is untouched, so a human can still answer it.
     let one = mcp.tool("get_pairing", json!({"id": id})).await;
@@ -760,7 +755,7 @@ async fn an_agent_cannot_approve_a_master_key() {
 /// would otherwise hand out its own week-long default.
 #[tokio::test]
 async fn an_approval_is_capped_like_a_mint() {
-    let core = core_or_skip!();
+    let core = real_core!();
     let root = core.mint("*", 3600);
     let mut mcp = Mcp::spawn_with(
         &core.url,
@@ -795,7 +790,7 @@ async fn an_approval_is_capped_like_a_mint() {
 /// the client with nothing at all.
 #[tokio::test]
 async fn an_agent_can_always_deny() {
-    let core = core_or_skip!();
+    let core = real_core!();
     let root = core.mint("*", 3600);
     let mut mcp = Mcp::spawn(&core.url, &root);
     mcp.start().await;
@@ -817,4 +812,49 @@ fn now_secs() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .expect("after 1970")
         .as_secs() as i64
+}
+
+#[tokio::test]
+async fn paired_mcp_renews_after_restart_and_stops_when_revoked() {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    let core = real_core!();
+    let admin = core.mint("*", 3600);
+    let (id, code) = core.cut_a_pairing(&admin).await;
+    let ticket = format!("bezel://pair/{}", URL_SAFE_NO_PAD.encode(
+        serde_json::to_vec(&json!({"v": 1, "url": core.url, "token": code})).unwrap()));
+    let path = std::env::temp_dir().join(format!("erisdb-mcp-{id}.json"));
+    let mut child = Command::new(env!("CARGO_BIN_EXE_erisdb-mcp"))
+        .args(["pair", &ticket, "--session-file"]).arg(&path)
+        .args(["--grant", "tasks:read", "--name", "real MCP installation"])
+        .stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true).spawn().unwrap();
+    let mut stderr = BufReader::new(child.stderr.take().unwrap()).lines();
+    let comparison = tokio::time::timeout(Duration::from_secs(10), stderr.next_line())
+        .await.unwrap().unwrap().unwrap();
+    let pending = core.api(reqwest::Method::GET, &format!("/v1/pairings/{id}"), &admin, Value::Null).await;
+    assert!(comparison.contains(pending["body"]["fingerprint"].as_str().unwrap()));
+    core.api(reqwest::Method::POST, &format!("/v1/pairings/{id}/approve"), &admin,
+        json!({"granted": ["tasks:read"], "ttl_secs": 1})).await;
+    let output = tokio::time::timeout(Duration::from_secs(10), child.wait_with_output()).await.unwrap().unwrap();
+    assert!(output.status.success());
+    assert!(output.stdout.is_empty(), "credentials must not reach stdout");
+    let saved: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(saved["client_id"], id);
+    assert_eq!(saved["refresh_secret"].as_str().unwrap().len(), 43);
+    #[cfg(unix)] {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+    }
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    for _ in 0..2 {
+        let mut mcp = Mcp::spawn_with(&core.url, &[("ERISDB_SESSION_FILE", path.to_str().unwrap())]);
+        mcp.start().await;
+        let permissions = mcp.tool("my_permissions", json!({})).await;
+        assert_eq!(permissions["client_id"], id);
+        assert_eq!(permissions["grants"], json!(["tasks:read"]));
+    }
+    core.api(reqwest::Method::POST, &format!("/v1/clients/{id}/revoke"), &admin, json!({})).await;
+    let mut mcp = Mcp::spawn_with(&core.url, &[("ERISDB_SESSION_FILE", path.to_str().unwrap())]);
+    mcp.start().await;
+    assert!(mcp.tool_err("my_permissions", json!({})).await.contains("401"));
+    std::fs::remove_file(path).unwrap();
 }

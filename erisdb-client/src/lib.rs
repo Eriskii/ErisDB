@@ -112,12 +112,22 @@ fn parse_body(bytes: &[u8]) -> Value {
         .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(bytes).into_owned()))
 }
 
+/// This unverified claim selects a renewal endpoint, never an authority.
+/// The server authenticates the installation using the actual QUIC peer.
+fn installation_id(token: &str) -> Option<String> {
+    let payload = B64.decode(token.split('.').nth(1)?).ok()?;
+    let claims: Value = serde_json::from_slice(&payload).ok()?;
+    let id = claims["client"].as_str()?;
+    (id.len() == 36 && id.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-')).then(|| id.to_string())
+}
+
 pub struct Client {
     endpoint: Endpoint,
     server: EndpointAddr,
     token: tokio::sync::RwLock<String>,
     client_name: String,
     conn: tokio::sync::Mutex<Option<Connection>>,
+    renewal: tokio::sync::Mutex<()>,
 }
 
 impl Client {
@@ -164,6 +174,7 @@ impl Client {
             token: tokio::sync::RwLock::new(token.to_string()),
             client_name: client_name.to_string(),
             conn: tokio::sync::Mutex::new(None),
+            renewal: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -183,12 +194,32 @@ impl Client {
         path: &str,
         body: Option<Value>,
     ) -> Result<(u16, Value)> {
+        let before = self.token.read().await.clone();
+        let response = self.request_unrenewed(method, path, &body).await?;
+        if response.0 != 401 || installation_id(&before).is_none() || path.ends_with("/refresh") {
+            return Ok(response);
+        }
+        // A 401 is an explicit refusal before effects. Renewing and then
+        // retrying is safe even for a write; a transport failure is not.
+        let _renewal = self.renewal.lock().await;
+        if *self.token.read().await == before {
+            if let Err(error) = self.renew_access(None).await {
+                return match error.downcast_ref::<Refused>() {
+                    Some(_) => Ok(response),
+                    None => Err(error),
+                };
+            }
+        }
+        self.request_unrenewed(method, path, &body).await
+    }
+
+    async fn request_unrenewed(&self, method: &str, path: &str, body: &Option<Value>) -> Result<(u16, Value)> {
         let conn = self.connection(false).await?;
-        match self.exchange(&conn, method, path, &body).await {
+        match self.exchange(&conn, method, path, body).await {
             Ok(r) => Ok(r),
             Err(failed) if failed.stage == Stage::BeforeSend || nullipotent(method) => {
                 let conn = self.connection(true).await?;
-                self.exchange(&conn, method, path, &body).await.map_err(|f| f.error)
+                self.exchange(&conn, method, path, body).await.map_err(|f| f.error)
             }
             Err(failed) => Err(failed.error),
         }
@@ -295,10 +326,18 @@ impl Client {
     /// over untouched — and an expired token cannot refresh, so a
     /// long-sleeping device refreshes on wake before its expiry passes.
     pub async fn refresh_capability(&self, ttl_secs: i64) -> Result<String> {
+        let _renewal = self.renewal.lock().await;
+        self.renew_access(Some(ttl_secs)).await
+    }
+
+    async fn renew_access(&self, ttl_secs: Option<i64>) -> Result<String> {
+        let client = installation_id(&self.token.read().await);
+        let path = client.as_ref().map(|id| format!("/v1/clients/{id}/refresh"))
+            .unwrap_or_else(|| "/v1/capabilities/refresh".to_string());
         let (status, body) = self
-            .request("POST", "/v1/capabilities/refresh", Some(serde_json::json!({"ttl_secs": ttl_secs})))
+            .request_unrenewed("POST", &path, &Some(serde_json::json!({"ttl_secs": ttl_secs})))
             .await?;
-        if status != 201 {
+        if status != if client.is_some() { 200 } else { 201 } {
             return Err(refused("refresh", status, body));
         }
         let token = body["token"]
@@ -351,9 +390,8 @@ impl Client {
         Ok(body)
     }
 
-    /// One look at the pairing session, and the only place its token is
-    /// ever handed over. Collecting clears it from the session, so this
-    /// answers [`Pairing::Approved`] exactly once and then errors.
+    /// Collect the result through the same authenticated installation key.
+    /// Repeating collection recovers safely after a lost response.
     pub async fn pairing_status(&self) -> Result<Pairing> {
         let (status, body) = self.request("GET", "/v1/pair/status", None).await?;
         if status != 200 {
@@ -977,7 +1015,7 @@ pub mod blocking {
             return None;
         }
         let mut out = [0u8; 32];
-        for (byte, pair) in out.iter_mut().zip(digits.chunks_exact(2)) {
+        for (byte, pair) in out.iter_mut().zip(digits.as_chunks::<2>().0) {
             let hi = pair[0].to_digit(16)?;
             let lo = pair[1].to_digit(16)?;
             *byte = (hi * 16 + lo) as u8;

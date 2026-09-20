@@ -92,6 +92,7 @@ struct Client {
     token: String,
     /// Sent as X-Bezel-Client; the server stamps it into source.client.
     client_name: Option<String>,
+    proof: String,
 }
 
 impl Client {
@@ -101,19 +102,27 @@ impl Client {
             base: base.to_string(),
             token: token.to_string(),
             client_name: None,
+            proof: format!("{}{}", uuid::Uuid::new_v4().simple(), uuid::Uuid::new_v4().simple()),
         }
     }
     fn with_client(base: &str, token: &str, client_name: &str) -> Self {
         Self { client_name: Some(client_name.to_string()), ..Self::new(base, token) }
     }
     fn req(&self, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
-        let mut r = self.http.request(method, format!("{}{path}", self.base)).bearer_auth(&self.token);
+        let mut r = self.http.request(method, format!("{}{path}", self.base)).bearer_auth(&self.token)
+            .header("X-ErisDB-Client-Proof", &self.proof);
         if let Some(name) = &self.client_name {
             r = r.header("x-bezel-client", name);
         }
         r
     }
-    async fn post(&self, path: &str, body: Value) -> (u16, Value) {
+    async fn post(&self, path: &str, mut body: Value) -> (u16, Value) {
+        if path == "/v1/pair/redeem" && body.get("challenge").is_none() {
+            use base64::Engine;
+            use sha2::Digest;
+            body["challenge"] = json!(base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(sha2::Sha256::digest(self.proof.as_bytes())));
+        }
         let r = self.req(reqwest::Method::POST, path).json(&body).send().await.unwrap();
         let status = r.status().as_u16();
         (status, r.json().await.unwrap_or(Value::Null))
@@ -207,6 +216,153 @@ async fn health_needs_no_auth() {
     let (url, _root, _pool) = setup().await;
     let r = reqwest::get(format!("{url}/v1/health")).await.unwrap();
     assert_eq!(r.status().as_u16(), 200);
+}
+
+async fn register_browser(operator: &Client, requested: &[&str], ttl: i64) -> (Client, String) {
+    let (status, cut) = operator.post("/v1/pairings", json!({})).await;
+    assert_eq!(status, 201, "{cut}");
+    let id = cut["id"].as_str().unwrap().to_string();
+    let mut browser = Client::new(&operator.base, cut["secret"].as_str().unwrap());
+    let (status, asked) = browser.post("/v1/pair/redeem", json!({"client": "Browser", "requested": requested})).await;
+    assert_eq!(status, 200, "{asked}");
+    let (status, approved) = operator.post(&format!("/v1/pairings/{id}/approve"), json!({"ttl_secs": ttl})).await;
+    assert_eq!(status, 200, "{approved}");
+    let (status, collected) = browser.get("/v1/pair/status").await;
+    assert_eq!(status, 200, "{collected}");
+    assert_eq!(collected["client_id"], id);
+    browser.token = collected["token"].as_str().unwrap().to_string();
+    (browser, id)
+}
+
+#[tokio::test]
+async fn registered_browsers_renew_after_access_expiry_until_revoked() {
+    let (url, root, _pool) = setup().await;
+    let operator = Client::new(&url, &root);
+    let (mut browser, id) = register_browser(&operator, &["tasks:read"], 1).await;
+    let original = browser.token.clone();
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    assert_eq!(browser.get("/v1/permissions").await.0, 401);
+    let (status, renewed) = browser.post(&format!("/v1/clients/{id}/refresh"), json!({})).await;
+    assert_eq!(status, 200, "{renewed}");
+    browser.token = renewed["token"].as_str().unwrap().into();
+    assert_ne!(browser.token, original);
+    assert_eq!(browser.get("/v1/permissions").await.0, 200);
+    let cap = erisdb::auth::verify(SECRET, &browser.token).unwrap();
+    assert!(cap.max_exp.is_none(), "an unasked-for chain deadline forces re-pairing");
+
+    assert_eq!(operator.post(&format!("/v1/clients/{id}/revoke"), json!({})).await.0, 200);
+    assert_eq!(browser.get("/v1/permissions").await.0, 401);
+    assert_eq!(browser.post(&format!("/v1/clients/{id}/refresh"), json!({})).await.0, 401);
+    assert_eq!(operator.post(&format!("/v1/clients/{id}/revoke"), json!({})).await.0, 200, "revocation is idempotent");
+}
+
+#[tokio::test]
+async fn revocation_reaches_other_replicas_and_closes_idle_subscriptions() {
+    use futures::StreamExt;
+    let (url, root, pool) = setup().await;
+    let operator = Client::new(&url, &root);
+    register_tasks_facet(&operator).await;
+    let (mut browser, id) = register_browser(&operator, &["tasks:read"], 600).await;
+    browser.base = spawn_core(pool).await;
+    let response = browser.req(reqwest::Method::GET, "/v1/changes/stream?since=0&facet=tasks")
+        .send().await.unwrap();
+    assert_eq!(response.status(), 200);
+    let mut stream = response.bytes_stream();
+    assert_eq!(browser.get("/v1/items?facet=tasks").await.0, 200);
+    assert_eq!(operator.post(&format!("/v1/clients/{id}/revoke"), json!({})).await.0, 200);
+    assert_eq!(browser.get("/v1/items?facet=tasks").await.0, 401);
+    assert_eq!(browser.post(&format!("/v1/clients/{id}/refresh"), json!({})).await.0, 401);
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while let Some(chunk) = stream.next().await {
+            assert!(!String::from_utf8_lossy(&chunk.unwrap()).contains("event: change"));
+        }
+    }).await.expect("revocation must close an idle stream");
+}
+
+#[tokio::test]
+async fn client_permissions_apply_immediately_and_cannot_exceed_the_request() {
+    let (url, root, _pool) = setup().await;
+    let operator = Client::new(&url, &root);
+    register_tasks_facet(&operator).await;
+    let (browser, id) = register_browser(&operator, &["tasks:*"], 600).await;
+    let (_, record) = operator.get(&format!("/v1/clients/{id}")).await;
+    let revision = record["revision"].as_i64().unwrap();
+    assert_eq!(operator.put(&format!("/v1/clients/{id}"), json!({"grants": ["*"], "revision": revision})).await.0, 403);
+    assert_eq!(browser.put(&format!("/v1/clients/{id}"), json!({"grants": ["*"], "revision": revision})).await.0, 403);
+    assert_eq!(browser.get("/v1/clients").await.0, 403);
+    let (status, changed) = operator.put(&format!("/v1/clients/{id}"), json!({"grants": ["tasks:read"], "revision": revision})).await;
+    assert_eq!(status, 200, "{changed}");
+    assert_eq!(operator.put(&format!("/v1/clients/{id}"), json!({"grants": ["tasks:create"], "revision": revision})).await.0, 409);
+    let (_, permissions) = browser.get("/v1/permissions").await;
+    assert_eq!(permissions["grants"], json!(["tasks:read"]));
+    assert_eq!(browser.post("/v1/items", json!({"facet": "tasks", "body": {"title": "no", "done": false}})).await.0, 403);
+    let (status, renewed) = browser.post(&format!("/v1/clients/{id}/refresh"), json!({})).await;
+    assert_eq!(status, 200);
+    assert_eq!(renewed["grants"], json!(["tasks:read"]));
+}
+
+#[tokio::test]
+async fn delegated_tokens_do_not_escape_their_installations_revocation() {
+    let (url, root, _pool) = setup().await;
+    let operator = Client::new(&url, &root);
+    let (browser, id) = register_browser(&operator, &["tasks:read", "meta:capabilities:mint"], 600).await;
+    let (status, child) = browser.post("/v1/capabilities", json!({"grants": ["tasks:read"], "ttl_secs": 60})).await;
+    assert_eq!(status, 201, "{child}");
+    let child = Client::new(&url, child["token"].as_str().unwrap());
+    assert_eq!(child.get("/v1/permissions").await.0, 200);
+    assert_eq!(child.post(&format!("/v1/clients/{id}/refresh"), json!({})).await.0, 401, "a delegated bearer cannot renew full installation authority");
+    assert_eq!(operator.post(&format!("/v1/clients/{id}/revoke"), json!({})).await.0, 200);
+    assert_eq!(child.get("/v1/permissions").await.0, 401);
+    assert_eq!(child.post("/v1/capabilities/refresh", json!({"ttl_secs": 60})).await.0, 401);
+}
+
+#[tokio::test]
+async fn browser_renewal_requires_the_secret_and_never_persists_it() {
+    let (url, root, pool) = setup().await;
+    let operator = Client::new(&url, &root);
+    let (browser, id) = register_browser(&operator, &["tasks:read"], 600).await;
+    let thief = Client::new(&url, &browser.token);
+    assert_eq!(thief.post(&format!("/v1/clients/{id}/refresh"), json!({})).await.0, 401);
+    let rows: Vec<String> = sqlx::query_scalar("SELECT row_to_json(c)::text FROM clients c")
+        .fetch_all(&pool).await.unwrap();
+    let (_, feed) = operator.get("/v1/changes?since=0&limit=5000").await;
+    let persisted = format!("{rows:?}{feed}");
+    assert!(!persisted.contains(&browser.proof), "renewal secret reached persistent state");
+    assert!(!persisted.contains(&browser.token), "access token reached persistent state");
+}
+
+#[tokio::test]
+async fn pairing_rejects_scope_expansion_and_malformed_browser_proofs() {
+    let (url, root, _pool) = setup().await;
+    let operator = Client::new(&url, &root);
+    let (_, cut) = operator.post("/v1/pairings", json!({})).await;
+    let scanner = Client::new(&url, cut["secret"].as_str().unwrap());
+    for challenge in [json!(null), json!(""), json!("a".repeat(43)), json!("untrusted")] {
+        let (status, _) = scanner.post("/v1/pair/redeem", json!({"client": "App", "requested": ["tasks:read"], "challenge": challenge})).await;
+        assert_eq!(status, 400);
+    }
+    assert_eq!(scanner.post("/v1/pair/redeem", json!({"client": "App", "requested": ["tasks:read"]})).await.0, 200);
+    let route = format!("/v1/pairings/{}/approve", cut["id"].as_str().unwrap());
+    assert_eq!(operator.post(&route, json!({"granted": ["*"]})).await.0, 403);
+    assert_eq!(operator.post(&route, json!({"granted": ["tasks:create"]})).await.0, 403);
+    assert_eq!(operator.post(&route, json!({})).await.0, 200);
+}
+
+#[tokio::test]
+async fn concurrent_collection_registers_one_client_and_recovers_both_responses() {
+    let (url, root, pool) = setup().await;
+    let operator = Client::new(&url, &root);
+    let (_, cut) = operator.post("/v1/pairings", json!({})).await;
+    let scanner = Client::new(&url, cut["secret"].as_str().unwrap());
+    assert_eq!(scanner.post("/v1/pair/redeem", json!({"client": "App", "requested": ["tasks:read"]})).await.0, 200);
+    assert_eq!(operator.post(&format!("/v1/pairings/{}/approve", cut["id"].as_str().unwrap()), json!({})).await.0, 200);
+    let (a, b) = tokio::join!(scanner.get("/v1/pair/status"), scanner.get("/v1/pair/status"));
+    for (status, result) in [a, b] {
+        assert_eq!(status, 200, "{result}");
+        assert!(result["token"].is_string());
+    }
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM clients").fetch_one(&pool).await.unwrap();
+    assert_eq!(count, 1);
 }
 
 #[tokio::test]
@@ -919,6 +1075,7 @@ async fn a_token_past_its_chain_is_refused() {
             user: None,
             max_exp: Some(now - 1),
             pair: None,
+            client: None,
         },
     )
     .unwrap();
@@ -1575,8 +1732,8 @@ async fn pairing_grants_nothing_until_a_human_approves() {
 
     let (status, again) = scanner.get("/v1/pair/status").await;
     assert_eq!(status, 200);
-    assert_eq!(again["status"], "collected");
-    assert!(again["token"].is_null(), "the token was handed out twice");
+    assert_eq!(again["status"], "approved");
+    assert!(again["token"].is_string(), "the bound client must recover a lost response");
 
     // And it grants exactly what the human said, not what was asked.
     let app = Client::new(&url, &token);
@@ -1591,6 +1748,38 @@ async fn pairing_grants_nothing_until_a_human_approves() {
         .put(&format!("/v1/items/{item_id}"), json!({"body": {"title": "x", "done": true}, "revision": 1}))
         .await;
     assert_eq!(status, 403, "update was requested but not granted");
+}
+
+/// Seeing the QR must not let another browser collect the approved client's token.
+#[tokio::test]
+async fn a_photographed_qr_cannot_collect_another_clients_approval() {
+    use base64::Engine;
+    use sha2::Digest;
+    let (url, root, _pool) = setup().await;
+    let operator = Client::new(&url, &root);
+    let (_, cut) = operator.post("/v1/pairings", json!({})).await;
+    let code = cut["secret"].as_str().unwrap();
+    let verifier = "legitimate-client-secret-with-at-least-43-characters";
+    let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(sha2::Sha256::digest(verifier.as_bytes()));
+    let scanner = Client::new(&url, code);
+    let (status, asked) = scanner.post("/v1/pair/redeem", json!({
+        "client": "My browser", "requested": ["tasks:read"], "challenge": challenge,
+    })).await;
+    assert_eq!(status, 200, "{asked}");
+    let (status, approved) = operator.post(
+        &format!("/v1/pairings/{}/approve", cut["id"].as_str().unwrap()), json!({}),
+    ).await;
+    assert_eq!(status, 200, "{approved}");
+
+    let thief = reqwest::Client::new();
+    let stolen = thief.get(format!("{url}/v1/pair/status")).bearer_auth(code).send().await.unwrap();
+    assert_eq!(stolen.status(), 401, "the QR holder collected someone else's token");
+
+    let collected = scanner.http.get(format!("{url}/v1/pair/status"))
+        .bearer_auth(code).header("X-ErisDB-Client-Proof", verifier).send().await.unwrap();
+    assert_eq!(collected.status(), 200);
+    assert!(collected.json::<Value>().await.unwrap()["token"].is_string());
 }
 
 #[tokio::test]
@@ -1942,4 +2131,69 @@ async fn the_core_speaks_http_over_iroh() -> Result<()> {
     assert!(addr.starts_with("iroh:"), "expected iroh:<endpoint id>, got {addr}");
     assert!(addr.contains(&client_ep.id().to_string()), "addr should name the caller: {addr}");
     Ok(())
+}
+
+/// A real terminal process produces the PNG, a real decoder scans it, and
+/// operator input selects authority that the resulting client actually uses.
+#[tokio::test]
+async fn terminal_qr_subset_and_client_management_work_end_to_end() {
+    use std::{process::Stdio, time::Duration};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::process::Command;
+    let (base, root, _) = setup().await;
+    let png_path = std::env::temp_dir().join(format!("erisdb-pair-{}.png", uuid::Uuid::new_v4()));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_erisdb"));
+    let mut child = command.args(["pair", "--url", &base, "--client-url", &base,
+        "--secret", std::str::from_utf8(SECRET).unwrap(), "--no-iroh", "--qr-output"])
+        .arg(&png_path).stdin(Stdio::piped()).stdout(Stdio::piped()).kill_on_drop(true).spawn().unwrap();
+    let mut input = child.stdin.take().unwrap();
+    let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+    let mut printed = String::new();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while let Some(line) = lines.next_line().await.unwrap() {
+            printed.push_str(&line); printed.push('\n');
+            if line.starts_with("saved ") { return; }
+        }
+        panic!("terminal ended without a PNG");
+    }).await.unwrap();
+    let decoder = png::Decoder::new(std::io::BufReader::new(std::fs::File::open(&png_path).unwrap()));
+    let mut reader = decoder.read_info().unwrap();
+    let mut bytes = vec![0; reader.output_buffer_size().unwrap()];
+    let image = reader.next_frame(&mut bytes).unwrap();
+    let mut qr = rqrr::PreparedImage::prepare_from_greyscale(image.width as usize, image.height as usize,
+        |x,y| bytes[y * image.width as usize + x]);
+    let decoded = qr.detect_grids()[0].decode().unwrap().1;
+    assert!(printed.contains(&decoded));
+    let ticket = erisdb::ticket::Ticket::parse(&decoded).unwrap();
+    assert_eq!(ticket.url.as_deref(), Some(base.as_str()));
+    let app = Client::new(&base, &ticket.token);
+    let (status, request) = app.post("/v1/pair/redeem", json!({"client":"Scanned QR app", "requested":["tasks:read","tasks:create"]})).await;
+    assert_eq!(status,200);
+    let id = request["id"].as_str().unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while let Some(line) = lines.next_line().await.unwrap() {
+            if line.contains("Compare this code") {
+                assert!(line.contains(request["body"]["fingerprint"].as_str().unwrap()));
+                return;
+            }
+        }
+        panic!("terminal did not display comparison");
+    }).await.unwrap();
+    input.write_all(b"s\n1\n").await.unwrap();
+    assert!(tokio::time::timeout(Duration::from_secs(10),child.wait()).await.unwrap().unwrap().success());
+    let (status, approved) = app.get("/v1/pair/status").await;
+    assert_eq!(status,200);
+    assert_eq!(approved["granted"],json!(["tasks:read"]));
+    let client = Client::new(&base,approved["token"].as_str().unwrap());
+    assert_eq!(client.post("/v1/items",json!({"facet":"tasks","body":{"title":"forbidden"}})).await.0,403);
+    for action in [vec!["list"],vec!["show",id],vec!["permissions",id,"--grant","tasks:read,tasks:create"],vec!["revoke",id]] {
+        let out = Command::new(env!("CARGO_BIN_EXE_erisdb"))
+            .args(["clients","--url",&base,"--secret",std::str::from_utf8(SECRET).unwrap()])
+            .args(action).output().await.unwrap();
+        assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));
+        assert!(String::from_utf8_lossy(&out.stdout).contains(id));
+    }
+    assert_eq!(client.get("/v1/permissions").await.0,401);
+    assert_eq!(Client::new(&base,&root).get("/v1/clients").await.1["clients"].as_array().unwrap().len(),1);
+    std::fs::remove_file(png_path).unwrap();
 }

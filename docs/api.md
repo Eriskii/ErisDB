@@ -120,6 +120,10 @@ facet of the item that id belongs to.
 | `GET /v1/permissions` | none beyond a valid token |
 | `GET /v1/server` | `meta:server:read` |
 | `POST /v1/pairings` | `meta:pairing:create` |
+| `GET /v1/clients`, `GET /v1/clients/{id}` | `meta:clients:read` |
+| `PUT /v1/clients/{id}` | `meta:clients:write`, plus enclosure |
+| `POST /v1/clients/{id}/revoke` | `meta:clients:revoke` |
+| `POST /v1/clients/{id}/refresh` | Installation proof; no bearer required |
 | `GET /v1/pairings`, `GET /v1/pairings/{id}` | `meta:pairing:read` |
 | `POST /v1/pairings/{id}/approve`, `/deny` | `meta:pairing:approve`, plus enclosure on approve |
 | `POST /v1/pair/redeem`, `GET /v1/pair/status` | `meta:pairing:redeem`, on a token naming a session |
@@ -888,6 +892,13 @@ no data and writes none; presenting it to `GET /v1/items` is a 403.
 
 ### `POST /v1/pair/redeem`
 
+The native identity is taken from the authenticated Iroh connection. HTTP clients
+must include `challenge` (an unpadded base64url SHA-256 commitment to a fresh
+installation secret) in the JSON body. The returned session contains `identity`
+and `fingerprint`. HTTP collection and renewal prove the secret in
+`X-ErisDB-Client-Proof`; redemption never sends the secret itself. See
+[registered installations](clients.md) for transport and credential details.
+
 Say who you are and what you want.
 
 **Permission:** `meta:pairing:redeem`, on a token that names a session.
@@ -928,31 +939,19 @@ is redeemed once, and a denied one cannot be retried for a better answer.
 
 ### `GET /v1/pair/status`
 
-The client's own view, and the one place its token is handed out.
+Requires the pairing capability and the same installation proof used at redemption:
+the authenticated Iroh key, or `X-ErisDB-Client-Proof` for HTTP clients. A different
+key or missing/wrong HTTP proof returns 401, even if the QR ticket is valid.
 
-**Permission:** `meta:pairing:redeem`, on a token that names a session.
+Before approval: `200 {status: "requested", fingerprint: "12AB-34CD-56EF"}`.
+After approval: `200 {status: "approved", granted: [...], token: "bz1.…",
+client_id: "UUID", exp: 1234567890, fingerprint: "12AB-34CD-56EF"}`.
 
-```json
-{ "status": "requested", "granted": null }
-```
-
-Once approved, and **once only**:
-
-```json
-{
-  "status": "approved",
-  "granted": ["tasks:read", "tasks:create"],
-  "token": "bz1.eyJncmFudHMiOlsidGFza3M6cmVhZCIsInRhc2tzOmNyZWF0ZSJdLCJleHAiOjE3ODgxMzM4MzgsInVzZXIiOiJwaG9uZSIsIm1heF9leHAiOjE3OTAxMjA5NDV9.au2Yihi4_lE0216vJWXCDOcVRtyt94gTMkbOT-MAaT4"
-}
-```
-
-Collecting clears the token from the session, so the same call again
-returns `{"status": "approved", "granted": [...]}` with no token. A
-replayed code cannot fetch it twice. Store what you collect; there is no
-second chance and no route that re-issues it.
-
-Poll this while the human decides. `status` is `pending`, `requested`,
-`approved` or `denied`.
+Collection creates the client and marks the pairing collected in one transaction.
+It is repeatable by that same installation while the ticket remains live, so a
+lost response does not lose the enrollment. No token is persisted in the pairing
+or audit log. A revoked registration cannot collect again. Requested/denied
+states contain no access credential. Responses have `Cache-Control: no-store`.
 
 ### `GET /v1/pairings`
 
@@ -1007,8 +1006,8 @@ for, with default lifetimes.
 
 | field | required | default | meaning |
 |-------|----------|---------|---------|
-| `granted` | no | whatever was `requested` | What to actually grant. Usually a subset; it does not have to be. |
-| `ttl_secs` | no | 604800 (7 days) | Lifetime of the token this issues. Must be positive. |
+| `granted` | no | whatever was `requested` | What to actually grant. Must be the requested set or a subset, also enclosed by the approver. |
+| `ttl_secs` | no | 604800 (7 days) | Access-token lifetime, 1–604800 seconds. |
 | `max_ttl_secs` | no | 2592000 (30 days) | Refresh chain, capped at 31536000 and clamped to the approver's own chain when not named. |
 | `user` | no | — | The signed identity the paired client writes as. |
 
@@ -1051,8 +1050,12 @@ Answer no. Takes no body.
 `granted` removed. Unlike approve, deny does not check the session's state
 or its expiry: a session can be denied whenever, including after it was
 approved, which cancels an approval the client has not collected yet. It
-does not reach a token already collected — nothing does, short of rotating
-the secret.
+returns 409 after collection; use `POST /v1/clients/{id}/revoke` to revoke the registration.
+
+## Registered installations
+
+The complete registry API, revision semantics, renewal and revocation contract
+are documented in [clients.md](clients.md#administration).
 
 ## Limits
 
@@ -1065,7 +1068,7 @@ the secret.
 | `X-Bezel-Client` | 128 characters, printable ASCII | It is copied into every change row this caller writes, so an unbounded one is a way to grow the table. |
 | Grants per token | 64, each ≤ 128 chars | Attacker-controlled strings baked into a payload that is HMAC'd on every request. |
 | `user` per token | 128 characters | Same reason. |
-| Refresh chain | 31536000 seconds over HTTP | The chain is the only bound on a leaked token. |
+| Refresh chain | 31536000 seconds over HTTP | Applies to manual/delegated refresh chains; registered installation renewal is independently revocable. |
 | Pairing code lifetime | 60 to 3600 seconds, default 600 | Long enough to walk to the other device, short enough that a photographed screen goes stale. |
 | Request body | 2 MiB | The framework default. Over it is 413. |
 | Store connection pool | 16 | Per replica. |

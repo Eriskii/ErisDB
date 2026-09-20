@@ -65,6 +65,39 @@ pub fn encloses(parent: &[String], child: &[String]) -> bool {
     child.iter().all(|c| parent.iter().any(|p| covers(p, c)))
 }
 
+/// The permissions both authorities grant, including crossing wildcards
+/// such as `tasks:*` and `*:read`, whose intersection is `tasks:read`.
+pub fn intersection(left: &[String], right: &[String]) -> Vec<String> {
+    fn pattern(left: &str, right: &str) -> Option<String> {
+        let a: Vec<_> = left.split(':').collect();
+        let b: Vec<_> = right.split(':').collect();
+        let mut result = Vec::new();
+        for i in 0..a.len().max(b.len()) {
+            let (&x, &y) = (a.get(i)?, b.get(i)?);
+            if x == "*" && i + 1 == a.len() {
+                result.extend_from_slice(&b[i..]);
+                return Some(result.join(":"));
+            }
+            if y == "*" && i + 1 == b.len() {
+                result.extend_from_slice(&a[i..]);
+                return Some(result.join(":"));
+            }
+            result.push(match (x, y) {
+                ("*", _) => y,
+                (_, "*") => x,
+                _ if x == y => x,
+                _ => return None,
+            });
+        }
+        Some(result.join(":"))
+    }
+    left.iter().flat_map(|a| right.iter().filter_map(move |b| pattern(a, b)))
+        .fold(Vec::new(), |mut grants, grant| {
+            if !grants.contains(&grant) { grants.push(grant); }
+            grants
+        })
+}
+
 fn segment_ok(seg: &str, allow_star: bool) -> bool {
     if seg == "*" {
         return allow_star;
@@ -143,6 +176,20 @@ fn meta_action(action: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn intersected_authority_requires_both_grants() {
+        let patterns = ["*", "tasks:*", "*:read", "tasks:read", "lists:create", "meta:*", "meta:pairing:*", "meta:*:read"];
+        let permissions = ["tasks:read", "tasks:create", "tasks:delete", "lists:read", "lists:create", "meta:pairing:read", "meta:pairing:approve", "meta:clients:read", "meta:clients:revoke"];
+        for a in patterns {
+            for b in patterns {
+                let both = intersection(&[a.into()], &[b.into()]);
+                for required in permissions {
+                    assert_eq!(granted(&both, required), covers(a, required) && covers(b, required), "{a} ∩ {b}: {required}");
+                }
+            }
+        }
+    }
 
     fn g(s: &[&str]) -> Vec<String> {
         s.iter().map(|x| x.to_string()).collect()

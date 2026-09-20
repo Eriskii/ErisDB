@@ -146,12 +146,10 @@ to point at one. Against a core that is not up it fails with
 could never be redeemed.
 
 It cuts the code, prints the QR, and waits. When a client redeems, the
-request appears with the permissions it asked for and you answer
-`[a] approve as asked`, `[e] everything`, `[s] select`, or `[d] deny`.
-`[e]` grants `*`; the CLI signs itself a token from the secret, so that
-one really is unlimited. Everything else is bounded by enclosure, which
-means an operator driving pairing through a dashboard grants only what
-their own token holds.
+request appears with its comparison fingerprint and requested permissions.
+Compare the fingerprint with the app, then choose `[a] approve as asked`,
+`[s] select`, or `[d] deny`. Approval cannot exceed the request or the acting
+operator's grants.
 
 Two things to know afterwards:
 
@@ -164,7 +162,7 @@ Two things to know afterwards:
   token is minted on collection, so denying an approved session before the
   client polls genuinely stops it existing. After collection there is a
   live credential and denying is refused with a 409: end that one by
-  expiry, or rotate the secret.
+  `erisdb clients revoke CLIENT_UUID`.
 
 ## Backup and restore
 
@@ -209,20 +207,18 @@ tokens and one that also re-pins every client.
 
 Rotating `ERISDB_SECRET` does exactly one irreversible thing, or two:
 
-- **Every outstanding token dies.** Tokens are self-describing HMACs; the
-  core verifies a signature and looks nothing up. There is no revocation
-  list and no record of who holds what, so there is no list to work from
-  when re-minting. Write down what you cut, or rediscover it the hard way.
+- **Outstanding token signatures become invalid.** Registered installations
+  can renew using their installation proof. Manual tokens must be re-minted.
 - **The address moves too, unless `ERISDB_IROH_SECRET` is set separately.**
   Every Android client, every MCP config, every `erisdb-client` caller is
   pinned to an endpoint id, and after a rotation they dial an address
   nobody answers. Print the new one with `erisdb endpoint-id` and re-pin
   each of them.
 
-Rotation is also the *only* revocation mechanism. A leaked token can be
-killed only by rotating, which kills every other token with it. So mint
-narrowly and let expiry do the work — see
-[capabilities.md](capabilities.md#no-revocation-list).
+Revoke one paired installation with `erisdb clients revoke CLIENT_UUID`.
+This immediately blocks subsequent access, renewal and active change feeds.
+Legacy/manual tokens without a registration still require expiry or signing-key
+rotation. [Client administration](clients.md) explains migration and recovery.
 
 `/etc/erisdb/*.env` stays mode 0600 and root-owned: systemd reads it as the
 manager, before dropping to the `erisdb` user, so the service account never

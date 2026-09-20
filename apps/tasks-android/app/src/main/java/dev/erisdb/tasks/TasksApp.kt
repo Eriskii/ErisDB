@@ -114,7 +114,7 @@ fun TasksApp(pairUri: String? = null, onPairHandled: () -> Unit = {}) {
     // The pairing conversation in flight: the ticket being redeemed, and
     // where the human on the other machine has got to.
     var redeeming by remember { mutableStateOf<Ticket?>(null) }
-    var approval by remember { mutableStateOf<Approval>(Approval.Waiting) }
+    var approval by remember { mutableStateOf<Approval>(Approval.Waiting()) }
     // Why the last ticket was refused. Loud, because a ticket that cannot
     // be read is a ticket that changed nothing.
     var refused by remember { mutableStateOf<String?>(null) }
@@ -188,7 +188,7 @@ fun TasksApp(pairUri: String? = null, onPairHandled: () -> Unit = {}) {
 
     /** Redeem a ticket's code and go and wait for a person. */
     fun beginPairing(ticket: Ticket) {
-        approval = Approval.Waiting
+        approval = Approval.Waiting()
         redeeming = ticket
         screen = Screen.Waiting
     }
@@ -234,7 +234,22 @@ fun TasksApp(pairUri: String? = null, onPairHandled: () -> Unit = {}) {
             if (refreshed.token != null || refreshed.dead) {
                 withContext(Dispatchers.Main) {
                     refreshed.token?.let { token = it }
-                    if (refreshed.dead) status = "token expired · paste a new one"
+                    if (refreshed.dead) { status = "access revoked or expired · pair again"; grants = Grants(emptyList()) }
+                }
+            }
+
+            if (refreshed.dead) return@withContext
+            when (val current = fetchGrants(ErisDBApi)) {
+                is Read.Ok -> {
+                    store.grants = current.value.held
+                    withContext(Dispatchers.Main) { grants = current.value }
+                }
+                is Read.Failed -> if (current.status == 401) {
+                    withContext(Dispatchers.Main) {
+                        status = "access revoked or expired · pair again"
+                        grants = Grants(emptyList())
+                    }
+                    return@withContext
                 }
             }
 

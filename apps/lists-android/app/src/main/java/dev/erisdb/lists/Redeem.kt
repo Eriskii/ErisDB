@@ -25,7 +25,7 @@ const val PAIR_POLL_MS = 1500L
 /** Where a pairing session stands, as this app sees it. */
 sealed class Approval {
     /** Redeemed. Somebody has to press a key on another machine. */
-    data object Waiting : Approval()
+    data class Waiting(val fingerprint: String? = null) : Approval()
 
     /** Answered yes. `token` has already been handed to the keeper, and
      * `granted` is what the human actually approved — which may be less
@@ -61,10 +61,12 @@ suspend fun requestPairing(
         .put("requested", JSONArray(requested))
     val r = api.request("POST", "/v1/pair/redeem", body.toString())
     return when {
-        r.optInt("status") == 200 -> Approval.Waiting
+        r.optInt("status") == 200 -> Approval.Waiting(
+            r.optJSONObject("body")?.optJSONObject("body")?.optString("fingerprint")?.takeIf { it.isNotEmpty() }
+        )
         // This app redeemed already and was interrupted before collecting.
         // The session knows where it stands, so go and ask it.
-        r.optInt("status") == 409 -> Approval.Waiting
+        r.optInt("status") == 409 -> Approval.Waiting()
         transportDown(r) -> Approval.Unreachable(why(r))
         r.optInt("status") == 403 -> Approval.Over(
             "that ticket does not carry a pairing code — cut a fresh one with erisdb pair"
@@ -93,7 +95,7 @@ suspend fun collect(api: CoreApi, keep: (String) -> Unit): Approval {
     } ?: emptyList()
 
     return when (body.optString("status")) {
-        "pending", "requested" -> Approval.Waiting
+        "pending", "requested" -> Approval.Waiting(body.optString("fingerprint").takeIf { it.isNotEmpty() })
         "denied" -> Approval.Denied
         // Spent. The core mints the token once, at collection, and marks
         // the session collected in the same revision-checked write — so a

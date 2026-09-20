@@ -124,7 +124,7 @@ fun readGrants(stored: String?): List<String>? = stored?.let {
  */
 suspend fun fetchGrants(api: CoreApi): Read<Grants> {
     val r = api.request("GET", "/v1/permissions")
-    if (r.optInt("status") != 200) return Read.Failed(why(r))
+    if (r.optInt("status") != 200) return Read.Failed(why(r), r.optInt("status"))
     val arr = r.getJSONObject("body").optJSONArray("grants") ?: JSONArray()
     return Read.Ok(Grants((0 until arr.length()).map { arr.getString(it) }))
 }

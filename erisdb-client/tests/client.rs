@@ -531,10 +531,8 @@ async fn a_client_pairs_itself_and_a_human_decides_what_it_gets() {
         .unwrap();
     assert_eq!(status, 403, "delete was asked for and not granted");
 
-    // The token is handed over once. A replayed code collects nothing,
-    // and the client is told why rather than getting an empty string.
-    let again = app.pairing_status().await.unwrap_err().to_string();
-    assert!(again.contains("once"), "{again}");
+    // The bound installation can recover if a collection response is lost.
+    assert!(matches!(app.pairing_status().await.unwrap(), Pairing::Approved { .. }));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -549,6 +547,37 @@ async fn a_denied_pairing_grants_nothing() {
         answer(&op, &id, None),
     );
     assert_eq!(outcome.expect("pairing ran"), Pairing::Denied);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn installation_keys_bind_collection_renewal_and_access_over_real_iroh() {
+    let (_pg, addr, operator) = a_core_to_pair_with().await;
+    let (id, code) = cut_a_pairing(&operator).await;
+    let app = Client::dial_addr(addr.clone(), &code, "Phone", Some([71; 32])).await.unwrap();
+    let intruder = Client::dial_addr(addr.clone(), &code, "Phone", Some([72; 32])).await.unwrap();
+    let requested = app.redeem_pairing("Phone", &["tasks:read", "tasks:create"]).await.unwrap();
+    let (_, seen) = operator.request("GET", &format!("/v1/pairings/{id}"), None).await.unwrap();
+    assert_eq!(requested["body"]["fingerprint"], seen["body"]["fingerprint"]);
+    let (status, approved) = operator.request("POST", &format!("/v1/pairings/{id}/approve"), Some(json!({"ttl_secs": 1}))).await.unwrap();
+    assert_eq!(status, 200, "{approved}");
+    assert_eq!(intruder.request("GET", "/v1/pair/status", None).await.unwrap().0, 401);
+    let Pairing::Approved { token, .. } = app.pairing_status().await.unwrap() else { panic!("not approved") };
+    let stolen = Client::dial_addr(addr.clone(), &token, "Phone", Some([73; 32])).await.unwrap();
+    assert_eq!(stolen.request("GET", "/v1/items?facet=tasks", None).await.unwrap().0, 401);
+    assert!(stolen.refresh_capability(1).await.is_err());
+
+    // The real installation sleeps past expiry, then reconnects and writes.
+    // The explicit 401 is safely retried after identity-authenticated renewal.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let resumed = Client::dial_addr(addr, &token, "Phone", Some([71; 32])).await.unwrap();
+    let (status, item) = resumed.request("POST", "/v1/items", Some(json!({"facet": "tasks", "body": {"text": "once"}}))).await.unwrap();
+    assert_eq!(status, 201, "{item}");
+    assert_eq!(item["source"]["installation"], id);
+    let (_, items) = resumed.request("GET", "/v1/items?facet=tasks", None).await.unwrap();
+    assert_eq!(items["items"].as_array().unwrap().len(), 1, "renewal duplicated a write");
+    assert_eq!(operator.request("POST", &format!("/v1/clients/{id}/revoke"), Some(json!({}))).await.unwrap().0, 200);
+    assert_eq!(resumed.request("GET", "/v1/items?facet=tasks", None).await.unwrap().0, 401);
+    assert!(resumed.refresh_capability(1).await.is_err());
 }
 
 /// A human may never answer, so waiting is always bounded.

@@ -33,7 +33,7 @@ object ErisDBApi : CoreApi {
 /** A read from the core: the value, or why it did not arrive. */
 sealed class Read<out T> {
     data class Ok<out T>(val value: T) : Read<T>()
-    data class Failed(val error: String) : Read<Nothing>()
+    data class Failed(val error: String, val status: Int = 0) : Read<Nothing>()
 }
 
 /** True when the core never answered, as opposed to answering badly. */

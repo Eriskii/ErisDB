@@ -13,6 +13,31 @@ exists so a *human* answers it, and do not let it overwrite a record it
 only half read — are held here instead, by two env switches and by
 making the dangerous field required.
 
+## Pair a connection
+
+```sh
+erisdb-mcp pair 'bezel://pair/…' --session-file ./tasks-session.json \
+  --grant tasks:read,tasks:create,meta:facets:read
+# Compare the fingerprint and approve on the core's terminal.
+erisdb-mcp --session-file ./tasks-session.json
+```
+
+Use a separate private session file per configured connection. The file is created
+with mode 0600, must not already exist, and is never returned through an MCP tool.
+`ERISDB_SESSION_FILE` is the environment equivalent. An HTTPS URL is required
+remotely; localhost HTTP is accepted. An Iroh-only ticket needs `--url` naming its
+HTTPS endpoint because this bridge speaks HTTP.
+
+Access renews after expiry, including after process restart, using the installation
+secret in that file. Revocation is checked by the core on each call. Only an explicit
+401 triggers renewal and one retry; ambiguous transport failures never repeat a
+write. A failed/interrupted pairing requires a fresh ticket; if the process was
+killed before cleanup, remove its empty session file before retrying.
+
+Existing `ERISDB_URL` plus `ERISDB_TOKEN_FILE`/`ERISDB_TOKEN` configuration still
+works with manual tokens and their original lifetime. For individually revocable,
+automatically renewing access, pair instead. See [client administration](../docs/clients.md).
+
 ## Tools
 
 ```

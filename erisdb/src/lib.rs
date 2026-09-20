@@ -7,6 +7,7 @@
 pub mod api;
 pub mod auth;
 pub mod error;
+pub mod installation;
 pub mod net;
 pub mod pair;
 pub mod permission;

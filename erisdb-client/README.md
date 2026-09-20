@@ -3,8 +3,8 @@
 Dials an ErisDB over Iroh. One QUIC connection, one HTTP/1.1 exchange per
 bi-stream, ALPN `bezel/0` — the same router the core serves over TCP,
 reached from anywhere without a port to forward or a certificate to
-manage. A capability token in hand is the whole of the authentication
-story.
+manage. Registered tokens are bound to the caller’s persistent Iroh installation key.
+Postgres supplies current grants and revocation status on every request.
 
 Three layers, each a thin wrapper over the one below:
 
@@ -93,16 +93,13 @@ match erisdb_client::pair(
 ```
 
 The approved set is not always the requested set: an operator may select
-a subset, or grant `*`. Read `granted` and render from it — and ask what
+the requested set or a subset. Read `granted` and render from it — and ask what
 you hold at any time with `client.permissions()`, which needs no
 permission because the answer is already inside the token.
 
-**The token is handed over once.** Collecting it clears it from the
-session, so a replayed code cannot fetch it again. Persist it before
-doing anything else; `pairing_status()` afterwards is an error naming
-exactly that, not an approval with an empty token in it.
-
-Three properties the surface holds to:
+**The installation proves possession of its Iroh key.** A copied QR cannot
+collect another installation's approved token. Preserve the key passed to `dial`:
+a different key cannot use, collect or renew its registered credentials.
 
 - **Waiting is bounded.** A human may never answer, so `pair` takes a
   deadline and returns `TimedOut` rather than parking forever.
@@ -260,3 +257,14 @@ dev-dependency, so it runs inside a ErisDB checkout.
 
 MIT. See [LICENSE](LICENSE). The core server is AGPL-3.0; the clients are
 deliberately not.
+
+## Installation renewal
+
+Registered requests that receive 401 renew with their persistent Iroh key, even
+after access expiry, then retry once. Revocation makes renewal fail too. An
+explicit 401 is safe to retry because authorization preceded effects; ambiguous
+transport failures retain the existing no-retry rule for writes.
+
+`refresh_capability` selects installation renewal when the token carries a
+`client` ID, and the old bounded-chain endpoint for manual tokens. Current
+registration permissions bound every request, including delegated tokens.

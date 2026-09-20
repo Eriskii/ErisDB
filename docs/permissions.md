@@ -79,6 +79,9 @@ defines them all.
 | `meta:facets:write`      | register, change and remove facets |
 | `meta:server:read`       | server state: version, uptime, limits, live streams, feed head |
 | `meta:feed:read`         | the change feed across every facet |
+| `meta:clients:read` | list or inspect registered installations |
+| `meta:clients:write` | change installation permissions, within requested and acting grants |
+| `meta:clients:revoke` | revoke an installation |
 | `meta:pairing:read`      | list pairing requests |
 | `meta:pairing:create`    | cut a pairing code |
 | `meta:pairing:approve`   | approve or deny a pairing request |
@@ -130,9 +133,9 @@ Pairing is where grants are decided, so an app asks and a human answers.
    ```
 3. **Approve.** The operator sees the request — in the waiting `erisdb pair`
    terminal, or any app holding `meta:pairing:approve` — and answers. They
-   may approve exactly what was asked, select a subset, grant `*`, or deny.
-4. **Collect.** The client polls `GET /v1/pair/status` with the same secret
-   and receives its token. The session is spent.
+   may approve exactly what was asked, select a subset, or deny. Both screens must show the same comparison fingerprint.
+4. **Collect.** The client polls `GET /v1/pair/status` with the pairing code and installation proof,
+   and receives its token. Only that installation can recover the response.
 
 A photographed QR is therefore worth nothing on its own: redeeming it
 raises a prompt on the operator's screen naming the client, and grants
@@ -156,7 +159,9 @@ and no grant depends on them.
 ## Sessions are items
 
 A pairing session is an item in the `pair` facet, reachable through
-`meta:pairing:*`. The core stays stateless: pairing needs no new storage,
-survives a restart, replicates across cores, and lands on the change feed
+`meta:pairing:*`. Pairing survives a restart, is shared across cores through Postgres, and lands on the change feed
 like everything else — so a dashboard watching the feed sees a pairing
 request arrive live.
+
+Durable registrations live separately in `clients`; generic item permissions
+cannot edit or revert them. See [clients.md](clients.md).

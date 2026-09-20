@@ -59,6 +59,10 @@ fun WaitingScreen(
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
+                if (state is Approval.Waiting && state.fingerprint != null) {
+                    Text("Compare ${state.fingerprint} with the terminal before approving.",
+                        style = MaterialTheme.typography.titleMedium)
+                }
                 Asked(requested)
                 if (state is Approval.Unreachable) {
                     Text(

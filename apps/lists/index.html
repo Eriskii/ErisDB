@@ -6,8 +6,7 @@
   Content-Security-Policy, inline because this is a single file served
   from anywhere — a file:// path, a static host, whatever.
 
-  script-src is the sha256 of the one inline <script> below. Editing that
-  script changes its hash and the browser will refuse to run it; recompute
+  script-src 'sha256-Wkdr99UyJoSm9a6z/iKAW4+KkGz0H4iUuiK+UpADKM4=' 'sha256-TRtL/q4WGGDaLQnixy0wAHNskeV4JyRems43deASZxc='; recompute
   with:
 
     { printf '\n'; sed -n '/^<script>$/,/^<\/script>$/p' index.html \
@@ -24,7 +23,7 @@
   BarcodeDetector reads the <video> element directly with no canvas and
   no blob: URL in between.
 -->
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'sha256-GG+zLPEHUDBdqI0xJJcW2fGMbAbE9C8VyV0+lei2N18='; style-src 'unsafe-inline'; connect-src *; base-uri 'none'; form-action 'none'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'sha256-Wkdr99UyJoSm9a6z/iKAW4+KkGz0H4iUuiK+UpADKM4=' 'sha256-TRtL/q4WGGDaLQnixy0wAHNskeV4JyRems43deASZxc='; style-src 'unsafe-inline'; connect-src *; base-uri 'none'; form-action 'none'">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>ErisDB · lists</title>
 <style>
@@ -205,6 +204,7 @@
   </div>
 </main>
 
+<script src="../shared/auth.js" integrity="sha256-Wkdr99UyJoSm9a6z/iKAW4+KkGz0H4iUuiK+UpADKM4="></script>
 <script>
 "use strict";
 // The facet name is the permission namespace, so it carries no version:
@@ -309,7 +309,8 @@ if (typeof selected !== "string") selected = null;
 
 async function api(method, path, body) {
   if (!config) throw new Error("not connected");
-  const res = await fetch(config.url + path, {
+  const res = await fetch(ErisDBAuth.baseURL(config.url) + path, {
+    redirect: "error", cache: "no-store",
     method,
     headers: {
       "Authorization": "Bearer " + config.token,
@@ -354,7 +355,7 @@ let grants = config?.grants ?? null;
 
 // Set when a write comes back 403: the grants on file are behind whatever
 // the core believes, so the next sync re-reads them.
-let permsStale = false;
+let permsStale = true;
 
 /**
  * Does one grant cover one concrete permission? The rule is
@@ -407,9 +408,13 @@ async function refreshToken() {
   if (exp === null || exp - Date.now() / 1000 >= config.ttl / 2) return;
   refreshing = true;
   try {
-    const r = await api("POST", "/v1/capabilities/refresh", { ttl_secs: config.ttl });
-    if (r.status === 201) {
-      config = { ...config, token: r.body.token };   // fresh exp rides in the token
+    const session = config;
+    const r = await ErisDBAuth.renew(session);
+    if (config !== session) return;
+    if (r.status === 200 || r.status === 201) {
+      config = { ...config, token: r.body.token, grants: r.body.grants ?? config.grants };
+      grants = config.grants;
+      renderPermissions();   // fresh exp rides in the token
       save(LS.config, config);
       renderConfigState();
     } else if (r.status === 401) {
@@ -425,7 +430,7 @@ async function refreshToken() {
 // the chain there is no shortcut back: a token comes from a person
 // approving a pairing request, so that is what the message asks for.
 function expired() {
-  setStatus("token expired · pair again");
+  setStatus(config?.refreshSecret ? "access revoked · pair again" : "token expired · pair again");
   $("#settings").open = true;
 }
 
@@ -539,7 +544,7 @@ function parseTicket(str) {
     if (!u || (u.protocol !== "http:" && u.protocol !== "https:")) {
       throw new Error("pairing code's url is not an http or https url");
     }
-    url = t.url.trim().replace(/\/$/, "");
+    url = ErisDBAuth.baseURL(t.url);
   }
   return {
     name: typeof t.name === "string" && t.name.trim() ? t.name.trim() : null,
@@ -558,12 +563,13 @@ function parseTicket(str) {
  * core hands it over exactly once — losing it after collecting it costs
  * the user a whole new pairing.
  */
-async function connect(url, token, name, granted) {
+async function connect(url, token, name, granted, refreshSecret = null) {
+  url = ErisDBAuth.baseURL(url);
   // The token's remaining life is the lifetime to keep renewing at; a
   // token without an exp never expires, so it never refreshes.
   const exp = tokenExp(token);
   config = {
-    url, token, name: name ?? null,
+    url, token, name: name ?? null, refreshSecret,
     grants: Array.isArray(granted) ? granted : null,
     ttl: exp === null ? null : Math.max(1, Math.round(exp - Date.now() / 1000)),
   };
@@ -586,16 +592,19 @@ async function connect(url, token, name, granted) {
 
 // A pairing conversation in flight: the code, the core it came from, and a
 // `live` flag the cancel button clears so an in-flight poll stands down.
+const PENDING_PAIR = "erisdb.lists.pending-pair";
 let pairing = null;
 
 /** One request carrying the pairing code. This is the entire conversation
  * an app has before it holds a capability of its own, so it speaks to two
  * endpoints and no others. */
-async function codeFetch(base, code, method, path, body) {
-  const res = await fetch(base + path, {
+async function codeFetch(base, code, method, path, body, proof) {
+  const res = await fetch(ErisDBAuth.baseURL(base) + path, {
+    redirect: "error", cache: "no-store",
     method,
     headers: {
       "Authorization": "Bearer " + code,
+      ...(proof ? { "X-ErisDB-Client-Proof": proof } : {}),
       "X-Bezel-Client": CLIENT,
       ...(body !== undefined ? { "Content-Type": "application/json" } : {}),
     },
@@ -617,14 +626,18 @@ async function pairWith(str) {
   $("#cfg-ticket").value = "";
   $("#cfg-url").value = t.url;
   const who = t.name ?? t.url;
-  pairing = { code: t.code, url: t.url, name: t.name, live: true };
+  let identity;
+  try { identity = await ErisDBAuth.identity(); }
+  catch (error) { pairMsg(error.message, "bad"); return; }
+  pairing = { code: t.code, url: t.url, name: t.name, proof: identity.secret, challenge: identity.challenge, live: true };
   const mine = pairing;
+  if (!save(PENDING_PAIR, mine)) { failPairing("Cannot save the pairing identity. Enable local storage and try again."); return; }
   showWaiting(who, `asking ${who} for permission…`);
 
   let r;
   try {
     r = await codeFetch(t.url, t.code, "POST", "/v1/pair/redeem",
-      { client: CLIENT, requested: WANTED });
+      { client: CLIENT, requested: WANTED, challenge: identity.challenge });
   } catch {
     if (mine.live) {
       failPairing("Could not reach the core at " + t.url + ". Check it is running and " +
@@ -634,7 +647,7 @@ async function pairWith(str) {
   }
   if (!mine.live) return;                 // cancelled while the request was out
   if (r.status !== 200) { failPairing(redeemError(r)); return; }
-  showWaiting(who, `waiting for approval on ${who}…`);
+  showWaiting(who, `Compare ${r.body.body.fingerprint} with the terminal before approving on ${who}.`);
   pollPairing(who, mine);
 }
 
@@ -663,10 +676,11 @@ function redeemError(r) {
 async function pollPairing(who, mine) {
   while (mine.live) {
     let r;
-    try { r = await codeFetch(mine.url, mine.code, "GET", "/v1/pair/status"); }
+    try { r = await codeFetch(mine.url, mine.code, "GET", "/v1/pair/status", undefined, mine.proof); }
     catch { await sleep(2000); continue; }   // the core blinked; keep waiting
     if (!mine.live) return;
     if (r.status === 200) {
+      if (r.body?.status === "requested") showWaiting(who, `Compare ${r.body.fingerprint} with the terminal before approving on ${who}.`);
       if (r.body?.status === "approved") {
         if (typeof r.body.token !== "string" || !r.body.token) {
           // The session was approved and its token collected by someone
@@ -679,7 +693,8 @@ async function pollPairing(who, mine) {
         const { url, name } = mine;
         mine.live = false; pairing = null;
         hideWaiting();
-        await connect(url, token, name, granted);
+        await connect(url, token, name, granted, mine.proof);
+        forget(PENDING_PAIR);
         pairMsg("paired with " + who, "good");
         setStatus("paired with " + who);
         $("#settings").open = false;   // pairing is done: land in the app
@@ -704,6 +719,7 @@ async function pollPairing(who, mine) {
 function cancelPairing() {
   if (pairing) pairing.live = false;
   pairing = null;
+  forget(PENDING_PAIR);
   hideWaiting();
 }
 
@@ -1132,7 +1148,8 @@ async function sync() {
     // A token adopted from storage reports what it holds on the first sync,
     // and a refused write sends the app back to ask again. Everything the
     // screen offers or withholds follows from the answer.
-    if (grants === null || permsStale) { permsStale = false; await loadPermissions(); }
+    permsStale = false;
+    if (!await loadPermissions()) { expired(); return; }
     await drainOutbox();
     if (cursor === null) await seed();
     const { status, body } = await api("GET",
@@ -1186,11 +1203,12 @@ async function stream() {
   streamAbort = ctl;
   let connected = false;
   try {
-    const res = await fetch(config.url +
+    const res = await fetch(ErisDBAuth.baseURL(config.url) +
       `/v1/changes/stream?since=${cursor}&facet=${encodeURIComponent(FACET)}`, {
       headers: { "Authorization": "Bearer " + config.token, "X-Bezel-Client": CLIENT },
-      signal: ctl.signal,
+      signal: ctl.signal, redirect: "error", cache: "no-store",
     });
+    if (res.status === 401) { expired(); return false; }
     if (!res.ok || !res.body) throw new Error("stream " + res.status);
     connected = true;
     streamLive = true;
@@ -1598,7 +1616,7 @@ $("#cfg-save").onclick = () => {
   // Hand-entered details name a core by its url; a label only ever comes
   // from a ticket, so there is none to keep here. What the token holds is
   // whatever it holds — connect asks the core rather than assuming.
-  connect(url, token, null);
+  connect(url, token, null).catch(error => pairMsg(error.message, "bad"));
 };
 
 $("#cfg-pair").onclick = () => pairWith($("#cfg-ticket").value);
@@ -1633,6 +1651,13 @@ renderPairState();
 renderConfigState();
 render();          // cache renders instantly, before any network
 initScanning();    // and the pairing screen learns whether it has a camera
+const pendingPair = load(PENDING_PAIR, null);
+if (pendingPair?.proof && pendingPair?.code && pendingPair?.url) {
+  pairing = { ...pendingPair, live: true };
+  $("#settings").open = true;
+  showWaiting(pairing.name ?? pairing.url, "resuming pairing…");
+  pollPairing(pairing.name ?? pairing.url, pairing);
+}
 streamLoop();      // then the feed trues it up: catch-up poll, then live
 // The stream is an optimization; the cursor poll is the source of
 // correctness, so it keeps running — every beat while the stream is down,

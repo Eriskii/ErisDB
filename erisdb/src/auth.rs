@@ -55,6 +55,9 @@ pub struct Capability {
     /// The pairing session this token redeems, when it is a pairing code.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pair: Option<String>,
+    /// Registered installation; revocation and current grants live in Postgres.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client: Option<uuid::Uuid>,
 }
 
 impl Capability {
@@ -156,7 +159,7 @@ pub fn mint_chain(
             Some(deadline_from_now(chain)?)
         }
     };
-    let cap = Capability { grants, exp, user: user.map(str::to_string), max_exp, pair: None };
+    let cap = Capability { grants, exp, user: user.map(str::to_string), max_exp, pair: None, client: None };
     mint_capability(secret, &cap)
 }
 
@@ -208,6 +211,7 @@ mod tests {
             user: None,
             max_exp,
             pair: None,
+            client: None,
         }
     }
 

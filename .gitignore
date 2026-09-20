@@ -3,6 +3,9 @@ target/
 build/
 .idea/
 *.iml
+node_modules/
+test-results/
+playwright-report/
 
 # filled-in secrets. Only the *.env.example templates are tracked.
 *.env
@@ -12,3 +15,6 @@ build/
 local.properties
 *.jks
 *.keystore
+.kotlin/
+__pycache__/
+*.pyc

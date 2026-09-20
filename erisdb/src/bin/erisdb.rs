@@ -66,6 +66,9 @@ enum Command {
         /// Lifetime of the token an approval issues, in seconds.
         #[arg(long, default_value_t = 604_800)]
         token_ttl: i64,
+        /// Also save the QR to this PNG file immediately.
+        #[arg(long)]
+        qr_output: Option<PathBuf>,
         /// Put this url in the ticket for clients that cannot speak QUIC.
         /// Browsers need it; phones do not. Defaults to `--url` when that
         /// is not loopback, since a phone cannot dial your localhost.
@@ -78,6 +81,15 @@ enum Command {
         secret: String,
         #[arg(long, env = "ERISDB_IROH_SECRET", hide_env_values = true)]
         iroh_secret: Option<String>,
+    },
+    /// Inspect, change permissions, or revoke registered app installations.
+    Clients {
+        #[arg(long, env = "ERISDB_URL", default_value = "http://127.0.0.1:7700")]
+        url: String,
+        #[arg(long, env = "ERISDB_SECRET", hide_env_values = true)]
+        secret: String,
+        #[command(subcommand)]
+        action: ClientCommand,
     },
     /// Mint a capability token from the shared secret.
     Mint {
@@ -105,6 +117,18 @@ enum Command {
         #[arg(long, env = "ERISDB_SECRET", hide_env_values = true)]
         secret: String,
     },
+}
+
+#[derive(Subcommand)]
+enum ClientCommand {
+    List,
+    Show { id: uuid::Uuid },
+    Permissions {
+        id: uuid::Uuid,
+        #[arg(long = "grant", required = true, value_delimiter = ',')]
+        grants: Vec<String>,
+    },
+    Revoke { id: uuid::Uuid },
 }
 
 #[tokio::main]
@@ -165,7 +189,7 @@ async fn main() -> Result<()> {
             let seed = iroh_secret.as_deref().unwrap_or(&secret);
             println!("{}", erisdb::net::endpoint_id(seed.as_bytes()));
         }
-        Command::Pair { url, name, ttl, token_ttl, client_url, no_iroh, secret, iroh_secret } => {
+        Command::Pair { url, name, ttl, token_ttl, qr_output, client_url, no_iroh, secret, iroh_secret } => {
             let base = url.trim_end_matches('/').to_string();
             // The CLI holds the secret, so it signs itself the short-lived
             // token it needs to drive pairing over the ordinary API — the
@@ -178,7 +202,7 @@ async fn main() -> Result<()> {
             )
             .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-            let http = reqwest::Client::new();
+            let http = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build()?;
             let cut: serde_json::Value = http
                 .post(format!("{base}/v1/pairings"))
                 .bearer_auth(&admin)
@@ -186,6 +210,7 @@ async fn main() -> Result<()> {
                 .send()
                 .await
                 .with_context(|| format!("reaching a core at {base} — is it running?"))?
+                .error_for_status()?
                 .json()
                 .await
                 .context("reading the pairing the core cut")?;
@@ -205,9 +230,31 @@ async fn main() -> Result<()> {
             }
             let ticket = erisdb::ticket::Ticket::new(code, eid, ticket_url, name)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
-            let encoded = ticket.encode().map_err(|e| anyhow::anyhow!("{e}"))?;
-
-            erisdb::pair::run(&http, &base, &admin, &id, &ticket, &encoded, token_ttl).await?;
+            if let Err(error) = erisdb::pair::run(&http, &base, &admin, &id, &ticket, token_ttl, qr_output.as_deref()).await {
+                let _ = http.post(format!("{base}/v1/pairings/{id}/deny")).bearer_auth(&admin).send().await;
+                return Err(error);
+            }
+        }
+        Command::Clients { url, secret, action } => {
+            let base = url.trim_end_matches('/');
+            let token = erisdb::auth::mint(secret.as_bytes(), &["*"], Some(300), None)?;
+            let http = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build()?;
+            let request = match action {
+                ClientCommand::List => http.get(format!("{base}/v1/clients")),
+                ClientCommand::Show { id } => http.get(format!("{base}/v1/clients/{id}")),
+                ClientCommand::Revoke { id } => http.post(format!("{base}/v1/clients/{id}/revoke")),
+                ClientCommand::Permissions { id, grants } => {
+                    let current: serde_json::Value = http.get(format!("{base}/v1/clients/{id}"))
+                        .bearer_auth(&token).send().await?.error_for_status()?.json().await?;
+                    http.put(format!("{base}/v1/clients/{id}"))
+                        .json(&serde_json::json!({ "grants": grants, "revision": current["revision"] }))
+                }
+            };
+            let response = request.bearer_auth(&token).send().await?;
+            let status = response.status();
+            let body: serde_json::Value = response.json().await?;
+            anyhow::ensure!(status.is_success(), "client operation refused ({status}): {body}");
+            println!("{}", serde_json::to_string_pretty(&body)?);
         }
         Command::Mint { grants, ttl, max_ttl, no_expiry, user, secret } => {
             let grants: Vec<&str> = grants.iter().map(String::as_str).collect();

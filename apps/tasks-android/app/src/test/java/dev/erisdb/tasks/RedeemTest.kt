@@ -23,7 +23,7 @@ class RedeemTest {
     @Test
     fun redeemingSaysWhoTheAppIsAndWhatItWants() = runTest {
         val core = core()
-        assertEquals(Approval.Waiting, requestPairing(core, CLIENT, MANIFEST))
+        assertEquals(Approval.Waiting(), requestPairing(core, CLIENT, MANIFEST))
 
         val asked = core.redeemed.single()
         assertEquals(CLIENT, asked.getString("client"))
@@ -64,7 +64,7 @@ class RedeemTest {
         // knows where it stands, so the second run goes and asks it.
         val core = core()
         requestPairing(core, CLIENT, MANIFEST)
-        assertEquals(Approval.Waiting, requestPairing(core, CLIENT, MANIFEST))
+        assertEquals(Approval.Waiting(), requestPairing(core, CLIENT, MANIFEST))
     }
 
     // ------------------------------------------------------------ collect
@@ -73,7 +73,7 @@ class RedeemTest {
     fun aRedeemedCodeWaitsUntilAPersonAnswers() = runTest {
         val core = core()
         requestPairing(core, CLIENT, MANIFEST)
-        assertEquals(Approval.Waiting, collect(core) { fail("nothing to keep yet") })
+        assertEquals(Approval.Waiting(), collect(core) { fail("nothing to keep yet") })
 
         core.approve(listOf("tasks:read", "tasks:create"), "bz1.granted.sig")
         val out = collect(core) {}
@@ -143,7 +143,7 @@ class RedeemTest {
         // Unreachable and Waiting are the two states the poll loop keeps
         // going through; the rest are endings.
         assertTrue(pollingOn(out))
-        assertTrue(pollingOn(Approval.Waiting))
+        assertTrue(pollingOn(Approval.Waiting()))
         assertFalse(pollingOn(Approval.Denied))
         assertFalse(pollingOn(Approval.Over("gone")))
         assertFalse(pollingOn(Approval.Approved("bz1.x", emptyList())))

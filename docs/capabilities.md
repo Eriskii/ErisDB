@@ -1,15 +1,14 @@
 # Capabilities
 
-A capability is a signed string that says what its holder may do. The core
-verifies a signature and looks nothing up — no session table, no user
-table, no revocation list. That is what makes the core stateless, and it
-is also the whole of the security model's cost: authority that cannot be
-looked up cannot be taken back.
+A capability is a signed upper bound on a request's authority. Registered
+installation tokens also carry a `client` UUID: the core checks that registration
+in Postgres on every request, verifies its transport binding and intersects its
+current grants with the token's grants. See [clients.md](clients.md).
 
-Everything below follows from that one trade.
-[permissions.md](permissions.md) is the authority on what a grant *means*;
-this page is about the token that carries one — how long it lives, how it
-delegates, and what it costs to undo.
+Manual/operator tokens have no registration. Their signature, scope and two
+clocks remain sufficient for authorization. The bounded refresh and delegation
+rules below describe those tokens; paired installations have independent renewal
+credentials and renew until revoked.
 
 ## The token
 
@@ -34,6 +33,7 @@ Three dot-separated parts, base64url without padding. The payload is JSON:
 | `exp` | Unix seconds. When *this* token stops working. Null on a `--no-expiry` token. |
 | `max_exp` | Unix seconds. The end of the refresh chain. Omitted when unset. |
 | `user` | A signed identity, stamped into `source.user`. Attribution, not privilege. Omitted when unset. |
+| `client` | Registered installation UUID, inherited by delegated tokens; enables immediate revocation. |
 | `pair` | The pairing session this token redeems. Only a pairing code carries one. Omitted otherwise. |
 
 Signed, not encrypted. Anyone holding a token can read its scope, and
@@ -175,47 +175,24 @@ There is no HTTP spelling for a token that never expires. `ttl_secs` is
 required and must be positive, because a stateless core cannot take back
 something it never recorded.
 
-### Approving is minting
+### Approving an installation
 
 `POST /v1/pairings/{id}/approve` runs the same enclosure check against the
 approver's token. An operator holding only `tasks:*` cannot grant
 `lists:read` however loudly the client asks, and cannot answer a request
 for `*` at all — the approval is refused, not trimmed. Pairing is where
-grants are decided, so it is bounded exactly where minting is.
+grants are decided. Approval also cannot exceed the original app request; its durable authority is independent of the administrator token lifetime.
 
-## No revocation list
+## Revocation
 
-There is nowhere to put one. The core reads a signature and answers; it
-never asks the store who a caller is. Adding a deny-list would mean a
-lookup on every request, state that has to replicate, and a table that has
-to be backed up and restored in step with everything else — which is to
-say, it would end statelessness.
+Use `erisdb clients revoke CLIENT_UUID` for registered installations. It blocks
+access, renewal, delegated tokens and active change subscriptions across replicas.
+Signing-key rotation alone does not revoke a registration: its proof can renew
+against the new signing key. See [clients.md](clients.md#administration).
 
-So there is exactly one way to revoke: **rotate `ERISDB_SECRET`.** It kills
-every outstanding token at once, because every token's signature was made
-with the old key. It is also indiscriminate — the poker's token, every
-phone, every MCP config, all of them, with no record anywhere of who held
-what to re-mint from.
-
-And by default it moves the server's address. The iroh endpoint id is
-derived from `ERISDB_IROH_SECRET` when that is set, and from `ERISDB_SECRET`
-when it is not; on a deployment that never set the former, rotating the
-signing key also re-keys the endpoint and every pinned client dials an
-address nobody answers. Setting `ERISDB_IROH_SECRET` separately, once, at
-install time, is what makes a future rotation cost only tokens. See
-[operations.md](operations.md).
-
-The practical answer to all of this is to grant narrowly and let expiry do
-the work: the smallest set of patterns that works, a `--ttl` wherever a
-lifetime is knowable, a short `--max-ttl` where it is not, and
-`--no-expiry` only where a token must outlive attention — as the poker's
-must.
-
-Narrowly is cheap, because the four actions let a grant say things a
-single write permission cannot. An append-only logger holds
-`sensors:create` and nothing else: it can add readings and can neither
-edit nor erase one. A dashboard holds `*:read` and cannot write anywhere,
-nor reach a single `meta:` operation.
+Legacy and manual tokens without a `client` claim have no individual registry
+entry. Their expiry or signing-key rotation ends them. Keep the Iroh seed separate
+if rotating the signing key must preserve the core's address.
 
 ## Rate limits
 
@@ -232,12 +209,10 @@ It is checked **before** authorization, so a caller with no
 `meta:capabilities:mint` that hammers the mint route sees 429 rather than
 403. Eleven requests on one connection is enough to watch it happen.
 
-The key is the observed address: the rung a caller cannot forge. Over Iroh
-that is the remote endpoint id, a real cryptographic identity, and the
-bucket does what it says. Over plain TCP it is the peer's `ip:port` —
-including the source port — so a caller opening a new connection per
-request gets a fresh bucket every time and the limit is close to
-meaningless. One more reason the TCP listener belongs on loopback.
+The key is the observed Iroh identity or TCP IP (not source port). HTTP clients
+behind the same local reverse proxy share that IP bucket. Installation renewal
+uses the same bucket. Limits are process-local; protect the public TLS edge
+against distributed floods when deploying publicly.
 
 ## Three ways to get a token
 

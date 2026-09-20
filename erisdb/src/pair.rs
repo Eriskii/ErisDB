@@ -149,6 +149,15 @@ fn prompt(text: &str) {
     std::io::stdout().flush().ok();
 }
 
+async fn answer_before(lines: &mut tokio::sync::mpsc::UnboundedReceiver<String>, expires: i64) -> Result<String> {
+    let remaining = expires.saturating_sub(chrono::Utc::now().timestamp()).max(0) as u64;
+    tokio::select! {
+        line = lines.recv() => line.context("pairing cancelled: input closed"),
+        _ = tokio::signal::ctrl_c() => anyhow::bail!("pairing cancelled"),
+        _ = tokio::time::sleep(std::time::Duration::from_secs(remaining)) => anyhow::bail!("pairing expired"),
+    }
+}
+
 /// Run the pairing conversation to its end: show the code, wait for a
 /// client to ask, put the request to the operator, and answer it.
 pub async fn run(
@@ -157,41 +166,51 @@ pub async fn run(
     admin: &str,
     id: &str,
     ticket: &crate::ticket::Ticket,
-    encoded: &str,
     token_ttl: i64,
+    qr_output: Option<&Path>,
 ) -> Result<()> {
-    show(ticket, encoded);
+    let encoded = ticket.encode()?;
+    show(ticket, &encoded);
+    if let Some(path) = qr_output {
+        write_png(&encoded, path, 8)?;
+        println!("saved {}", path.display());
+    }
     println!("Waiting for a client. Press s to save the code as a png, or ctrl-c to stop.");
     prompt("> ");
 
     let mut lines = stdin_lines();
+    let mut poll = tokio::time::interval(std::time::Duration::from_secs(1));
     let session = loop {
         tokio::select! {
+            _ = tokio::signal::ctrl_c() => anyhow::bail!("pairing cancelled"),
             line = lines.recv() => match line {
                 Some(l) if l.trim().eq_ignore_ascii_case("s") => {
                     let path = png_path(ticket.name.as_deref());
-                    write_png(encoded, &path, 8)?;
+                    write_png(&encoded, &path, 8)?;
                     println!("saved {}", path.display());
                     prompt("> ");
                 }
                 Some(_) => prompt("> "),
-                None => {}
+                None => anyhow::bail!("pairing cancelled: input closed"),
             },
-            _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
+            _ = poll.tick() => {
                 let body: serde_json::Value = http
                     .get(format!("{base}/v1/pairings/{id}"))
                     .bearer_auth(admin)
                     .send()
                     .await?
+                    .error_for_status()?
                     .json()
                     .await?;
+                anyhow::ensure!(body["body"]["expires"].as_i64().is_some_and(|end| end > chrono::Utc::now().timestamp()), "pairing expired");
                 match body["body"]["status"].as_str() {
                     Some("requested") => break body,
-                    Some("pending") | None => {}
+                    Some("pending") => {}
                     Some(other) => {
                         println!("\npairing is {other}; nothing to do.");
                         return Ok(());
                     }
+                    None => anyhow::bail!("core returned an invalid pairing session"),
                 }
             }
         }
@@ -203,21 +222,23 @@ pub async fn run(
         .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
         .unwrap_or_default();
 
-    println!("\n\n{client} wants:");
+    let fingerprint = session["body"]["fingerprint"].as_str().context("pairing has no verification code")?;
+    println!("\n\nCompare this code with the app: {fingerprint}");
+    println!("Approve only if both displays match.\n{client} wants:");
     for (i, grant) in asked.iter().enumerate() {
         println!("  {}. {grant}", i + 1);
     }
-    println!("\n[a] approve as asked   [e] everything   [s] select   [d] deny");
+    println!("\n[a] approve as asked   [s] select   [d] deny");
     prompt("> ");
 
-    let answer = lines.recv().await.unwrap_or_default().trim().to_lowercase();
+    let expires = session["body"]["expires"].as_i64().context("pairing has no expiry")?;
+    let answer = answer_before(&mut lines, expires).await?.trim().to_lowercase();
     let granted: Vec<String> = match answer.as_str() {
         "a" => asked.clone(),
-        "e" => vec!["*".to_string()],
         "s" => {
             println!("Numbers to approve, comma separated (empty denies):");
             prompt("> ");
-            let picks = lines.recv().await.unwrap_or_default();
+            let picks = answer_before(&mut lines, expires).await?;
             picks
                 .split(',')
                 .filter_map(|p| p.trim().parse::<usize>().ok())

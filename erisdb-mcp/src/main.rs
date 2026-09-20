@@ -12,6 +12,11 @@
 //! it only half read — are held back here as well, by [`Policy`] and by
 //! making the dangerous field required rather than optional.
 
+mod session;
+
+use clap::Parser;
+use std::{path::PathBuf, sync::Arc};
+use tokio::sync::{Mutex, RwLock};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerInfo};
 use rmcp::{tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler, ServiceExt};
@@ -77,7 +82,9 @@ impl Policy {
 struct ErisDBMcp {
     http: reqwest::Client,
     base: String,
-    token: String,
+    token: Arc<RwLock<String>>,
+    session: Option<Arc<session::Session>>,
+    renewal: Arc<Mutex<()>>,
     policy: Policy,
 }
 
@@ -91,10 +98,24 @@ impl ErisDBMcp {
         query: &[(&str, String)],
         body: Option<&Value>,
     ) -> Result<(u16, Value), String> {
+        let token = self.token.read().await.clone();
+        let first = self.call_with(&token, method.clone(), path, query, body).await?;
+        if first.0 != 401 { return Ok(first); }
+        let Some(session) = &self.session else { return Ok(first); };
+        let _renewal = self.renewal.lock().await;
+        if *self.token.read().await == token {
+            *self.token.write().await = session.renew(&self.http).await.map_err(|e| format!("renewal: {e}"))?;
+        }
+        let token = self.token.read().await.clone();
+        self.call_with(&token, method, path, query, body).await
+    }
+
+    async fn call_with(&self, token: &str, method: reqwest::Method, path: &str,
+        query: &[(&str, String)], body: Option<&Value>) -> Result<(u16, Value), String> {
         let mut req = self
             .http
             .request(method, format!("{}{path}", self.base))
-            .bearer_auth(&self.token)
+            .bearer_auth(token)
             .header("x-bezel-client", "erisdb-mcp");
         if !query.is_empty() {
             req = req.query(query);
@@ -264,7 +285,8 @@ struct ApprovePairing {
 #[tool_router]
 impl ErisDBMcp {
     fn new(base: String, token: String, policy: Policy) -> Self {
-        Self { http: reqwest::Client::new(), base, token, policy }
+        Self { http: session::http(), base, token: Arc::new(RwLock::new(token)),
+            session: None, renewal: Arc::new(Mutex::new(())), policy }
     }
 
     #[tool(description = "List every registered facet (the tables of the store): name, strictness, and JSON Schema. Read this first to learn what data exists.")]
@@ -490,8 +512,7 @@ impl ErisDBMcp {
             return Self::refuse(
                 "\"*\" is a master key over the whole store and is not granted through this \
                  server. Name the permissions the client actually needs, or hand out a master \
-                 key yourself with `erisdb pair` (the [e] key), where a person is looking at the \
-                 request.",
+                 key yourself with `erisdb mint` after reviewing the required authority.",
             );
         }
         // An approved token is a credential like a minted one, so the
@@ -567,15 +588,44 @@ fn token_from_env() -> anyhow::Result<String> {
     })
 }
 
+#[derive(Parser)]
+#[command(version, about = "ErisDB MCP bridge; pair once, renew until revoked")]
+struct Args {
+    #[arg(long, env = "ERISDB_SESSION_FILE")]
+    session_file: Option<PathBuf>,
+    #[command(subcommand)]
+    command: Option<Action>,
+}
+
+#[derive(clap::Subcommand)]
+enum Action {
+    /// Pair this connection interactively, using a pasted ticket.
+    Pair {
+        ticket: String,
+        #[arg(long)] session_file: PathBuf,
+        #[arg(long, env = "ERISDB_URL")] url: Option<String>,
+        #[arg(long, default_value = "erisdb-mcp")] name: String,
+        #[arg(long = "grant", value_delimiter = ',', required = true)] grants: Vec<String>,
+    },
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let base = std::env::var("ERISDB_URL")
-        .map_err(|_| anyhow::anyhow!("ERISDB_URL is not set (e.g. http://127.0.0.1:7700)"))?
-        .trim_end_matches('/')
-        .to_string();
-    let service = ErisDBMcp::new(base, token_from_env()?, Policy::from_env())
-        .serve(rmcp::transport::stdio())
-        .await?;
+    let args = Args::parse();
+    if let Some(Action::Pair { ticket, session_file, url, name, grants }) = args.command {
+        return session::pair(&ticket, url.as_deref(), &session_file, &name, &grants).await;
+    }
+    let bridge = if let Some(path) = args.session_file {
+        let session = session::Session::read(&path)?;
+        let mut bridge = ErisDBMcp::new(session.url.clone(), session.token.clone(), Policy::from_env());
+        bridge.session = Some(Arc::new(session));
+        bridge
+    } else {
+        let base = session::base_url(&std::env::var("ERISDB_URL")
+            .map_err(|_| anyhow::anyhow!("set ERISDB_SESSION_FILE, or ERISDB_URL and ERISDB_TOKEN_FILE"))?)?;
+        ErisDBMcp::new(base, token_from_env()?, Policy::from_env())
+    };
+    let service = bridge.serve(rmcp::transport::stdio()).await?;
     service.waiting().await?;
     Ok(())
 }
