@@ -65,6 +65,7 @@ jobs:
       - run: npm ci
       - run: npx playwright install --with-deps chromium
       - run: python3 scripts/update-csp.py --check
+      - run: cargo build --locked --manifest-path erisdb/Cargo.toml --bin erisdb
       - run: npm run test:e2e
       - uses: actions/upload-artifact@v4
         if: failure()
@@ -85,6 +86,8 @@ jobs:
         with:
           node-version: 22
       - uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
       - run: sdkmanager "platforms;android-37" "build-tools;36.0.0" "ndk;29.0.14206865"
       - run: rustup target add aarch64-linux-android x86_64-linux-android
       - run: cargo install cargo-ndk --locked

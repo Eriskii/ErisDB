@@ -213,8 +213,7 @@ Switched on, three things still hold:
   default that arrives by omission; the permissions get typed out, which
   means they get read.
 - **`"*"` is refused outright.** A master key is a keystroke a person
-  makes while looking at the request — `[e]` in `erisdb pair` — not
-  something handed out on request over a tool call.
+  makes using `erisdb mint`, after reviewing the required authority.
 - **The lifetime is capped** by `ERISDB_MCP_MAX_MINT_TTL`, including when
   `ttl_secs` is omitted. An approved token is a credential like a minted
   one, and the core's own default is a week.

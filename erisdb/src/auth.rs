@@ -1,8 +1,8 @@
-//! Stateless capability tokens.
+//! Signed capability tokens and bounded delegation.
 //!
 //! A token is `bz1.<b64url(payload)>.<b64url(hmac_sha256(secret, payload))>`.
-//! The payload carries its own scope; the core verifies a signature and looks
-//! nothing up.
+//! The payload carries an upper scope bound. Registered tokens also name an
+//! installation; api/installation.rs checks its live Postgres authority.
 //!
 //! Scope is a set of grants, matched against the permission each request
 //! requires. See permission.rs and docs/permissions.md.
@@ -10,8 +10,7 @@
 //! Lifetime runs on two clocks. `exp` is when this token stops working.
 //! `max_exp` is the end of its refresh chain: refresh moves `exp` forward,
 //! never past `max_exp`. Once `max_exp` passes, the line is dead and a human
-//! re-mints — so a leaked token is bounded even though the core keeps no
-//! revocation list. A token with no `exp` never expires and cannot be
+//! re-mints. Registered installations have a separate, revocable renewal proof. A token with no `exp` never expires and cannot be
 //! refreshed; only the CLI, which holds the secret, mints one.
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;

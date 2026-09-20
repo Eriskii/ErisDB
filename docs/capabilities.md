@@ -251,9 +251,8 @@ the secret, so it is already the trusted path.
 
 `erisdb pair` takes no scope flags at all. It cuts a pairing code against a
 running core, shows it as a QR, and waits: the client says what it wants
-and the operator answers. What it hands out is bounded by enclosure like
-any other mint, and the CLI's own working token is cut from the secret, so
-`[e] everything` really can grant `*`.
+and the operator answers. Approval is bounded by the requested grants and the operator’s own authority.
+The terminal offers approve, select a subset, or deny, after fingerprint comparison.
 
 ```sh
 erisdb pair --name my-laptop

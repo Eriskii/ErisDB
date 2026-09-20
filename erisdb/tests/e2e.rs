@@ -43,6 +43,10 @@ async fn pg() -> &'static Pg {
 
 /// A fresh, migrated database in the shared container.
 async fn fresh_pool() -> PgPool {
+    fresh_pool_with(&erisdb::MIGRATOR).await
+}
+
+async fn fresh_pool_with(migrations: &sqlx::migrate::Migrator) -> PgPool {
     let pg = pg().await;
     let db = format!("erisdb_{}", uuid::Uuid::new_v4().simple());
     let admin = PgPoolOptions::new()
@@ -60,7 +64,7 @@ async fn fresh_pool() -> PgPool {
         .connect(&format!("{}/{db}", pg.base_url))
         .await
         .expect("db connect");
-    erisdb::MIGRATOR.run(&pool).await.expect("migrate");
+    migrations.run(&pool).await.expect("migrate");
     pool
 }
 
@@ -2196,4 +2200,31 @@ async fn terminal_qr_subset_and_client_management_work_end_to_end() {
     assert_eq!(client.get("/v1/permissions").await.0,401);
     assert_eq!(Client::new(&base,&root).get("/v1/clients").await.1["clients"].as_array().unwrap().len(),1);
     std::fs::remove_file(png_path).unwrap();
+}
+
+/// Upgrade a real pre-registry database, preserving data and recording every
+/// forced pairing transition in the same durable feed as ordinary writes.
+#[tokio::test]
+async fn upgrading_legacy_pairings_preserves_data_and_audits_invalidation() {
+    let legacy = sqlx::migrate::Migrator::with_migrations(
+        erisdb::MIGRATOR.iter().filter(|m| m.version < 6).cloned().collect());
+    let pool = fresh_pool_with(&legacy).await;
+    let id = uuid::Uuid::new_v4();
+    sqlx::query("INSERT INTO items (id, facet, body) VALUES ($1, 'pair', $2)")
+        .bind(id).bind(json!({"status":"approved","requested":["tasks:read"],"granted":["tasks:read"]}))
+        .execute(&pool).await.unwrap();
+    let data_id = uuid::Uuid::new_v4();
+    sqlx::query("INSERT INTO items (id, facet, body) VALUES ($1, 'tasks', $2)")
+        .bind(data_id).bind(json!({"title":"existing data","done":false})).execute(&pool).await.unwrap();
+    erisdb::MIGRATOR.run(&pool).await.unwrap();
+    let base = spawn_core(pool).await;
+    let admin = Client::new(&base, &erisdb::auth::mint(SECRET, &["*"], Some(60), None).unwrap());
+    let pairing = admin.get(&format!("/v1/pairings/{id}")).await.1;
+    assert_eq!(pairing["body"]["status"],"denied");
+    assert_eq!(pairing["revision"],2);
+    let history = admin.get(&format!("/v1/items/{id}/history")).await.1;
+    assert!(history.to_string().contains("0006_registered_clients"));
+    assert!(history.to_string().contains("denied"));
+    assert_eq!(admin.get(&format!("/v1/items/{data_id}")).await.1["body"]["title"],"existing data");
+    assert_eq!(admin.get("/v1/clients").await.1["clients"],json!([]));
 }

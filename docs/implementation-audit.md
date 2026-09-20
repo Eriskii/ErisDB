@@ -84,15 +84,16 @@ for individual revocation. No mDNS or short-code service was added.
 ## Verification of the implementation
 
 Locally passed: Clippy with warnings denied on all three Rust components;
-161 Rust tests (including real Postgres, TCP, Iroh, terminal/PNG decoder and MCP
+162 Rust tests (including real Postgres, TCP, Iroh, terminal/PNG decoder and MCP
 subprocess flows); all three Chromium E2E scenarios against a real core and
-Postgres; both Android unit suites and APK builds with real ARM64/x86_64 JNI.
+Postgres; 209 Android unit tests and both APK builds with real ARM64/x86_64 JNI.
 
 The QR theft regression was reproduced before the fix: a second client holding
 only the photographed ticket received the approved credential. It now receives
 401. Additional integration cases cover post-expiry renewal, foreign Iroh keys,
 concurrent collection, grant intersection/ceilings, stale revisions, renewal-proof
-secrecy, delegated revocation, and closing idle subscriptions across replicas.
+secrecy, delegated revocation, closing idle subscriptions across replicas, and
+upgrading a real pre-registry database without losing data or audit history.
 
 `tests/android/e2e.py` drives actual APK screens through ADB, then validates writes
 and installation identity in the actual core. It exercises deep-link pairing,

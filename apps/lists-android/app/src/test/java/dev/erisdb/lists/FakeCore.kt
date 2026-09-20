@@ -123,16 +123,14 @@ class FakeCore(private val facet: String = "lists") : CoreApi {
         }
         if (pairExpired) return refuse(400, "bad_request", "this pairing code has expired")
         val body = JSONObject()
-            .put("status", pairStatus ?: "pending")
+            .put("status", if (pairStatus == "collected") "approved" else pairStatus ?: "pending")
             .put("granted", JSONArray(pairGranted))
-        // Handed over once: the core mints the token at collection and
-        // spends the session in the same write, so what a replay sees is
-        // `collected` and no token.
+        // Unit fixture models repeatable collection by this same app.
+        // Real identity binding is exercised against PostgreSQL/Iroh in E2E.
         pairToken?.let {
             body.put("token", it)
             pairStatus = "collected"
         }
-        pairToken = null
         return answer(200, body)
     }
 

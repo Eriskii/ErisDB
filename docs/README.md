@@ -8,11 +8,12 @@ anything else. These pages are the detail behind it.
 |------|-----|
 | [api.md](api.md) | The complete v1 HTTP reference. Every route, parameter, status code, required permission and error. The reference, and the place to check a claim. |
 | [permissions.md](permissions.md) | What a grant is and what it covers. The grammar, the four facet actions, the closed `meta` namespace, enclosure, and why the facet namespace is open. |
-| [capabilities.md](capabilities.md) | The token that carries a grant: the two clocks, refresh, enclosure over scope and time, why there is no revocation list, what rotation costs. |
+| [capabilities.md](capabilities.md) | The token that carries a grant: the two clocks, refresh, enclosure over scope and time, manual refresh chains and registered revocation. |
 | [facets.md](facets.md) | What a facet is, how to register one, why its name is a permission namespace, schema validation, lapse rules, and the shipped contracts in full. |
 | [plugins.md](plugins.md) | One-shot executable plugins: manifests, operation schemas and permissions, the stdin/stdout protocol, streaming, and the OpenAI Chat Completions plugin. |
 | [change-feed.md](change-feed.md) | The feed as bus and audit log. Cursors, ops, history, revert, and the fact that it grows forever. |
-| [clients.md](clients.md) | How to build one. Pair, sync, write, refresh — and the worked examples in this tree. |
+| [clients.md](clients.md) | Registered installation identity, independent renewal, revocation, administration and migration. |
+| [client-development.md](client-development.md) | How to build one. Pair, sync, write, refresh — and the worked examples in this tree. |
 | [pairing.md](pairing.md) | The ticket format: one QR code carrying an address and a code a human turns into a token. |
 | [operations.md](operations.md) | Running it. Configuration, migrations, the poker, pairing, secrets, transport, limits, logs. |
 
@@ -25,7 +26,7 @@ finish: build, database, service, tokens, poker, apps. Then
 [what secret rotation costs](operations.md#secrets-and-what-rotation-costs),
 which is cheaper to get right at install time than later.
 
-**I want to build a client.** [clients.md](clients.md) first: it is the
+**I want to build a client.** [client-development.md](client-development.md) first: it is the
 shape, and it links out to everything it depends on.
 [permissions.md](permissions.md) to decide what to ask a human for,
 [api.md](api.md) as you go, [pairing.md](pairing.md) if the thing has a
@@ -34,7 +35,7 @@ and reads faster than any of this.
 
 **I want to understand the design.** [permissions.md](permissions.md) and
 [change-feed.md](change-feed.md) are the two ideas the rest follows from —
-authority as namespaced grants nobody can recall, and an append-only feed
+authority as namespaced grants bounded by revocable installations, and an append-only feed
 that is both the bus and the history. [capabilities.md](capabilities.md)
 is the lifetime and delegation half of the first;
 [facets.md](facets.md) is how the store gets structure without a deploy.

@@ -6,7 +6,7 @@
   Content-Security-Policy, inline because this is a single file served
   from anywhere — a file:// path, a static host, whatever.
 
-  script-src 'sha256-Wkdr99UyJoSm9a6z/iKAW4+KkGz0H4iUuiK+UpADKM4=' 'sha256-4gNgrtw6AkToxRk6jLhsteL78sQr9M1ZV9roxkVpw0Y='; recompute
+  script-src 'sha256-Wkdr99UyJoSm9a6z/iKAW4+KkGz0H4iUuiK+UpADKM4=' 'sha256-8j3GJYGtYRZdUPB9bs6O19UG/JUujj5IX1v3aV6uW0k='; recompute
   with:
 
     { printf '\n'; sed -n '/^<script>$/,/^<\/script>$/p' index.html \
@@ -23,7 +23,7 @@
   BarcodeDetector reads the <video> element directly with no canvas and
   no blob: URL in between.
 -->
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'sha256-Wkdr99UyJoSm9a6z/iKAW4+KkGz0H4iUuiK+UpADKM4=' 'sha256-4gNgrtw6AkToxRk6jLhsteL78sQr9M1ZV9roxkVpw0Y='; style-src 'unsafe-inline'; connect-src *; base-uri 'none'; form-action 'none'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'sha256-Wkdr99UyJoSm9a6z/iKAW4+KkGz0H4iUuiK+UpADKM4=' 'sha256-8j3GJYGtYRZdUPB9bs6O19UG/JUujj5IX1v3aV6uW0k='; style-src 'unsafe-inline'; connect-src *; base-uri 'none'; form-action 'none'">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>ErisDB · tasks</title>
 <style>
@@ -412,9 +412,8 @@ async function refreshToken() {
   }
 }
 
-// Refresh keeps a session alive; it cannot resurrect one. Past the end of
-// the chain there is no shortcut back: a token comes from a person
-// approving a pairing request, so that is what the message asks for.
+// Registered renewal can recover expired access. A refused installation
+// must pair again; manual tokens still have a bounded refresh chain.
 function expired() {
   setStatus(config?.refreshSecret ? "access revoked · pair again" : "token expired · pair again");
   $("#settings").open = true;
@@ -547,8 +546,8 @@ function parseTicket(str) {
  * token comes through here.
  *
  * The token is written to storage before the first `await`, because the
- * core hands it over exactly once — losing it after collecting it costs
- * the user a whole new pairing.
+ * installation proof can recover a lost collection response while the
+ * pairing ticket remains live.
  */
 async function connect(url, token, name, granted, refreshSecret = null) {
   url = ErisDBAuth.baseURL(url);
@@ -657,8 +656,8 @@ function redeemError(r) {
 
 /**
  * Wait for the human. `requested` is the wait itself; `approved` hands the
- * token over exactly once, so it is stored before anything else is done
- * with it, and `denied` is a plain answer rather than an error.
+ * token to the proven installation. Store it before proceeding; `denied`
+ * is a plain answer rather than a transport error.
  */
 async function pollPairing(who, mine) {
   while (mine.live) {
@@ -670,10 +669,7 @@ async function pollPairing(who, mine) {
       if (r.body?.status === "requested") showWaiting(who, `Compare ${r.body.fingerprint} with the terminal before approving on ${who}.`);
       if (r.body?.status === "approved") {
         if (typeof r.body.token !== "string" || !r.body.token) {
-          // The session was approved and its token collected by someone
-          // else. It is handed over once, so there is nothing to collect.
-          failPairing("This pairing was already completed elsewhere — a token is handed " +
-            "over once. Run erisdb pair on the core again to pair this app.");
+          failPairing("The core returned an approval without a token. Update the core and pair again.");
           return;
         }
         const { token, granted } = r.body;

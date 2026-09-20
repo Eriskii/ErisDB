@@ -200,7 +200,7 @@ painful: parse the ticket, redeem it once, then loop on `nativePairPoll`
 from a background thread while the status is `waiting`. Every call is
 bounded by its own timeout, so no thread parks forever, and the back
 button calls `nativePairCancel`, which wakes a parked poll with
-`cancelled`. `approved` is the one and only sighting of the token —
+`cancelled`. Persist `approved` before proceeding —
 write it to storage before anything else, and read `granted` rather than
 assuming the request was granted whole.
 

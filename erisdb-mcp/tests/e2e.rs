@@ -3,11 +3,8 @@
 //! socket, and the erisdb-mcp binary as a real subprocess speaking
 //! JSON-RPC over its stdio. No mocks.
 //!
-//! Nothing here links the erisdb crate. The core is driven as a process,
-//! so this repo stands on its own: a bare clone builds, and `cargo test`
-//! runs everything that does not need a core — the handshake, the
-//! toolbox, the input schemas, and the guards that refuse before they
-//! reach the network. The rest says out loud what it needs and stops.
+//! The core is driven as a process and built from the sibling crate when
+//! needed. Missing prerequisites fail the suite rather than silently skipping.
 
 use std::path::PathBuf;
 use std::process::Stdio;

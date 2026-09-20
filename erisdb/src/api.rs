@@ -838,9 +838,8 @@ async fn stream_changes(
         facet: Option<String>,
         cursor: i64,
         queue: VecDeque<Change>,
-        /// When the token that opened this stream dies. Authorization is
-        /// checked once, at subscribe, so without this a token with a minute
-        /// left holds an open firehose for as long as the process runs.
+        /// Signature verification happens at subscribe; expiry and live
+        /// registration authority are checked before every emitted event.
         expires_at: Option<i64>,
         capability: Capability,
         peer: Option<String>,

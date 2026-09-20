@@ -14,10 +14,8 @@ import org.json.JSONObject
 //   POST /v1/pair/redeem   — who this app is, and what it would like
 //   GET  /v1/pair/status   — polled until a human answers
 //
-// The token comes back exactly once: collecting it clears it from the
-// session, so a replayed code cannot fetch it again. That is why `collect`
-// hands it to its caller before returning, and why the caller's job is to
-// put it on disk and nothing else.
+// Collection is bound to the installation key and repeatable while the
+// ticket is live. Persist the returned credential before proceeding.
 
 /** How long between polls while a human is deciding. */
 const val PAIR_POLL_MS = 1500L
@@ -79,10 +77,8 @@ suspend fun requestPairing(
  * Ask the session where it stands and, on approval, put the token in the
  * caller's hands before returning.
  *
- * `keep` runs first and runs once. The core hands the token over exactly
- * once, so a token collected and then lost to a crash costs the user
- * another trip to the core — durability here matters more than anywhere
- * else in this app.
+ * `keep` runs before returning. A lost response can be recovered by the
+ * same installation, but persistence still precedes app work.
  */
 suspend fun collect(api: CoreApi, keep: (String) -> Unit): Approval {
     val r = api.request("GET", "/v1/pair/status")

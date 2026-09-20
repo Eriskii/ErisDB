@@ -207,21 +207,18 @@ openssl rand -hex 32
 Rotating it therefore does two irreversible things to everything already
 deployed:
 
-- **Every outstanding token dies.** Tokens are self-describing HMACs: the
-  core verifies a signature and looks nothing up. There is no revocation
-  list and no record of who holds what. Every client needs re-minting.
+- **Outstanding token signatures become invalid.** Registered installations
+  can renew using their installation proof. Manual tokens must be re-minted.
 - **The server's address changes.** Each Android client, each MCP config,
   each `erisdb-client` caller is pinned to the endpoint id derived from the
   old secret, and will dial an address nobody answers. Print the new one
   with `erisdb endpoint-id` and re-pin every one of them.
 
-Rotation is also the only revocation mechanism: a leaked token can be killed
-only by rotating the secret, which kills every other token and moves the
-address with it. So grant narrowly — the fewest patterns that work, and
-literal ones over wildcards, since the four actions let a grant say
-"append readings and never edit one" — with a `--ttl` wherever a lifetime
-is knowable, and `--no-expiry` only where a token must outlive attention,
-as the poker's does.
+Revoke one paired installation with `erisdb clients revoke CLIENT_UUID`.
+This immediately blocks subsequent access, renewal and active change feeds.
+Legacy/manual tokens without a registration still require expiry or signing-key
+rotation. [Client administration](docs/clients.md) explains migration and recovery.
+
 
 ## Transport
 

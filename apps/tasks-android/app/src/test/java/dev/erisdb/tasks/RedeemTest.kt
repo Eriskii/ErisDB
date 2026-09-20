@@ -10,9 +10,8 @@ import org.junit.Test
 /**
  * Two-phase pairing: redeem a code, then wait for a person.
  *
- * The token comes back exactly once — collecting it clears it from the
- * session — so the tests that matter most here are about what happens to
- * it in the instant after it arrives.
+ * Collection is repeatable for the same installation. These unit tests
+ * verify local storage ordering; the real E2E suite proves authorization.
  */
 class RedeemTest {
 
@@ -83,9 +82,7 @@ class RedeemTest {
 
     @Test
     fun theCollectedTokenIsOnDiskBeforeCollectReturns() = runTest {
-        // It is handed over exactly once. Losing it after collection costs
-        // the user another trip to the core, so it is written through the
-        // sealed store before anything else in this app can fail.
+        // Persist before allowing app work to proceed.
         val core = core()
         requestPairing(core, CLIENT, MANIFEST)
         core.approve(listOf("tasks:*"), "bz1.only.chance")
@@ -95,24 +92,17 @@ class RedeemTest {
 
         assertEquals("bz1.only.chance", kept)
         assertEquals("bz1.only.chance", (out as Approval.Approved).token)
-        // And the core no longer holds it: a second ask cannot rescue one
-        // that was dropped.
-        assertNull(core.pairToken)
+        assertEquals("bz1.only.chance", core.pairToken)
     }
 
     @Test
-    fun aTokenAlreadyCollectedCannotBeFetchedAgain() = runTest {
-        // The core spends the session in the write that hands the token
-        // over, so a replayed code sees `collected` and nothing else.
+    fun theSameInstallationCanRecoverALostCollectionResponse() = runTest {
         val core = core()
         requestPairing(core, CLIENT, MANIFEST)
-        core.approve(listOf("tasks:*"), "bz1.spent")
+        core.approve(listOf("tasks:read"), "bz1.recoverable")
         collect(core) {}
-        assertEquals("collected", core.pairStatus)
-
-        val out = collect(core) { fail("there is nothing left to keep") }
-        assertTrue(out is Approval.Over)
-        assertTrue((out as Approval.Over).reason.contains("already"))
+        val recovered = collect(core) {}
+        assertEquals("bz1.recoverable", (recovered as Approval.Approved).token)
     }
 
     @Test

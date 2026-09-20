@@ -13,7 +13,7 @@ module.exports = defineConfig({
   webServer: {
     command: "node tests/browser/server.cjs",
     url: "http://127.0.0.1:18770/ready",
-    timeout: 180_000,
+    timeout: 900_000, // Includes a cold Rust build on a fresh checkout.
     reuseExistingServer: false,
   },
 });

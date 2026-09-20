@@ -1008,7 +1008,7 @@ for, with default lifetimes.
 |-------|----------|---------|---------|
 | `granted` | no | whatever was `requested` | What to actually grant. Must be the requested set or a subset, also enclosed by the approver. |
 | `ttl_secs` | no | 604800 (7 days) | Access-token lifetime, 1–604800 seconds. |
-| `max_ttl_secs` | no | 2592000 (30 days) | Refresh chain, capped at 31536000 and clamped to the approver's own chain when not named. |
+| `max_ttl_secs` | no | no deadline | Optional installation lifetime, 1–31536000 seconds. |
 | `user` | no | — | The signed identity the paired client writes as. |
 
 ```json
