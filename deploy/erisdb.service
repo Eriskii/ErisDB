@@ -1,0 +1,51 @@
+# The core, as a service. Stateless: everything durable is in Postgres, and
+# the iroh identity is derived from ERISDB_SECRET, so this unit owns no state
+# and a restart loses nothing.
+[Unit]
+Description=erisdb — stateless personal data core
+Documentation=https://github.com/Eriskii/ErisDB
+# Postgres may live on another host, so it is a Wants, not a Requires.
+Wants=network-online.target postgresql.service
+After=network-online.target postgresql.service
+# The store may still be coming up; keep retrying rather than giving up.
+StartLimitIntervalSec=0
+
+[Service]
+Type=exec
+User=erisdb
+Group=erisdb
+# DATABASE_URL, ERISDB_SECRET, ERISDB_LISTEN, plugin configuration and secrets.
+# Mode 0600, owned by root.
+EnvironmentFile=/etc/erisdb/erisdb.env
+ExecStart=/usr/local/bin/erisdb serve --listen ${ERISDB_LISTEN}
+Restart=on-failure
+RestartSec=5s
+
+# Hardening. The core writes nothing to disk.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallFilter=@system-service
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+# AF_INET/AF_INET6 carry both the TCP listener and iroh's QUIC datagrams —
+# UDP must stay open on both families. AF_NETLINK is how iroh enumerates
+# local interfaces to advertise candidate addresses.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  crate:
+    name: ${{ matrix.crate }}
+    runs-on: ubuntu-latest
+    # The three Rust components are separate crate trees with no workspace
+    # root, so each is built from its own directory.
+    strategy:
+      fail-fast: false
+      matrix:
+        crate: [erisdb, erisdb-client, erisdb-mcp]
+    defaults:
+      run:
+        working-directory: ${{ matrix.crate }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the toolchain
+        run: rustup component add rustfmt clippy
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            ${{ matrix.crate }}/target
+          key: ${{ runner.os }}-cargo-${{ matrix.crate }}-${{ hashFiles(format('{0}/Cargo.lock', matrix.crate)) }}
+          restore-keys: ${{ runner.os }}-cargo-${{ matrix.crate }}-
+
+      # Advisory. The tree is hand-formatted wider than rustfmt's default and
+      # reads better for it, so a diff here is a note, not a verdict.
+      - name: Format
+        run: cargo fmt --check || true
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      # The suites bring up real Postgres through testcontainers, against the
+      # Docker daemon the runner already has.
+      - name: Test
+        run: cargo test

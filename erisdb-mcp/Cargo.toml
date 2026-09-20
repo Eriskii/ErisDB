@@ -1,0 +1,26 @@
+[package]
+name = "erisdb-mcp"
+version = "0.1.0"
+edition = "2021"
+description = "An ErisDB client speaking MCP over stdio: the core's API as tools."
+license = "MIT"
+repository = "https://github.com/Eriskii/ErisDB"
+readme = "README.md"
+keywords = ["erisdb", "mcp", "llm", "tools"]
+categories = ["command-line-utilities", "api-bindings"]
+
+[dependencies]
+anyhow = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rmcp = { version = "3.1.4", features = ["server", "transport-io", "macros"] }
+schemars = "1.2.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+
+# The end-to-end suite drives a real core and a real Postgres, both as
+# processes: a container to run the store, and the erisdb binary itself.
+# Nothing here links the erisdb crate, so this repo builds and tests on its
+# own.
+[dev-dependencies]
+testcontainers-modules = { version = "0.15", features = ["postgres"] }

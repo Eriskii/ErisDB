@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- Iroh dials relays and hole-punches over the network. -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <!-- A due date passing is worth interrupting someone for. -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!--
+      allowBackup="false" — nothing this app holds belongs in Google's
+      cloud or on a device-to-device transfer. The capability token and
+      the iroh private key are secrets, sealed under a keystore key that
+      cannot leave this phone and so would arrive elsewhere as noise; and
+      everything else is a cache of the core, which reseeds on first
+      sync. There is nothing to back up, so nothing is.
+    -->
+    <application
+        android:allowBackup="false"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:supportsRtl="true"
+        android:windowSoftInputMode="adjustResize"
+        android:theme="@style/Theme.ErisDBTasks">
+        <!-- singleTop: a ticket scanned while the app is already up reaches
+             onNewIntent on the running activity instead of stacking a
+             second copy of it on top of the first. -->
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:launchMode="singleTop">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+            <!--
+              Pairing arrives as a link. The phone's camera app already
+              reads QR codes and opens what it finds, so `erisdb pair`
+              printing a bezel://pair/… code is a scanner this app does not
+              have to embed — no camera permission, no library, and the
+              ticket lands in onCreate or onNewIntent.
+            -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="bezel" android:host="pair" />
+            </intent-filter>
+        </activity>
+    </application>
+
+</manifest>

@@ -1,0 +1,41 @@
+{
+  "protocol": 1,
+  "name": "openai",
+  "description": "OpenAI API calls through a fresh process per request",
+  "executable": "/usr/local/libexec/erisdb/erisdb-plugin-openai",
+  "environment": {
+    "OPENAI_API_KEY": true,
+    "OPENAI_BASE_URL": false,
+    "OPENAI_ORGANIZATION": false,
+    "OPENAI_PROJECT": false
+  },
+  "timeout_secs": 600,
+  "operations": {
+    "chat.completions": {
+      "description": "Create or stream an OpenAI Chat Completion",
+      "permission": "openai:chat",
+      "request_schema": {
+        "type": "object",
+        "required": ["model", "messages"],
+        "properties": {
+          "model": {
+            "type": "string",
+            "minLength": 1
+          },
+          "messages": {
+            "type": "array",
+            "minItems": 1
+          },
+          "stream": {
+            "type": "boolean"
+          },
+          "tools": {
+            "type": "array"
+          },
+          "tool_choice": {}
+        },
+        "additionalProperties": true
+      }
+    }
+  }
+}

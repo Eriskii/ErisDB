@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Dark window theme in night mode: the system sees a dark app and
+         force-dark leaves the window alone. -->
+    <style name="Theme.ErisDBLists" parent="android:Theme.Material.NoActionBar">
+        <item name="android:forceDarkAllowed">false</item>
+    </style>
+</resources>

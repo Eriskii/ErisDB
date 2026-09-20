@@ -2,8 +2,31 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
+<!--
+  Content-Security-Policy, inline because this is a single file served
+  from anywhere — a file:// path, a static host, whatever.
+
+  script-src is the sha256 of the one inline <script> below. Editing that
+  script changes its hash and the browser will refuse to run it; recompute
+  with:
+
+    { printf '\n'; sed -n '/^<script>$/,/^<\/script>$/p' index.html \
+      | sed '1d;$d'; } | sha256sum | cut -d' ' -f1 | xxd -r -p | base64
+
+  connect-src stays wide open: the core's URL is whatever a pairing ticket
+  or the manual fields name, so there is no origin to pin at authoring
+  time. frame-ancestors is not honoured in a meta policy; serve this file
+  with X-Frame-Options if you care.
+
+  The QR scanner needs no directive of its own. The camera preview is a
+  MediaStream attached with `video.srcObject`, which is an object, not a
+  URL — nothing is fetched, so media-src never comes into it, and
+  BarcodeDetector reads the <video> element directly with no canvas and
+  no blob: URL in between.
+-->
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'sha256-gucauyXIbxUKiRtQA3oJL1zT0VSKmOgFN82QjgMVPdg='; style-src 'unsafe-inline'; connect-src *; base-uri 'none'; form-action 'none'">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>bezel · tasks</title>
+<title>ErisDB · tasks</title>
 <style>
   :root {
     --bg: #f6f5f2; --card: #ffffff; --ink: #1c1b19; --muted: #8a8578;
@@ -26,14 +49,16 @@
   h1 .status { font-size: .75rem; color: var(--muted); font-weight: normal; }
   .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 1rem; margin-bottom: 1rem; }
   form.add { display: flex; gap: .5rem; flex-wrap: wrap; }
-  input, select, button {
+  input, select, textarea, button {
     font: inherit; color: inherit; background: var(--bg);
     border: 1px solid var(--line); border-radius: 8px; padding: .45rem .6rem;
   }
-  input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+  input:focus, textarea:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
   #title { flex: 1 1 12rem; }
+  #repeat-n { width: 3.6rem; }
   button { cursor: pointer; }
   button.primary { background: var(--accent); color: #fff; border-color: transparent; }
+  button.danger { color: var(--danger); border-color: var(--danger); background: none; }
   ul { list-style: none; margin: 0; padding: 0; }
   li.task {
     display: flex; align-items: center; gap: .7rem;
@@ -42,6 +67,7 @@
   li.task:last-child { border-bottom: none; }
   li.task .t { flex: 1; }
   li.task.done .t { text-decoration: line-through; color: var(--muted); }
+  li.task.pending { opacity: .65; }
   .due { font-size: .75rem; color: var(--muted); white-space: nowrap; }
   .due.overdue { color: var(--danger); font-weight: 600; }
   .x { border: none; background: none; color: var(--muted); font-size: 1rem; }
@@ -50,37 +76,120 @@
   details.settings .row { display: flex; flex-direction: column; gap: .5rem; margin-top: .7rem; }
   .empty { color: var(--muted); text-align: center; padding: 1.5rem 0; }
   #notifbtn { font-size: .8rem; }
+  #cfg-state { font-size: .8rem; color: var(--muted); }
+  /* pairing */
+  .stack { display: flex; flex-direction: column; gap: .5rem; margin-top: .5rem; }
+  .hint { font-size: .78rem; color: var(--muted); }
+  .pairhead { font-size: 1rem; margin: 0 0 .2rem; }
+  #pair-intro code { font-family: ui-monospace, monospace; font-size: .9em; }
+  #cfg-ticket { width: 100%; resize: vertical;
+                font-family: ui-monospace, monospace; font-size: .8rem; }
+  #scanner { display: flex; flex-direction: column; gap: .5rem; }
+  #cam { width: 100%; max-height: 60vh; background: #000; border-radius: 8px; }
+  #pair-msg { font-size: .82rem; }
+  /* An empty note still eats a flex gap; nothing to say is nothing to show. */
+  #scan-note:empty, #pair-msg:empty { display: none; }
+  #pair-msg.bad { color: var(--danger); }
+  #pair-msg.good { color: var(--ok); }
+  details.manual summary { cursor: pointer; color: var(--muted); font-size: .82rem; }
+  /* waiting for a human to answer on the other device */
+  #pair-wait { display: flex; flex-direction: column; gap: .5rem; }
+  #pair-wait .pairhead { display: flex; align-items: baseline; gap: .5rem; }
+  .spinner {
+    width: .7rem; height: .7rem; border-radius: 50%; flex: 0 0 auto;
+    border: 2px solid var(--line); border-top-color: var(--accent);
+    animation: spin 1s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  @media (prefers-reduced-motion: reduce) { .spinner { animation: none; } }
+  ul.wants { font-size: .78rem; color: var(--muted); }
+  ul.wants li { padding: .1rem 0; }
+  ul.wants li::before { content: "· "; }
+  #perm-banner { font-size: .85rem; color: var(--muted); }
+  #perm-banner.readonly { border-color: var(--accent); }
+  #perm-banner.blocked { border-color: var(--danger); color: var(--danger); }
+  /* `hidden` has to beat the display rules above, so it is stated once here */
+  [hidden] { display: none !important; }
+  /* Unpaired, the connection card is the only card: it is the screen. */
+  body.unpaired .app { display: none; }
+  body.unpaired details.settings > summary { display: none; }
+  body.unpaired #cfg-state,
+  body.unpaired #notifbtn,
+  body.unpaired #cfg-forget { display: none; }
+  body:not(.unpaired) #pair-intro { display: none; }
 </style>
 </head>
 <body>
 <main>
-  <h1>bezel · tasks <span class="status" id="status">offline</span></h1>
+  <h1>ErisDB · tasks <span class="status" id="status">offline</span></h1>
 
-  <div class="card">
+  <div class="card app" id="perm-banner" hidden></div>
+
+  <div class="card app" id="add-card">
     <form class="add" id="addform">
       <input id="title" placeholder="What needs doing?" autocomplete="off" required>
       <input id="due" type="datetime-local">
+      <input id="repeat-n" type="number" min="1" step="1" value="1" title="repeat every n units">
       <select id="repeat" title="repeat">
         <option value="">once</option>
-        <option value="day">daily</option>
-        <option value="week">weekly</option>
-        <option value="month">monthly</option>
-        <option value="year">yearly</option>
+        <option value="day">days</option>
+        <option value="week">weeks</option>
+        <option value="month">months</option>
+        <option value="year">years</option>
       </select>
       <button class="primary">Add</button>
     </form>
   </div>
 
-  <div class="card"><ul id="list"></ul><div class="empty" id="empty">nothing yet</div></div>
+  <div class="card app"><ul id="list"></ul><div class="empty" id="empty">nothing yet</div></div>
 
   <div class="card">
     <details class="settings" id="settings">
       <summary>connection</summary>
       <div class="row">
-        <input id="cfg-url" placeholder="core url, e.g. http://127.0.0.1:7700">
-        <input id="cfg-token" placeholder="capability token (bz1.…)" type="password">
-        <button id="cfg-save">Connect</button>
+        <div id="pair-intro">
+          <h2 class="pairhead">Pair with a core</h2>
+          <div class="hint">Run <code>erisdb pair</code> on the core and scan the QR code
+            it prints. The code grants nothing on its own — this app asks for the
+            permissions it needs and a person at the core answers.</div>
+        </div>
+        <div id="cfg-state"></div>
+
+        <div id="pair-wait" hidden>
+          <div class="pairhead"><span class="spinner"></span><span id="pair-wait-who"></span></div>
+          <div class="hint" id="pair-wait-what"></div>
+          <ul class="wants" id="pair-wants"></ul>
+          <button id="pair-cancel" type="button">Cancel</button>
+        </div>
+
+        <div id="pair-forms" class="stack">
+          <button id="scan-btn" type="button" class="primary" hidden>Scan a QR code</button>
+          <div id="scanner" hidden>
+            <video id="cam" playsinline muted></video>
+            <button id="scan-cancel" type="button">Cancel</button>
+          </div>
+          <div id="scan-note" class="hint"></div>
+
+          <label class="hint" for="cfg-ticket">Paste a pairing code</label>
+          <textarea id="cfg-ticket" rows="2" placeholder="bezel://pair/…"
+                    autocomplete="off" spellcheck="false"></textarea>
+          <button id="cfg-pair" type="button">Pair</button>
+
+          <details class="manual" id="manual">
+            <summary>Enter details manually</summary>
+            <div class="stack">
+              <input id="cfg-url" placeholder="core url, e.g. http://127.0.0.1:7700">
+              <input id="cfg-token" placeholder="capability token (bz1.…)" type="password"
+                     autocomplete="off" spellcheck="false">
+              <button id="cfg-save" type="button">Connect</button>
+            </div>
+          </details>
+        </div>
+
+        <div id="pair-msg"></div>
+
         <button id="notifbtn" type="button">enable notifications</button>
+        <button id="cfg-forget" type="button" class="danger">Disconnect &amp; forget token</button>
       </div>
     </details>
   </div>
@@ -88,26 +197,104 @@
 
 <script>
 "use strict";
-const FACET = "tasks/v1";
-const CLIENT = "Tasks (Web) v0.1"; // stamped into every write's source
+// The facet name is the permission namespace, so it carries no version:
+// `tasks:read` outlives a schema change, `tasks/v1:read` would not. The
+// schema version lives in the registration body instead.
+const FACET = "tasks";
+const FACET_VERSION = 1;
+const CLIENT = "Tasks (Web) v0.2"; // stamped into every write's source
+
+// ---------------------------------------------------------------- manifest
+// What this app asks a human for when it pairs. Asking is free — the
+// operator answers, and may answer with less — so the manifest is a wish
+// and `grants` below is the truth.
+//
+// The four facet grants are what the app is for, and they are four rather
+// than "write" because the useful answers live in between: create and
+// update are separate permissions, so "may add a task but not edit one" is
+// a real reply and the UI honours it.
+//
+// The two facet-registration grants are asked for and never required. With
+// them, a brand-new core learns the tasks schema during pairing and a fresh
+// install costs no terminal work. Without them the app is fully usable —
+// it registers nothing, and says who to ask if the facet turns out to be
+// missing. Demanding them would be the wrong trade: `meta:facets:write`
+// registers, changes and removes EVERY facet on the core, lists and pairing
+// sessions included, which is far more than a tasks app should hold for the
+// sake of a one-time setup step. So it is offered as a convenience the
+// operator may decline, not as the price of using the app.
+const WANTED = [
+  `${FACET}:read`,
+  `${FACET}:create`,
+  `${FACET}:update`,
+  `${FACET}:delete`,
+  "meta:facets:read",
+  "meta:facets:write",
+];
+
+// What each request means, for the waiting screen — the same sentences the
+// facet registration hands the operator's approval prompt.
+const WANT_SAYS = {
+  [`${FACET}:read`]: "read your tasks",
+  [`${FACET}:create`]: "add tasks",
+  [`${FACET}:update`]: "change and complete tasks",
+  [`${FACET}:delete`]: "delete tasks",
+  "meta:facets:read": "read facet registrations",
+  "meta:facets:write": "register the tasks facet — optional, decline it and " +
+    "someone else registers the facet instead",
+};
+
 const LS = {
   config: "bezel.tasks.config",
   items: "bezel.tasks.items",
   cursor: "bezel.tasks.cursor",
   notified: "bezel.tasks.notified",
+  outbox: "bezel.tasks.outbox",
 };
-const load = (k, d) => JSON.parse(localStorage.getItem(k) ?? JSON.stringify(d));
-const save = (k, v) => localStorage.setItem(k, JSON.stringify(v));
+
+const $ = s => document.querySelector(s);
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-let config = load(LS.config, null);      // {url, token}
-let items = load(LS.items, {});          // id -> item (server shape)
+// ---------------------------------------------------------------- storage
+// localStorage is a shared, hand-editable, quota-limited box, not a
+// database. A truncated or corrupt value resets that one key and the app
+// carries on; a full quota degrades to in-memory state and says so on the
+// status line rather than throwing out of the sync loop.
+
+let storageFull = false;
+
+function load(k, d) {
+  let raw = null;
+  try { raw = localStorage.getItem(k); } catch { return d; }
+  if (raw === null) return d;
+  try { return JSON.parse(raw); }
+  catch {
+    try { localStorage.removeItem(k); } catch {}
+    return d;
+  }
+}
+
+function save(k, v) {
+  try { localStorage.setItem(k, JSON.stringify(v)); return true; }
+  catch { return false; }
+}
+
+function forget(k) { try { localStorage.removeItem(k); } catch {} }
+
+let config = load(LS.config, null);      // {url, token, name, ttl, grants}
+let items = load(LS.items, {});          // id -> item, the server's snapshot
 let cursor = load(LS.cursor, null);      // change-feed seq, client-held
 let notified = load(LS.notified, {});    // id -> updated_at we notified for
+let outbox = load(LS.outbox, []);        // durable queue of unsent mutations
+
+if (!Array.isArray(outbox)) outbox = [];
+if (items === null || typeof items !== "object") items = {};
+if (notified === null || typeof notified !== "object") notified = {};
 
 // ---------------------------------------------------------------- core client
 
 async function api(method, path, body) {
+  if (!config) throw new Error("not connected");
   const res = await fetch(config.url + path, {
     method,
     headers: {
@@ -127,7 +314,8 @@ async function api(method, path, body) {
 // A token is `bz1.<b64url(payload)>.<b64url(sig)>` and the payload is JSON
 // carrying an optional `exp` in unix seconds. The client reads exp to know
 // when to refresh; the signature is the core's business, and the token
-// goes nowhere but the API.
+// goes nowhere but the API. It is never written back into the DOM: the
+// settings panel shows a configured state, not the secret.
 
 function tokenExp(token) {
   try {
@@ -135,6 +323,62 @@ function tokenExp(token) {
     const exp = JSON.parse(atob(b64)).exp;
     return typeof exp === "number" ? exp : null;   // null: never expires
   } catch { return null; }
+}
+
+// ---------------------------------------------------------------- grants
+// What this token may actually do, as GET /v1/permissions reports it. The
+// operator may approve less than the manifest asked for, so every control
+// on the screen is drawn from this rather than from WANTED.
+//
+// `null` means "not asked yet". A token adopted from storage is still a
+// valid token, so the app stays fully usable and learns the truth on its
+// first sync; graying the screen out on boot and un-graying it a moment
+// later would be a worse lie than being briefly optimistic. A refused write
+// is caught safely either way: 403 is permanent, so the op leaves the
+// outbox with its reason instead of jamming the queue.
+let grants = config?.grants ?? null;
+
+// Set when a write comes back 403: the grants on file are behind whatever
+// the core believes, so the next sync re-reads them.
+let permsStale = false;
+
+/**
+ * Does one grant cover one concrete permission? The rule is
+ * docs/permissions.md: a `*` segment matches exactly one segment, and a `*`
+ * in FINAL position matches all remaining segments. That is what makes `*`
+ * alone mean everything and `tasks:*` reach `tasks:create`, and why
+ * `*:read` does not reach `meta:facets:read` — its last segment is the
+ * literal `read`, so it matches exactly two segments.
+ */
+function covers(grant, permission) {
+  const g = grant.split(":"), p = permission.split(":");
+  for (let i = 0; i < g.length; i++) {
+    if (g[i] === "*" && i === g.length - 1) return p.length > i;
+    if (i >= p.length || (g[i] !== "*" && g[i] !== p[i])) return false;
+  }
+  return g.length === p.length;
+}
+
+/** May this app do `action`? A bare action names this app's own facet, so
+ * `can("create")` asks about `tasks:create`; a qualified one is asked as
+ * written, so `can("meta:facets:write")` asks about exactly that. */
+function can(action) {
+  if (grants === null) return true;
+  const permission = action.includes(":") ? action : `${FACET}:${action}`;
+  return grants.some(g => covers(g, permission));
+}
+
+/** Ask the core what this token holds. Needs no permission of its own — a
+ * caller may always ask what it already has — and it is the only authority
+ * on the answer, since an operator may have approved a subset. */
+async function loadPermissions() {
+  const r = await api("GET", "/v1/permissions");
+  if (r.status !== 200 || !Array.isArray(r.body?.grants)) return false;
+  grants = r.body.grants;
+  config = { ...config, grants };
+  save(LS.config, config);
+  renderPermissions();
+  return true;
 }
 
 // Trade a still-valid token for one with the same scope and the same
@@ -153,7 +397,7 @@ async function refreshToken() {
     if (r.status === 201) {
       config = { ...config, token: r.body.token };   // fresh exp rides in the token
       save(LS.config, config);
-      $("#cfg-token").value = config.token;
+      renderConfigState();
     } else if (r.status === 401) {
       expired();
     }
@@ -163,17 +407,474 @@ async function refreshToken() {
   }
 }
 
-// Refresh keeps a session alive; it cannot resurrect one.
+// Refresh keeps a session alive; it cannot resurrect one. Past the end of
+// the chain there is no shortcut back: a token comes from a person
+// approving a pairing request, so that is what the message asks for.
 function expired() {
-  setStatus("token expired · paste a new one");
+  setStatus("token expired · pair again");
   $("#settings").open = true;
 }
 
-// Register the tasks facet — or upgrade a registration that predates
-// `repeat`. 403 means a narrower token; fine either way.
+// Drop the capability and everything derived from it. The queued writes
+// go too — they are addressed to a core this browser no longer holds a
+// token for.
+function disconnect() {
+  config = null;
+  grants = null; permsStale = false; facetMissing = false;
+  items = {}; cursor = null; notified = {}; outbox = []; lastDrop = null;
+  for (const k of Object.values(LS)) forget(k);
+  streamAbort?.abort();
+  stopScan();
+  cancelPairing();
+  $("#cfg-url").value = "";
+  $("#cfg-token").value = "";
+  $("#cfg-ticket").value = "";
+  pairMsg("");
+  renderPairState();
+  renderConfigState();
+  renderPermissions();
+  render();
+  setStatus("disconnected");
+}
+
+// ---------------------------------------------------------------- pairing
+// A ticket is `bezel://pair/<base64url-nopad(JSON)>` naming where the core
+// is and carrying a pairing CODE. The format is docs/pairing.md, and it is
+// base64url of JSON precisely so that a browser reads one with atob and
+// JSON.parse and nothing else.
+//
+// The code is not a capability over any data: it holds exactly
+// `meta:pairing:redeem`, names one session, and expires in minutes.
+// Pairing is two phases with a human in between:
+//
+//   redeem   POST /v1/pair/redeem — the app says who it is and what it wants
+//   wait     GET  /v1/pair/status — until a person approves, narrows, or denies
+//   collect  the same poll returns the token, ONCE
+//
+// So a photographed QR code is worth nothing on its own. It gets whoever
+// took it as far as raising a prompt on the operator's screen, naming an
+// app they did not install and asking for permissions they can refuse.
+
+const PAIR_PREFIX = "bezel://pair/";
+
+// These apps speak HTTP over fetch(). A ticket carrying only an endpoint
+// id names a core reachable over iroh, and no browser can dial one.
+const EID_ONLY =
+  "This core is reachable over iroh only — the code carries an endpoint id and no url, " +
+  "and a browser cannot dial iroh. Pair the Android app with this code, or serve the " +
+  "core over http and run erisdb pair again for a ticket with a url in it.";
+
+function parseUrl(s) { try { return new URL(s); } catch { return null; } }
+
+/** Unpadded base64url to text, strictly: anything that is not clean
+ * base64url of valid UTF-8 throws rather than decoding to mojibake. */
+function decodeB64url(s) {
+  if (!/^[A-Za-z0-9_-]+$/.test(s)) throw new Error("not base64url");
+  const b64 = s.replace(/-/g, "+").replace(/_/g, "/");
+  const bin = atob(b64 + "=".repeat((4 - b64.length % 4) % 4));
+  const bytes = Uint8Array.from(bin, c => c.charCodeAt(0));
+  return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+}
+
+/**
+ * Parse and validate a pairing ticket, returning `{name, eid, url, code}`
+ * with `name` and `eid` null when the ticket omits them. `code` is the
+ * ticket's `token` field under the name that says what it is: a redeem
+ * secret for one session, not a capability over anything.
+ *
+ * Every rejection throws with a message naming what is wrong. Nothing
+ * here is guessed or repaired: refusing loudly beats storing half a
+ * config, and a scanner that silently stores rubbish looks like a scanner
+ * that does not work.
+ */
+function parseTicket(str) {
+  const s = String(str ?? "").trim();
+  if (!s.startsWith(PAIR_PREFIX)) {
+    throw new Error("not a pairing code — it has to start with " + PAIR_PREFIX);
+  }
+  const payload = s.slice(PAIR_PREFIX.length);
+  if (!payload) throw new Error("pairing code carries no payload after " + PAIR_PREFIX);
+  let text;
+  try { text = decodeB64url(payload); }
+  catch { throw new Error("pairing code is damaged — the payload is not valid base64url"); }
+  let t;
+  try { t = JSON.parse(text); }
+  catch { throw new Error("pairing code is damaged — the payload is not JSON"); }
+  if (t === null || typeof t !== "object" || Array.isArray(t)) {
+    throw new Error("pairing code is damaged — the payload is not a ticket object");
+  }
+  if (t.v !== 1) {
+    throw new Error("pairing code is version " + JSON.stringify(t.v) +
+      " and this app speaks version 1 — update the app, or cut a v1 ticket");
+  }
+  if (typeof t.token !== "string" || !t.token) {
+    throw new Error("pairing code carries no secret to redeem");
+  }
+  const hasEid = t.eid !== undefined && t.eid !== null;
+  const hasUrl = t.url !== undefined && t.url !== null;
+  if (!hasEid && !hasUrl) {
+    throw new Error("pairing code names neither a url nor an endpoint id");
+  }
+  if (hasEid && !(typeof t.eid === "string" && /^[0-9a-f]{64}$/.test(t.eid))) {
+    throw new Error("pairing code's endpoint id is not 64 lowercase hex characters");
+  }
+  let url = null;
+  if (hasUrl) {
+    // The url is dialled with fetch() from this origin, so the scheme is
+    // decided by the URL parser and only http(s) is dialled at all.
+    const u = typeof t.url === "string" ? parseUrl(t.url) : null;
+    if (!u || (u.protocol !== "http:" && u.protocol !== "https:")) {
+      throw new Error("pairing code's url is not an http or https url");
+    }
+    url = t.url.trim().replace(/\/$/, "");
+  }
+  return {
+    name: typeof t.name === "string" && t.name.trim() ? t.name.trim() : null,
+    eid: hasEid ? t.eid : null,
+    url,
+    code: t.token,
+  };
+}
+
+/**
+ * Adopt a capability: store it, learn what it holds, register the facet if
+ * that was allowed, start syncing. Every path that ends in a url and a
+ * token comes through here.
+ *
+ * The token is written to storage before the first `await`, because the
+ * core hands it over exactly once — losing it after collecting it costs
+ * the user a whole new pairing.
+ */
+async function connect(url, token, name, granted) {
+  // The token's remaining life is the lifetime to keep renewing at; a
+  // token without an exp never expires, so it never refreshes.
+  const exp = tokenExp(token);
+  config = {
+    url, token, name: name ?? null,
+    grants: Array.isArray(granted) ? granted : null,
+    ttl: exp === null ? null : Math.max(1, Math.round(exp - Date.now() / 1000)),
+  };
+  save(LS.config, config);
+  grants = config.grants;
+  permsStale = false; facetMissing = false;
+  items = {}; cursor = null; notified = {}; outbox = []; lastDrop = null;
+  persist(); saveOutbox();
+  renderPairState();
+  renderConfigState();
+  renderPermissions();
+  render();
+  // An approval carries what was granted, but the token itself is the
+  // authority on it, so the UI settles on the core's answer.
+  try { await loadPermissions(); } catch {}
+  try { await ensureFacet(); } catch {}
+  streamAbort?.abort();   // the loop reconnects against the new config
+  streamLoop();
+}
+
+// A pairing conversation in flight: the code, the core it came from, and a
+// `live` flag the cancel button clears so an in-flight poll stands down.
+let pairing = null;
+
+/** One request carrying the pairing code. This is the entire conversation
+ * an app has before it holds a capability of its own, so it speaks to two
+ * endpoints and no others. */
+async function codeFetch(base, code, method, path, body) {
+  const res = await fetch(base + path, {
+    method,
+    headers: {
+      "Authorization": "Bearer " + code,
+      "X-Bezel-Client": CLIENT,
+      ...(body !== undefined ? { "Content-Type": "application/json" } : {}),
+    },
+    body: body !== undefined ? JSON.stringify(body) : undefined,
+  });
+  let json = null;
+  try { json = await res.json(); } catch {}
+  return { status: res.status, body: json };
+}
+
+/** A scanned or pasted ticket, all the way to a paired app: redeem the
+ * code, wait for a person, collect the token. */
+async function pairWith(str) {
+  let t;
+  try { t = parseTicket(str); }
+  catch (e) { pairMsg(e.message, "bad"); return; }
+  if (!t.url) { pairMsg(EID_ONLY, "bad"); return; }
+  cancelPairing();
+  $("#cfg-ticket").value = "";
+  $("#cfg-url").value = t.url;
+  const who = t.name ?? t.url;
+  pairing = { code: t.code, url: t.url, name: t.name, live: true };
+  const mine = pairing;
+  showWaiting(who, `asking ${who} for permission…`);
+
+  let r;
+  try {
+    r = await codeFetch(t.url, t.code, "POST", "/v1/pair/redeem",
+      { client: CLIENT, requested: WANTED });
+  } catch {
+    if (mine.live) {
+      failPairing("Could not reach the core at " + t.url + ". Check it is running and " +
+        "that this device can reach that address, then pair again.");
+    }
+    return;
+  }
+  if (!mine.live) return;                 // cancelled while the request was out
+  if (r.status !== 200) { failPairing(redeemError(r)); return; }
+  showWaiting(who, `waiting for approval on ${who}…`);
+  pollPairing(who, mine);
+}
+
+/** Why a redeem was refused, in words a person can act on. */
+function redeemError(r) {
+  if (r.status === 400) {
+    return "That pairing code has expired — a code is good for about ten minutes. " +
+      "Run erisdb pair on the core again for a fresh one.";
+  }
+  if (r.status === 401) {
+    return "This core will not accept that pairing code. Run erisdb pair on the core " +
+      "you mean to pair with, and use the code it prints.";
+  }
+  if (r.status === 409) {
+    return "That pairing code has already been used — each one pairs one app, once. " +
+      "Run erisdb pair on the core again for a fresh one.";
+  }
+  return "The core refused the pairing request: " + detail(r);
+}
+
+/**
+ * Wait for the human. `requested` is the wait itself; `approved` hands the
+ * token over exactly once, so it is stored before anything else is done
+ * with it, and `denied` is a plain answer rather than an error.
+ */
+async function pollPairing(who, mine) {
+  while (mine.live) {
+    let r;
+    try { r = await codeFetch(mine.url, mine.code, "GET", "/v1/pair/status"); }
+    catch { await sleep(2000); continue; }   // the core blinked; keep waiting
+    if (!mine.live) return;
+    if (r.status === 200) {
+      if (r.body?.status === "approved") {
+        if (typeof r.body.token !== "string" || !r.body.token) {
+          // The session was approved and its token collected by someone
+          // else. It is handed over once, so there is nothing to collect.
+          failPairing("This pairing was already completed elsewhere — a token is handed " +
+            "over once. Run erisdb pair on the core again to pair this app.");
+          return;
+        }
+        const { token, granted } = r.body;
+        const { url, name } = mine;
+        mine.live = false; pairing = null;
+        hideWaiting();
+        await connect(url, token, name, granted);
+        pairMsg("paired with " + who, "good");
+        setStatus("paired with " + who);
+        $("#settings").open = false;   // pairing is done: land in the app
+        return;
+      }
+      if (r.body?.status === "denied") {
+        failPairing("The request was refused on " + who + ", so this app was given " +
+          "nothing. Run erisdb pair on the core again to ask once more.");
+        return;
+      }
+    } else if (r.status === 400 || r.status === 401 || r.status === 404) {
+      failPairing("The pairing code ran out before anyone answered — a code is good for " +
+        "about ten minutes. Run erisdb pair on the core again for a fresh one.");
+      return;
+    }
+    await sleep(1500);
+  }
+}
+
+/** Stop waiting. The session on the core is left exactly as it is — the
+ * operator may still answer it — but this app is no longer listening. */
+function cancelPairing() {
+  if (pairing) pairing.live = false;
+  pairing = null;
+  hideWaiting();
+}
+
+function failPairing(message) {
+  cancelPairing();
+  pairMsg(message, "bad");
+  setStatus(config ? "not paired again" : "not paired");
+}
+
+/** Between redeem and answer there is a person walking to a keyboard, so
+ * the wait is a state with a name, a list of what was asked for, and a way
+ * out — not a spinner that could mean anything. */
+function showWaiting(who, what) {
+  pairMsg("");
+  $("#pair-wait-who").textContent = who;
+  $("#pair-wait-what").textContent = what;
+  $("#pair-wants").replaceChildren(...WANTED.map(g => {
+    const li = document.createElement("li");
+    li.textContent = WANT_SAYS[g] ?? g;
+    return li;
+  }));
+  $("#pair-wait").hidden = false;
+  $("#pair-forms").hidden = true;   // one thing on screen while waiting
+  setStatus("waiting for approval");
+}
+
+function hideWaiting() {
+  $("#pair-wait").hidden = true;
+  $("#pair-forms").hidden = false;
+}
+
+function pairMsg(text, kind) {
+  const el = $("#pair-msg");
+  el.textContent = text;
+  el.className = text ? (kind ?? "") : "";
+}
+
+/** Unpaired, the connection card is the whole screen — the app behind it
+ * has nothing to show until a core is behind it. */
+function renderPairState() {
+  document.body.classList.toggle("unpaired", !config);
+  if (!config) $("#settings").open = true;
+}
+
+// ---------------------------------------------------------------- scanning
+// BarcodeDetector is the browser's own QR decoder: Chrome, Edge and the
+// Android WebView have it, Firefox and desktop Safari do not. There is no
+// bundled fallback decoder, because this app is one file with no
+// dependencies — where the camera path cannot work, the paste path is the
+// path, and the Scan button is not drawn at all. A button that cannot
+// work is worse than no button.
+//
+// getUserMedia exists only in a secure context, and these apps are often
+// served over plain http on a LAN, where it is simply absent. That is the
+// likeliest reason scanning is unavailable here, so it is tested first
+// and named plainly: it is a fact about browsers, not a fault in the app.
+
+let scanAvailable = false;
+let camStream = null;
+let scanTimer = null;
+let scanning = false;
+
+async function qrDecoderAvailable() {
+  if (!("BarcodeDetector" in window)) return false;
+  try {
+    const formats = await BarcodeDetector.getSupportedFormats();
+    return Array.isArray(formats) && formats.includes("qr_code");
+  } catch { return false; }
+}
+
+/** Decide once whether to offer the camera, and say why when not. */
+async function initScanning() {
+  let why = null;
+  if (window.isSecureContext === false) {
+    why = "Scanning needs the camera, and a browser only grants one over https or on " +
+      "localhost. This page is plain http, so paste the pairing code instead — " +
+      "erisdb pair prints it as text under the QR.";
+  } else if (!navigator.mediaDevices?.getUserMedia) {
+    why = "This browser gives the page no camera, so paste the pairing code instead — " +
+      "erisdb pair prints it as text under the QR.";
+  } else if (!await qrDecoderAvailable()) {
+    why = "This browser has no built-in QR decoder — Chrome, Edge and the Android app " +
+      "do. Paste the pairing code instead: erisdb pair prints it as text under the QR.";
+  }
+  scanAvailable = why === null;
+  $("#scan-btn").hidden = !scanAvailable;
+  $("#scan-note").textContent = why ?? "";
+  // With no camera, pasting is the primary path and should look like it.
+  $("#cfg-pair").classList.toggle("primary", !scanAvailable);
+}
+
+async function startScan() {
+  if (scanning || !scanAvailable) return;
+  scanning = true;
+  pairMsg("");
+  $("#scan-btn").hidden = true;
+  $("#scanner").hidden = false;
+  let detector;
+  try { detector = new BarcodeDetector({ formats: ["qr_code"] }); }
+  catch {
+    stopScan();
+    pairMsg("This browser cannot decode QR codes — paste the pairing code instead.", "bad");
+    return;
+  }
+  try {
+    camStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } });
+  } catch (e) {
+    stopScan();
+    pairMsg(
+      e?.name === "NotAllowedError"
+        ? "Camera permission denied. Allow the camera for this page and scan again, or " +
+          "paste the pairing code instead."
+        : e?.name === "NotFoundError"
+          ? "No camera on this device — paste the pairing code instead."
+          : "The camera would not open (" + (e?.name ?? "unknown") + "). Paste the " +
+            "pairing code instead.",
+      "bad");
+    return;
+  }
+  // Cancelled while the permission prompt was up: the tracks still have
+  // to be stopped, or the camera stays lit with nothing showing it.
+  if (!scanning) {
+    for (const track of camStream.getTracks()) track.stop();
+    camStream = null;
+    return;
+  }
+  const video = $("#cam");
+  video.srcObject = camStream;
+  try { await video.play(); } catch {}
+  pairMsg("point the camera at the QR code from erisdb pair");
+  scanFrame(detector, video);
+}
+
+/** One frame, then the next. A QR that is not a ticket is not a reason to
+ * put the camera away — say so and keep looking. */
+async function scanFrame(detector, video) {
+  if (!scanning) return;
+  try {
+    const codes = await detector.detect(video);
+    if (!scanning) return;
+    const hit = codes.find(c =>
+      typeof c.rawValue === "string" && c.rawValue.trim().startsWith(PAIR_PREFIX));
+    if (hit) { stopScan(); pairWith(hit.rawValue); return; }
+    if (codes.length) {
+      pairMsg("that QR code is not an ErisDB pairing code — run erisdb pair on the core");
+    }
+  } catch {}                  // a frame read before the video has one
+  if (scanning) scanTimer = setTimeout(() => scanFrame(detector, video), 120);
+}
+
+/** Every exit from the camera runs through here: success, cancel, error,
+ * disconnect, and the page going away. A camera left running on a phone
+ * is not a small thing. */
+function stopScan() {
+  scanning = false;
+  clearTimeout(scanTimer);
+  scanTimer = null;
+  if (camStream) {
+    for (const track of camStream.getTracks()) track.stop();
+    camStream = null;
+  }
+  const video = $("#cam");
+  video.pause();
+  video.srcObject = null;
+  $("#scanner").hidden = true;
+  $("#scan-btn").hidden = !scanAvailable;
+}
+
+// The tasks facet, shared with the Android client. `lapse` is what makes
+// the core emit a `lapsed` change when a due date passes with `done`
+// still false — without it there are no due notifications at all.
 const FACET_BODY = {
   name: FACET,
+  version: FACET_VERSION,
   strict: true,
+  // Human sentences for the approval prompt, so the operator reads "add
+  // tasks" rather than "tasks:create". Presentation only: no grant depends
+  // on them, and a missing one shows the raw permission.
+  permissions: {
+    read: "read your tasks",
+    create: "add tasks",
+    update: "change and complete tasks",
+    delete: "delete tasks",
+  },
   schema: {
     type: "object",
     required: ["title", "done"],
@@ -197,30 +898,225 @@ const FACET_BODY = {
   lapse: { due: "due", done: "done" },
 };
 
+// True once a write comes back `unknown_facet`: the core has never been
+// told what a task is. Not the user's fault and not a property of their
+// data, so it is named plainly on screen instead of surfacing as a schema
+// error nobody can act on.
+let facetMissing = false;
+
+/**
+ * Register the facet, or bring a narrower registration up to this one.
+ *
+ * Runs only when the operator approved `meta:facets:write`. That grant is
+ * asked for so a fresh core needs no terminal work, and doing without it is
+ * an ordinary state rather than a failure: the app skips this entirely and
+ * `permissionNote` says who to ask if the facet turns out to be missing.
+ * Asking the core and taking a 403 for an answer would say the same thing
+ * less politely.
+ */
 async function ensureFacet() {
+  if (!can("meta:facets:write")) return;
   const r = await api("POST", "/v1/items", { facet: "facet", body: FACET_BODY });
+  if (r.status === 201) { facetMissing = false; renderPermissions(); return; }
   if (r.status !== 409) return;
+  // A registration under this name exists. Reading it is what says whether
+  // it is this one, and reading it needs its own grant.
+  if (!can("meta:facets:read")) return;
   const facets = await api("GET", "/v1/items?facet=facet&limit=1000");
   if (facets.status !== 200) return;
   const reg = facets.body.items.find(i => i.body.name === FACET);
-  if (!reg || reg.body.schema?.properties?.repeat) return;
+  if (!reg) return;
+  const current = !!reg.body.schema?.properties?.repeat && !!reg.body.lapse;
+  if (current) return;
   await api("PUT", "/v1/items/" + reg.id, { body: FACET_BODY, revision: reg.revision });
+}
+
+// ---------------------------------------------------------------- outbox
+// Offline-first: every mutation is written to the outbox BEFORE the
+// network is touched, so closing the tab mid-write loses nothing and the
+// op replays on next load. What the screen shows is the server snapshot
+// with the queued ops replayed on top, so an edit is visible instantly.
+//
+// Ops:
+//   {op:"create", tmp, at, body}
+//   {op:"update", id, patch}
+//   {op:"delete", id}
+//
+// A patch is a shallow overlay on the item's body; a key set to null
+// removes the field, which a strict schema needs for optional fields.
+
+function merge(base, patch) {
+  const out = { ...base };
+  for (const [k, v] of Object.entries(patch)) {
+    if (v === null) delete out[k]; else out[k] = v;
+  }
+  return out;
+}
+
+function saveOutbox() { if (!save(LS.outbox, outbox)) storageFull = true; }
+
+// A permanently refused write is data the user will not get back, so its
+// reason outlives the sync that discovered it: the status line holds it
+// until the next mutation, rather than flashing it for one poll.
+let lastDrop = null;
+
+/** Durable first, then optimistic, then sync. */
+function enqueue(op) {
+  lastDrop = null;
+  outbox.push(op);
+  saveOutbox();
+  render();
+  sync();
+}
+
+/** The truth the user sees: the server snapshot plus everything queued. */
+function view() {
+  const out = { ...items };
+  for (const op of outbox) {
+    if (op.op === "create") {
+      out[op.tmp] = {
+        id: op.tmp, facet: FACET, body: op.body, revision: 0,
+        created_at: op.at, updated_at: op.at, pending: true,
+      };
+    } else if (op.op === "update") {
+      const cur = out[op.id];
+      if (cur) out[op.id] = { ...cur, body: merge(cur.body, op.patch), pending: true };
+    } else if (op.op === "delete") {
+      delete out[op.id];
+    }
+  }
+  return out;
+}
+
+// Statuses worth waiting out: the token can be replaced, a 5xx passes.
+// Everything else in the 4xx range is the core saying no, permanently.
+const retryable = s => s === 401 || s === 408 || s === 425 || s === 429 || s >= 500;
+
+const detail = r => r.body?.detail ?? r.body?.error ?? ("status " + r.status);
+
+/**
+ * A permanent refusal, as an outbox drop: the op leaves the queue carrying
+ * the reason, which is what keeps one refused write from jamming every
+ * write behind it.
+ *
+ * Two refusals say something the screen should react to as well. 403 means
+ * the grants on file are behind whatever the core believes, so they are
+ * re-read; `unknown_facet` means nothing can be saved here at all until
+ * someone registers the facet.
+ */
+function refused(r, what) {
+  if (r.status === 403) permsStale = true;
+  if (r.body?.error === "unknown_facet") facetMissing = true;
+  return { drop: what + " refused: " + detail(r) };
+}
+
+/**
+ * Send one op. Returns null to keep it queued (transport down or a
+ * transient status), otherwise `{item?, drop?}` — the op leaves the queue
+ * either way, `drop` carrying the reason it was refused for good.
+ */
+async function sendOp(op) {
+  try {
+    if (op.op === "create") {
+      const r = await api("POST", "/v1/items", { facet: FACET, body: op.body });
+      if (r.status === 201) { facetMissing = false; return { item: r.body }; }
+      return retryable(r.status) ? null : refused(r, "create");
+    }
+    if (op.op === "update") {
+      // The patch is the intent, so it is replayed onto whatever body the
+      // core currently holds — a concurrent edit to a field this op never
+      // named survives instead of being clobbered.
+      for (let attempt = 0; attempt < 2; attempt++) {
+        let base = items[op.id];
+        if (!base || attempt > 0) {
+          const fresh = await api("GET", "/v1/items/" + op.id);
+          if (fresh.status === 404) return { drop: "edit dropped: item gone" };
+          if (fresh.status !== 200) {
+            return retryable(fresh.status) ? null : refused(fresh, "edit");
+          }
+          items[op.id] = base = fresh.body;
+        }
+        const r = await api("PUT", "/v1/items/" + op.id,
+          { body: merge(base.body, op.patch), revision: base.revision });
+        if (r.status === 200) return { item: r.body };
+        if (r.status === 404) return { drop: "edit dropped: item gone" };
+        if (r.status === 409 && attempt === 0) continue;   // take theirs, replay ours
+        if (r.status === 409) return { drop: "edit refused: revision conflict persisted" };
+        if (retryable(r.status)) return null;
+        return refused(r, "edit");
+      }
+    }
+    if (op.op === "delete") {
+      const r = await api("DELETE", "/v1/items/" + op.id);
+      if (r.status === 204 || r.status === 404) return {};
+      return retryable(r.status) ? null : refused(r, "delete");
+    }
+  } catch {
+    return null;   // transport down: the op stays queued, in order
+  }
+  return { drop: "unknown op" };
+}
+
+/** A create's synthetic id becomes the real one for everything still
+ * queued behind it — a later edit or delete must never address an id the
+ * core has never seen. */
+function retarget(tmp, item) {
+  for (const o of outbox) if (o.id === tmp) o.id = item.id;
+}
+
+/** A create the core refused permanently leaves nothing to edit or
+ * delete: everything queued against it goes with it. */
+function retire(tmp) {
+  outbox = outbox.filter(o => o.id !== tmp);
+}
+
+// Drain in order and stop at the first thing worth retrying, so ordering
+// holds. One drain at a time: a second entrant would race the queue.
+let draining = false;
+async function drainOutbox() {
+  if (draining) return;
+  draining = true;
+  try {
+    while (outbox.length) {
+      const op = outbox[0];
+      const res = await sendOp(op);
+      if (res === null) break;
+      outbox.shift();
+      if (op.op === "create") {
+        if (res.item) { items[res.item.id] = res.item; retarget(op.tmp, res.item); }
+        else retire(op.tmp);
+      } else if (op.op === "update" && res.item) {
+        items[res.item.id] = res.item;
+      } else if (op.op === "delete") {
+        delete items[op.id];
+        delete notified[op.id];
+      }
+      if (res.drop) lastDrop = res.drop;
+      saveOutbox();
+      persist();
+    }
+  } finally {
+    draining = false;
+  }
 }
 
 // ---------------------------------------------------------------- sync engine
 // Local cache first; the change feed (cursor held client-side) keeps it true.
 
 // One change row applied to the cache. The cursor poll and the live
-// stream both land here — the feed is the only way items change.
-async function applyChange(ch) {
+// stream both land here — the feed is the only way server state changes.
+// Synchronous by construction: nothing here may touch the network, or
+// the SSE reader stalls behind it.
+function applyChange(ch) {
   if (ch.op === "deleted") {
     delete items[ch.item_id];
     delete notified[ch.item_id];
   } else if (ch.op === "lapsed") {
-    await notifyIfStillDue(ch.item_id);
-  } else {
+    queueLapsed(ch.item_id);
+  } else if (ch.body) {
     // Change rows carry the full snapshot: apply the feed directly,
-    // no per-item refetch.
+    // no per-item refetch. A row without a body is not an upsert, so it
+    // never writes a hollow item into the cache.
     items[ch.item_id] = {
       id: ch.item_id, facet: ch.facet, body: ch.body, revision: ch.revision,
       created_at: items[ch.item_id]?.created_at ?? ch.at,
@@ -229,26 +1125,36 @@ async function applyChange(ch) {
   }
 }
 
-let syncing = false;
+let syncing = false, syncAgain = false;
 async function sync() {
-  if (!config || syncing) return;
+  if (!config) return;
+  if (syncing) { syncAgain = true; return; }   // fold the request into the run in flight
   syncing = true;
   try {
     await refreshToken();
+    // A token adopted from storage reports what it holds on the first sync,
+    // and a refused write sends the app back to ask again. Everything the
+    // screen offers or withholds follows from the answer.
+    if (grants === null || permsStale) { permsStale = false; await loadPermissions(); }
+    await drainOutbox();
     if (cursor === null) await seed();
     const { status, body } = await api("GET",
       `/v1/changes?since=${cursor}&facet=${encodeURIComponent(FACET)}&limit=500`);
     if (status === 401) { expired(); return; }
     if (status !== 200) throw new Error("changes " + status);
-    for (const ch of body.changes) await applyChange(ch);
+    for (const ch of body.changes) applyChange(ch);
     cursor = Math.max(cursor, body.next);   // the stream may be ahead
     persist();
-    setStatus((streamLive ? "live · " : "synced ") + new Date().toLocaleTimeString());
+    setStatus(lastDrop ?? (outbox.length
+      ? `${outbox.length} queued`
+      : (streamLive ? "live · " : "synced ") + new Date().toLocaleTimeString()));
   } catch (e) {
-    setStatus("offline · cached");
+    setStatus(lastDrop ??
+      (outbox.length ? `offline · ${outbox.length} queued` : "offline · cached"));
   } finally {
     syncing = false;
     render();
+    if (syncAgain) { syncAgain = false; sync(); }
   }
 }
 
@@ -263,7 +1169,9 @@ async function seed() {
 }
 
 function persist() {
-  save(LS.items, items); save(LS.cursor, cursor); save(LS.notified, notified);
+  const ok = [save(LS.items, items), save(LS.cursor, cursor),
+              save(LS.notified, notified)];
+  storageFull = ok.includes(false);
 }
 
 // ---------------------------------------------------------------- live stream
@@ -300,12 +1208,12 @@ async function stream() {
       // Frames are blank-line separated; keep-alive comments parse to nothing.
       let i;
       while ((i = buf.indexOf("\n\n")) >= 0) {
-        await applyFrame(buf.slice(0, i));
+        applyFrame(buf.slice(0, i));
         buf = buf.slice(i + 2);
       }
     }
   } catch (e) {
-    setStatus("stream lost · polling");
+    if (config) setStatus("stream lost · polling");   // a disconnect aborts on purpose
   } finally {
     streamLive = false;
     streamAbort = null;
@@ -313,15 +1221,18 @@ async function stream() {
   return connected;
 }
 
-async function applyFrame(frame) {
+// Never awaits: the reader stays free to keep draining the socket, so a
+// bulk lapse sweep cannot back it up.
+function applyFrame(frame) {
   let event = "message", data = "";
   for (const line of frame.split("\n")) {
     if (line.startsWith("event:")) event = line.slice(6).trim();
     else if (line.startsWith("data:")) data += line.slice(5).replace(/^ /, "");
   }
   if (event !== "change" || !data) return;
-  const ch = JSON.parse(data);
-  await applyChange(ch);
+  let ch;
+  try { ch = JSON.parse(data); } catch { return; }
+  applyChange(ch);
   if (ch.seq > cursor) cursor = ch.seq;
   persist();
   render();
@@ -339,6 +1250,7 @@ async function streamLoop() {
   try {
     while (config) {
       await sync();
+      if (!config) break;
       if (cursor !== null && await stream()) backoff = 1000;
       if (!config) break;
       await sleep(backoff);
@@ -354,9 +1266,18 @@ async function streamLoop() {
 // local due-check so the client reacts between ticks. Both verify against
 // the core before firing — a completed or deleted task never notifies.
 
+/** Verify one id against the core and fire once per edit. Only a 404
+ * proves the task is gone; every other failure leaves the cache exactly
+ * as it was, which is the whole point of having one. */
 async function notifyIfStillDue(id) {
-  const r = await api("GET", "/v1/items/" + id);
-  if (r.status !== 200) { delete items[id]; return; }
+  let r;
+  try { r = await api("GET", "/v1/items/" + id); }
+  catch { return; }                   // offline: the cache stands
+  if (r.status === 404) {
+    delete items[id]; delete notified[id]; persist();
+    return;
+  }
+  if (r.status !== 200) return;       // 401, 500, 503: transient, cache untouched
   items[id] = r.body;
   const t = r.body.body;
   if (t.done || !t.due || new Date(t.due) > new Date()) return;
@@ -366,44 +1287,85 @@ async function notifyIfStillDue(id) {
   if (Notification.permission === "granted") {
     new Notification("Task due: " + t.title, {
       body: "was due " + new Date(t.due).toLocaleString(),
-      tag: "bezel-task-" + id,
+      tag: "erisdb-task-" + id,
     });
   }
 }
 
+// Verification costs a round-trip, so ids queue here and a single drainer
+// works through them off the SSE reader's back.
+const lapsedPending = new Set();
+let lapsedDraining = false;
+
+function queueLapsed(id) {
+  lapsedPending.add(id);
+  drainLapsed();
+}
+
+async function drainLapsed() {
+  if (lapsedDraining) return;
+  lapsedDraining = true;
+  try {
+    while (lapsedPending.size) {
+      const id = lapsedPending.values().next().value;
+      lapsedPending.delete(id);
+      try { await notifyIfStillDue(id); } catch {}
+    }
+  } finally {
+    lapsedDraining = false;
+    render();
+  }
+}
+
+// The local sweep reads the server snapshot: a task that exists only in
+// the outbox has no id the core would recognise yet.
 function localDueCheck() {
   const now = new Date();
   for (const item of Object.values(items)) {
     const t = item.body;
     if (!t.done && t.due && new Date(t.due) <= now && notified[item.id] !== item.updated_at) {
-      notifyIfStillDue(item.id);
+      queueLapsed(item.id);
     }
   }
 }
 
 // ---------------------------------------------------------------- recurrence
 // A repeating task never goes done: completing it advances `due` by
-// n×unit until it lands in the future. Month/year steps clamp to the end
-// of shorter months.
+// n×unit until it lands strictly in the future. This is the rule in
+// ../tasks-android/…/Recurrence.kt, to the date.
 
-function stepDate(d, n, unit) {
-  const next = new Date(d);
-  if (unit === "day") next.setDate(next.getDate() + n);
-  else if (unit === "week") next.setDate(next.getDate() + 7 * n);
-  else {
-    const day = next.getDate();
-    next.setDate(1);
-    next.setMonth(next.getMonth() + (unit === "month" ? n : 12 * n));
-    const last = new Date(next.getFullYear(), next.getMonth() + 1, 0).getDate();
-    next.setDate(Math.min(day, last));
-  }
-  return next;
+/** `due` plus k periods of n×unit, anchored on the ORIGINAL due date so
+ * month and year steps keep their day of month across clamped months:
+ * Jan 31 → Feb 28 → Mar 31, never Feb 28 → Mar 28. */
+function stepDate(due, n, unit, k) {
+  const total = n * k;
+  const d = new Date(due);
+  if (unit === "day") { d.setDate(d.getDate() + total); return d; }
+  if (unit === "week") { d.setDate(d.getDate() + 7 * total); return d; }
+  const day = d.getDate();
+  d.setDate(1);                                        // survive the short month
+  d.setMonth(d.getMonth() + (unit === "month" ? total : 12 * total));
+  const last = new Date(d.getFullYear(), d.getMonth() + 1, 0).getDate();
+  d.setDate(Math.min(day, last));
+  return d;
 }
 
+/**
+ * The next due date after completing a repeating task at `now`: `due`
+ * advanced by whole n×unit periods until it is strictly after `now`.
+ *
+ * The step always happens at least once, so completing early moves the
+ * task on to the next period rather than leaving it due today; and a due
+ * date far in the past catches up in one call, landing on the next
+ * period boundary rather than replaying every one it missed.
+ */
 function advance(dueIso, n, unit, now = new Date()) {
-  let d = stepDate(new Date(dueIso), n, unit);
-  while (d <= now) d = stepDate(d, n, unit);
-  return d.toISOString();
+  const step = Math.max(1, Math.trunc(n) || 1);        // n < 1 would never terminate
+  const due = new Date(dueIso);
+  let k = 1;
+  let next = stepDate(due, step, unit, k);
+  while (next <= now) next = stepDate(due, step, unit, ++k);
+  return next.toISOString();
 }
 
 /** The change a "complete" click applies, recurrence-aware. */
@@ -420,37 +1382,31 @@ function fmtRepeat(rep) {
 
 // ---------------------------------------------------------------- actions
 
-async function addTask(title, due, repeat) {
+// A synthetic id for an item the core has not seen yet. randomUUID needs
+// a secure context; the fallback only has to be unique within one queue.
+const uid = () => (crypto.randomUUID?.() ??
+  Date.now().toString(36) + "-" + Math.random().toString(36).slice(2));
+
+function addTask(title, due, repeat) {
   const body = { title, done: false, ...(due ? { due } : {}), ...(repeat ? { repeat } : {}) };
-  const r = await api("POST", "/v1/items", { facet: FACET, body });
-  if (r.status === 201) { items[r.body.id] = r.body; persist(); render(); }
-  sync();
+  enqueue({ op: "create", tmp: "pending-" + uid(), at: new Date().toISOString(), body });
 }
 
-// Revision-checked write; on conflict, take the server's version and retry once.
-async function mutate(id, change, retried) {
-  const item = items[id];
-  if (!item) return;
-  const r = await api("PUT", "/v1/items/" + id,
-    { body: { ...item.body, ...change }, revision: item.revision });
-  if (r.status === 200) { items[id] = r.body; persist(); render(); }
-  else if (r.status === 409 && !retried) {
-    const fresh = await api("GET", "/v1/items/" + id);
-    if (fresh.status === 200) { items[id] = fresh.body; await mutate(id, change, true); }
-  }
-  sync();
+function mutate(id, patch) {
+  if (!view()[id]) return;
+  enqueue({ op: "update", id, patch });
 }
 
-async function removeTask(id) {
-  const r = await api("DELETE", "/v1/items/" + id);
-  if (r.status === 204 || r.status === 404) { delete items[id]; persist(); render(); }
-  sync();
+function removeTask(id) {
+  if (!view()[id]) return;
+  enqueue({ op: "delete", id });
 }
 
 // ---------------------------------------------------------------- ui
 
-const $ = s => document.querySelector(s);
-function setStatus(s) { $("#status").textContent = s; }
+function setStatus(s) {
+  $("#status").textContent = storageFull ? s + " · cache full" : s;
+}
 
 function fmtDue(due) {
   const d = new Date(due), now = new Date();
@@ -463,9 +1419,69 @@ function fmtDue(due) {
   return d.toLocaleDateString();
 }
 
+// The token itself never reaches the DOM; this is what the panel says
+// instead of handing a password manager a secret to remember. A ticket's
+// `name` is the label when there is one — it is a courtesy to the human
+// and trusted for nothing — and the url otherwise.
+function renderConfigState() {
+  const el = $("#cfg-state");
+  if (!config) { el.textContent = "not connected"; return; }
+  const exp = tokenExp(config.token);
+  const who = config.name ? config.name + " · " + config.url : config.url;
+  el.textContent = "paired with " + who + " · token " +
+    (exp === null ? "never expires" : "valid until " + new Date(exp * 1000).toLocaleString());
+}
+
+// What the screen is missing when an action was refused, said as the thing
+// the user cannot do rather than as a permission string.
+const NOT_ALLOWED = {
+  create: "cannot add tasks",
+  update: "cannot change or complete them",
+  delete: "cannot delete them",
+};
+
+/** The sentence the banner carries, or "" when there is nothing to say. */
+function permissionNote() {
+  if (!config) return "";
+  if (facetMissing) {
+    return `This core has no “${FACET}” facet registered, so nothing can be saved to it. ` +
+      `Ask whoever runs the core to register it — or disconnect, pair again, and approve ` +
+      `this app's request to register facets.`;
+  }
+  if (!can("read")) {
+    return "This app was not given permission to read your tasks, so there is nothing to " +
+      "show. Disconnect and pair again to ask for it.";
+  }
+  const missing = ["create", "update", "delete"].filter(a => !can(a));
+  if (missing.length === 3) {
+    return "Read-only: this app was approved to read your tasks and nothing else. " +
+      "Disconnect and pair again to ask for more.";
+  }
+  if (missing.length) {
+    return "Approved for part of what was asked: " +
+      missing.map(a => NOT_ALLOWED[a]).join(", ") +
+      ". Disconnect and pair again to ask for more.";
+  }
+  return "";
+}
+
+/** The screen obeys what was granted rather than what was asked for: a
+ * control for something the core will refuse comes off it, because an Add
+ * button that always fails is worse than no Add button. */
+function renderPermissions() {
+  $("#add-card").hidden = !can("create");
+  const note = permissionNote();
+  const banner = $("#perm-banner");
+  banner.textContent = note;
+  banner.hidden = !note;
+  banner.className = "card app" +
+    (facetMissing || !can("read") ? " blocked" : note ? " readonly" : "");
+}
+
 function render() {
+  renderPermissions();
   const list = $("#list");
-  const sorted = Object.values(items).sort((a, b) => {
+  const sorted = Object.values(view()).sort((a, b) => {
     if (a.body.done !== b.body.done) return a.body.done ? 1 : -1;
     const ad = a.body.due ?? "9999", bd = b.body.due ?? "9999";
     return ad < bd ? -1 : ad > bd ? 1 : 0;
@@ -474,9 +1490,14 @@ function render() {
   list.replaceChildren(...sorted.map(item => {
     const t = item.body;
     const li = document.createElement("li");
-    li.className = "task" + (t.done ? " done" : "");
+    li.className = "task" + (t.done ? " done" : "") + (item.pending ? " pending" : "");
     const box = document.createElement("input");
     box.type = "checkbox"; box.checked = t.done;
+    // The box doubles as the done indicator, so without `update` it stays
+    // on screen and stops working rather than vanishing and taking the one
+    // thing that says whether a task is finished with it.
+    box.disabled = !can("update");
+    if (box.disabled) box.title = "this app was not approved to change tasks";
     box.onchange = () => mutate(item.id, completion(t, box.checked));
     const span = document.createElement("span");
     span.className = "t"; span.textContent = t.title;
@@ -494,10 +1515,12 @@ function render() {
       due.textContent = fmtDue(t.due);
       li.append(due);
     }
-    const x = document.createElement("button");
-    x.className = "x"; x.textContent = "✕"; x.title = "delete";
-    x.onclick = () => removeTask(item.id);
-    li.append(x);
+    if (can("delete")) {
+      const x = document.createElement("button");
+      x.className = "x"; x.textContent = "✕"; x.title = "delete";
+      x.onclick = () => removeTask(item.id);
+      li.append(x);
+    }
     return li;
   }));
 }
@@ -505,43 +1528,68 @@ function render() {
 $("#addform").onsubmit = e => {
   e.preventDefault();
   const title = $("#title").value.trim();
-  if (!title || !config) return;
+  if (!title || !config || !can("create")) return;
   const dueRaw = $("#due").value;
   const unit = $("#repeat").value;
+  const n = Math.max(1, Math.trunc(Number($("#repeat-n").value)) || 1);
   // A repeat without a due has nothing to advance from: default to now.
   const due = dueRaw ? new Date(dueRaw).toISOString()
     : unit ? new Date().toISOString() : null;
-  addTask(title, due, unit ? { n: 1, unit } : null);
-  $("#title").value = ""; $("#due").value = ""; $("#repeat").value = "";
+  addTask(title, due, unit ? { n, unit } : null);
+  $("#title").value = ""; $("#due").value = "";
+  $("#repeat").value = ""; $("#repeat-n").value = "1";
 };
 
-$("#cfg-save").onclick = async () => {
-  const token = $("#cfg-token").value.trim();
-  // The token's remaining life is the lifetime to keep renewing at; a
-  // token without an exp never expires, so it never refreshes.
-  const exp = tokenExp(token);
-  config = {
-    url: $("#cfg-url").value.trim().replace(/\/$/, ""),
-    token,
-    ttl: exp === null ? null : Math.max(1, Math.round(exp - Date.now() / 1000)),
-  };
-  save(LS.config, config);
-  items = {}; cursor = null; notified = {}; persist();
-  await ensureFacet();
-  streamAbort?.abort();   // the loop reconnects against the new config
-  streamLoop();
+$("#cfg-save").onclick = () => {
+  // An empty token field with a config already saved means "keep the
+  // token, change the url" — the field is empty by design, not by
+  // accident, so it must not read as "erase my credentials".
+  const token = $("#cfg-token").value.trim() || config?.token;
+  const url = $("#cfg-url").value.trim().replace(/\/$/, "");
+  if (!token || !url) { setStatus("url and token required"); return; }
+  $("#cfg-token").value = "";
+  cancelPairing();
+  pairMsg("");
+  // Hand-entered details name a core by its url; a label only ever comes
+  // from a ticket, so there is none to keep here. What the token holds is
+  // whatever it holds — connect asks the core rather than assuming.
+  connect(url, token, null);
 };
+
+$("#cfg-pair").onclick = () => pairWith($("#cfg-ticket").value);
+
+$("#pair-cancel").onclick = () => {
+  cancelPairing();
+  pairMsg("");
+  setStatus(config ? "paired" : "not paired");
+};
+
+// A ticket is one line, so Enter pairs and Shift+Enter is the newline
+// nobody typing a ticket wants by accident.
+$("#cfg-ticket").onkeydown = e => {
+  if (e.key === "Enter" && !e.shiftKey) {
+    e.preventDefault();
+    pairWith($("#cfg-ticket").value);
+  }
+};
+
+$("#scan-btn").onclick = () => startScan();
+$("#scan-cancel").onclick = () => { stopScan(); pairMsg(""); };
+
+$("#cfg-forget").onclick = () => disconnect();
 
 $("#notifbtn").onclick = () => Notification.requestPermission();
 
 // ---------------------------------------------------------------- boot
 
-if (config) {
-  $("#cfg-url").value = config.url; $("#cfg-token").value = config.token;
-} else {
-  $("#settings").open = true;
-}
+// A stored config is a working session and stays one. Its token is still
+// valid, so it is adopted as it stands — the first sync asks the core what
+// that token holds and the screen settles onto the answer.
+if (config) $("#cfg-url").value = config.url;
+renderPairState();
+renderConfigState();
 render();          // cache renders instantly, before any network
+initScanning();    // and the pairing screen learns whether it has a camera
 streamLoop();      // then the feed trues it up: catch-up poll, then live
 // The stream is an optimization; the cursor poll is the source of
 // correctness, so it keeps running — every beat while the stream is down,
@@ -551,7 +1599,9 @@ setInterval(() => { if (!streamLive || ++beats % 6 === 0) sync(); }, 10_000);
 setInterval(localDueCheck, 15_000);
 document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "visible") sync();
+  else stopScan();   // a backgrounded tab holding the camera open
 });
+window.addEventListener("pagehide", stopScan);
 </script>
 </body>
 </html>

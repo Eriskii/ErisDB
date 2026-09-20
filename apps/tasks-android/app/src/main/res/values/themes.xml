@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Compose owns all theming; the window theme's only jobs are to match
+         the system light/dark mode (see values-night) and to keep the
+         force-dark engine from inverting our already-themed content. -->
+    <style name="Theme.ErisDBTasks" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:forceDarkAllowed">false</item>
+    </style>
+</resources>
