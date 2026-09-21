@@ -5,8 +5,23 @@ storage. It stores JSON records under named schemas called facets, checks client
 permissions, and keeps a change history that apps can use to sync. Clients connect
 through the HTTP API or encrypted Iroh connections.
 
+ErisDB is a self-hostable personal data server and universal app backend designed
+for personal software ecosystems. It stores app data in a shared postgres database
+allowing for easy interop between allowed apps. ErisDB includes and is designed to
+be used with the integrated Iroh networking, to allow access by your apps from any
+network your client is on. Individual apps can register custom schemas, called 'facets',
+to simplify APIs compared to raw database access. Apps can register facets in real time
+all without needing to restart the server!
+
+ErisDB also supports plugins, allowing apps to access outside data. Included is a plugin
+which forwards an OpenAI endpoint to your apps, allowing you to keep your API key separate
+and avoid needing to authenticate every app you want AI features in. Future plans
+for bundled plugins include IMAP and CalDAV forwarding, as well as a plugin to
+ingest Google Health data.
+
 The [API documentation](docs/api.md) covers every server endpoint, authentication,
-pairing, permissions, and CLI commands, with examples.
+pairing, permissions, and CLI commands, with examples. I encourage you to
+make your own apps for ErisDB! That's the entire point!
 
 ## Install
 
