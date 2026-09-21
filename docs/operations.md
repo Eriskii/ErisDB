@@ -1,11 +1,32 @@
 # Operations
 
-Running an ErisDB. The [root README](../README.md#wiring-it-up) has the
+Running an ErisDB. The [root README](../README.md#install) has the
 install commands; this page is what to know while it is running.
 
 `erisdb serve` stores items, history, and installation registrations in
 Postgres. The poker calls the tick endpoint on a timer. In-memory caches,
 rate limits, and active connections belong to each running server process.
+
+## Systemd service (Debian)
+
+After building the server and creating the database using the README, install
+the binary and the supplied unit from the repository root:
+
+```sh
+sudo install -m 0755 "$HOME/.cargo/bin/erisdb" /usr/local/bin/erisdb
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin erisdb
+sudo install -d -m 0755 /etc/erisdb
+sudo install -m 0600 "$HOME/.config/erisdb/server.env" /etc/erisdb/erisdb.env
+sudo install -m 0644 deploy/erisdb.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now erisdb
+curl --fail http://127.0.0.1:7700/v1/health
+```
+
+Stop any foreground `erisdb serve` process before starting the service. Keep the
+same database URL and secret. Edit service configuration with
+`sudoedit /etc/erisdb/erisdb.env`, then `sudo systemctl restart erisdb`.
+Read logs with `sudo journalctl -u erisdb`.
 
 ## The process
 
@@ -142,9 +163,21 @@ Two things to know afterwards:
 
 ## Backup and restore
 
-Covered in full in
-[the root README](../README.md#backup-and-restore). The three things that
-bite, restated because they are the ones that lose data:
+With `DATABASE_URL` loaded from the server environment file, back up the database:
+
+```sh
+pg_dump --format=custom --file="erisdb-$(date +%F).dump" "$DATABASE_URL"
+```
+
+To restore, stop ErisDB and point `DATABASE_URL` at an empty database owned by
+the ErisDB database role, then run:
+
+```sh
+pg_restore --dbname="$DATABASE_URL" --no-owner erisdb-YYYY-MM-DD.dump
+```
+
+Restore the deployment configuration and secrets before starting ErisDB again.
+Keep these properties in mind:
 
 1. **Restore the whole database together.** `items`, the `changes` feed, and
    the `clients` registry must agree. Partial restores can break sync or
@@ -202,9 +235,7 @@ needs to see the secret on disk.
 
 ## Transport posture
 
-Two paths into the same router, with very different properties. The
-[root README](../README.md#transport) has the summary; the operational
-reading is:
+The HTTP and Iroh listeners serve the same API, with different transport security:
 
 **Iroh is the reachable path.** ALPN `erisdb/0`, HTTP/1.1 per QUIC
 bi-stream, authenticated and encrypted end to end by the transport, with

@@ -131,7 +131,7 @@ the audit log and trims the table. A dump therefore contains every version
 of everything ever written, including things since deleted, including
 anything that was ever briefly in a body by mistake. Size for it, and
 handle it accordingly — see
-[the root README's backup notes](../README.md#backup-and-restore).
+[the backup notes](operations.md#backup-and-restore).
 
 The other half of the same fact: **restoring `items` without `changes` is
 not a restore.** Every sync client holds a cursor into the feed, and a feed

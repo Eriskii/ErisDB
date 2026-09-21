@@ -1,276 +1,145 @@
 # ErisDB
 
-ErisDB is a personal data server. This repository contains the core, clients,
-apps, and deployment files:
+ErisDB is a self-hosted personal data server written in Rust, with PostgreSQL
+storage. It stores JSON records under named schemas called facets, checks client
+permissions, and keeps a change history that apps can use to sync. Clients connect
+through the HTTP API or encrypted Iroh connections.
 
-- **`erisdb/`** — the core. Stateless Rust process over Postgres; facets,
-  capabilities, change feed, tick sweep. See its README.
-- **`poker/`** — the clock. A curl in a systemd timer. Knows one URL, one
-  token, nothing else.
-- **`apps/tasks/`** — the first browser client, with shared authentication in
-  `apps/shared/`: local cache in
-  localStorage, cursor-based sync against the change feed, revision-safe
-  writes, and due notifications fed by both the poker's lapse sweep and a
-  local due-check between ticks.
-- **`apps/lists/`** — lists of stuff. Same browser structure as tasks. Each
-  entry is `list` + `name`, with optional description, link, and a flat
-  frontmatter-style attributes map; lists are implicit — a list is the set
-  of entries naming it. Added/modified timestamps ride the item envelope.
-- **`erisdb-client/`** — a Rust client that dials ErisDB over Iroh by
-  endpoint id; async core, blocking facade for FFI, JNI bindings for
-  Android.
-- **one-shot plugins** — executable operations loaded from deployment
-  manifests. One request starts one process and streams its stdout; no call
-  touches Postgres and no plugin survives between requests. The shipped
-  `erisdb-plugin-openai` forwards Chat Completions, including tools and SSE.
-- **`clients/mcp/`** — a separate client application. An MCP host launches it
-  over stdio; it makes authenticated HTTP requests to ErisDB. It has its own
-  binary and build. See its [README](clients/mcp/README.md).
-- **`apps/tasks-android/`** — the tasks client as an Android app over
-  `erisdb-client`: one-off and recurring tasks with due dates on
-  `tasks`; completing a repeating task advances its due date instead
-  of finishing it. See its [README](apps/tasks-android/README.md).
-- **`apps/lists-android/`** — the lists client as an Android app over
-  `erisdb-client`, using QR/deep-link pairing and its own Iroh installation
-  identity. See its [README](apps/lists-android/README.md).
-- **`deploy/`** — how the core runs on a machine: a systemd unit and an
-  environment file to fill in.
+The [API documentation](docs/api.md) covers every server endpoint, authentication,
+pairing, permissions, and CLI commands, with examples.
 
-## Documentation
+## Install
 
-This file is the tour. [`docs/`](docs/) is the detail:
-[api.md](docs/api.md) documents the server API with examples,
-[permissions.md](docs/permissions.md) what a grant is and what it covers,
-[capabilities.md](docs/capabilities.md) the token that carries one,
-[facets.md](docs/facets.md) how the store gets structure without a deploy,
-[change-feed.md](docs/change-feed.md) the feed that is both bus and audit
-log, [clients.md](docs/clients.md) installation identity and administration,
-[client-development.md](docs/client-development.md) how to build a client,
-[plugins.md](docs/plugins.md) how one-shot external operations are installed
-and invoked,
-[pairing.md](docs/pairing.md) the ticket format, and
-[operations.md](docs/operations.md) what to know while it is running.
-[`docs/README.md`](docs/README.md) indexes them and names the shortest
-path through for each of those three jobs.
+These instructions build the server from source and set up a local PostgreSQL
+database. Run commands as your normal user unless they use `sudo`.
 
-## Wiring it up
+### Nix (Linux)
 
-The core is one binary against one Postgres database. The poker, apps and MCP
-client make authenticated API requests. One-shot plugins are the other
-path: operator-installed executables launched once per authorized call, with
-no database involvement.
-
-### The core
+With Nix installed, open a [shell with the required packages](https://nixos.org/manual/nix/stable/command-ref/nix-shell.html):
 
 ```sh
-# build and install the binary (everything below runs from the repo root)
-cargo build --release --manifest-path erisdb/Cargo.toml
-sudo install -m 0755 erisdb/target/release/erisdb /usr/local/bin/erisdb
-
-# the store; `erisdb serve` runs the migrations itself on startup
-sudo -u postgres createuser erisdb
-sudo -u postgres createdb -O erisdb erisdb
-
-# the service account and its secrets
-sudo useradd --system --no-create-home --shell /usr/sbin/nologin erisdb
-sudo install -d -m 0755 /etc/erisdb
-sudo install -m 0600 deploy/erisdb.env.example /etc/erisdb/erisdb.env
-sudoedit /etc/erisdb/erisdb.env    # DATABASE_URL, ERISDB_SECRET, ERISDB_LISTEN
-
-# the unit
-sudo install -m 0644 deploy/erisdb.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now erisdb
-curl -fsS http://127.0.0.1:7700/v1/health
+nix-shell -p cargo rustc gcc pkg-config postgresql_18 openssl git curl python3
 ```
 
-`/etc/erisdb/*.env` stays mode 0600 root-owned: systemd reads it as the
-manager, before dropping to the `erisdb` user, so the service account never
-needs to see the secret on disk.
-
-### Tokens and the address
-
-Run these commands with the service environment file sourced:
+Use a current Nixpkgs channel for the Rust toolchain. Run the remaining commands
+inside this shell. For a new local PostgreSQL instance:
 
 ```sh
-set -a; . /etc/erisdb/erisdb.env; set +a
-
-erisdb endpoint-id                                    # what clients dial
-erisdb mint --grant '*' --ttl 3600                    # an operator's token
-erisdb mint --grant meta:system:tick --no-expiry      # for the poker
+export PGDATA="$HOME/.local/share/erisdb/postgres"
+initdb --encoding=UTF8 --auth-local=peer --auth-host=scram-sha-256
+pg_ctl -l "$PGDATA/server.log" -o "-h 127.0.0.1 -k '$PGDATA'" start
+createuser -h "$PGDATA" --pwprompt erisdb
+createdb -h "$PGDATA" --owner=erisdb erisdb
 ```
 
-`erisdb endpoint-id` is a pure derivation of the secret — the same answer
-whether or not the server is running, and the same answer after every
-restart.
+Choose a database password when prompted. PostgreSQL runs in the background;
+use `pg_ctl stop` to stop it. After a reboot, reopen the Nix shell, set `PGDATA`,
+and repeat the `pg_ctl ... start` command. Initialize the database only once.
 
-### One-shot plugins
+### Debian
 
-The OpenAI plugin is built with the core but installed as a separate
-executable. It is never a service:
+Install the build tools and PostgreSQL:
 
 ```sh
-sudo install -d -m 0755 /usr/local/libexec/erisdb /etc/erisdb/plugins.d
-sudo install -m 0755 erisdb/target/release/erisdb-plugin-openai \
-  /usr/local/libexec/erisdb/
-sudo install -m 0644 deploy/plugins/openai.json /etc/erisdb/plugins.d/
-sudoedit /etc/erisdb/erisdb.env    # ERISDB_PLUGIN_DIR, OPENAI_API_KEY
-sudo systemctl restart erisdb
+sudo apt update
+sudo apt install -y build-essential pkg-config ca-certificates curl git \
+  openssl postgresql python3
+sudo systemctl enable --now postgresql
+sudo -u postgres createuser --pwprompt erisdb
+sudo -u postgres createdb --owner=erisdb erisdb
 ```
 
-Each `POST /v1/call` validates the manifest's permission and JSON Schema,
-starts a fresh executable, pipes the input through stdin, and streams stdout
-back. Calls, prompts and responses are never written to Postgres. See
-[docs/plugins.md](docs/plugins.md) for the manifest and process protocols.
-
-A token carries **grants**: `tasks:read`, `tasks:*`, `*:read`,
-`meta:facets:write`, `*`. `--grant` is repeatable and splits on commas.
-Apps do not need one of these: pair them instead, with
+Choose a database password when prompted. Install the current stable Rust
+[using rustup](https://doc.rust-lang.org/book/ch01-01-installation.html) if needed:
 
 ```sh
-erisdb pair --name my-laptop
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+. "$HOME/.cargo/env"
 ```
 
-which shows a QR code, lets the client say what it wants, and asks you.
-[docs/permissions.md](docs/permissions.md) is the grammar and
-[docs/pairing.md](docs/pairing.md) is the ticket.
+### Build and run
 
-### The poker
+From your checkout of this repository, or clone it first:
 
 ```sh
-sudo install -m 0755 poker/poke.sh /usr/local/bin/
-sudo install -m 0644 poker/erisdb-poker.service poker/erisdb-poker.timer /etc/systemd/system/
-sudo install -m 0600 poker/poker.env.example /etc/erisdb/poker.env
-sudoedit /etc/erisdb/poker.env    # ERISDB_URL, ERISDB_POKER_TOKEN
-sudo systemctl daemon-reload
-sudo systemctl enable --now erisdb-poker.timer
+git clone git@github.com:Eriskii/ErisDB.git
+cd ErisDB
+cargo install --locked --path erisdb --bin erisdb
+export PATH="$HOME/.cargo/bin:$PATH"
 ```
 
-`poke.sh` is a curl with two variables; any cron that can set them works
-just as well as the timer.
-
-### The apps
-
-Serve the `apps/` directory statically over HTTPS (HTTP is supported on localhost),
-preserving `shared/` alongside `tasks/` and `lists/`. Open either app and give it
-a ticket: scan the QR `erisdb pair` prints, or
-paste the `erisdb://pair/…` string. The app redeems it, asks for the
-permissions it needs, and waits while you answer in the terminal. Pasting
-a URL and a token still works for a token you already hold. The Android
-clients take an iroh endpoint id instead of a URL — no IP, no port.
-
-## Backup and restore
-
-Postgres holds the server's durable data. Back up the database together with
-the deployment configuration and secrets. The Iroh identity is derived from
-`ERISDB_IROH_SECRET`, or `ERISDB_SECRET` when that is unset.
+Create the configuration once:
 
 ```sh
-# DATABASE_URL comes from the environment file:
-#   set -a; . /etc/erisdb/erisdb.env; set +a
-
-# dump: custom format, compressed, restorable selectively
-pg_dump --format=custom --file="erisdb-$(date +%F).dump" "$DATABASE_URL"
-
-# restore into an empty database
-sudo -u postgres createdb -O erisdb erisdb
-pg_restore --dbname="$DATABASE_URL" --no-owner erisdb-YYYY-MM-DD.dump
+mkdir -p "$HOME/.config/erisdb"
+(umask 077; cat > "$HOME/.config/erisdb/server.env" <<EOF_CONFIG
+DATABASE_URL=postgres://erisdb:REPLACE_WITH_DATABASE_PASSWORD@127.0.0.1/erisdb
+ERISDB_SECRET=$(openssl rand -hex 32)
+ERISDB_LISTEN=127.0.0.1:7700
+EOF_CONFIG
+)
 ```
 
-Three things to keep straight:
-
-- **Restore the whole database together.** `items` is current truth; `changes`
-  is the append-only feed every sync client reads by cursor; `clients` holds
-  installation permissions and revocation. Partial restores can break sync or
-  restore inconsistent authority. An older backup can restore registrations
-  revoked after that backup.
-- **`changes` grows without bound.** Every write snapshots the full body it
-  produced, deletes keep the bodies that came before them, and the poker
-  adds a `tick` row a minute. Nothing prunes any of it — the feed *is* the
-  history. A dump therefore contains every version of everything ever
-  written, including things since deleted; size and handle it accordingly.
-- **A dump is half the system.** Without the same `ERISDB_SECRET`, every
-  token minted against that secret fails verification. Back up both configured
-  secrets separately from the dump to preserve the signing key and Iroh identity.
-
-## Secrets
-
-`ERISDB_SECRET` does two jobs at once:
-
-1. It is the HMAC key that signs and verifies every capability token.
-2. Unless `ERISDB_IROH_SECRET` is set, it also derives the Iroh endpoint ID.
+Edit `~/.config/erisdb/server.env` and replace the database password placeholder.
+URL-encode special characters in the password. Keep this file private and retain
+the same secret across restarts. Load it and start the server:
 
 ```sh
-openssl rand -hex 32
+set -a
+. "$HOME/.config/erisdb/server.env"
+set +a
+erisdb serve
 ```
 
-Rotating it has these effects:
-
-- **Outstanding token signatures become invalid.** Registered installations
-  can renew using their installation proof. Manual tokens must be re-minted.
-- **The address changes unless `ERISDB_IROH_SECRET` is set.** Each Android client and
-  each `erisdb-client` caller is pinned to the endpoint id derived from the
-  old secret, and will dial an address nobody answers. Print the new one
-  with `erisdb endpoint-id` and re-pin every one of them.
-
-Revoke one paired installation with `erisdb clients revoke CLIENT_UUID`.
-This immediately blocks subsequent access, renewal and active change feeds.
-Manual tokens without a registration still require expiry or signing-key
-rotation. [Client administration](docs/clients.md) explains renewal and revocation.
-
-
-## Transport
-
-Two paths into the same router, with very different properties.
-
-- **Iroh** (ALPN `erisdb/0`, HTTP/1.1 per QUIC bi-stream) is authenticated
-  and encrypted end to end. Anyone may connect; nobody reads or writes
-  without a token.
-- **Plain TCP is neither.** `--listen` defaults to `127.0.0.1:7700` and
-  belongs on loopback. Capability tokens are bearer credentials in an
-  `Authorization` header, CORS is permissive, and this path has no
-  transport security: binding it to a public interface publishes every
-  token that crosses it to anyone on the wire.
-
-If the TCP listener has to be reachable off-host, put TLS in front of it —
-a reverse proxy terminating HTTPS into `127.0.0.1:7700`. Otherwise leave it
-on loopback and dial over iroh, which is what the Android clients do and
-what needs no open port at all.
-
-## Tests
-
-`erisdb/`, `erisdb-client/`, and `clients/mcp/` each carry a suite. They are separate crate
-trees with no workspace root, so each runs from its own directory:
+The server initializes its tables on first startup. In another terminal, check:
 
 ```sh
-(cd erisdb && cargo test)
-(cd erisdb-client && cargo test)
-(cd clients/mcp && cargo test)
+curl --fail http://127.0.0.1:7700/v1/health
 ```
 
-The suites bring up a real Postgres through testcontainers and talk to it over
-real sockets, so **Docker must be running**. `erisdb`'s e2e suite also
-exercises real Iroh QUIC. No mocks.
+For remote HTTP access, put an HTTPS reverse proxy on the same machine in front
+of `127.0.0.1:7700`. Android clients connect over Iroh. See
+[operations](docs/operations.md) for systemd setup, backups, and configuration.
 
-CI runs all three suites plus `cargo clippy -- -D warnings` and
-an advisory `cargo fmt --check` on every push and pull request.
+## Included demo apps
 
-## License
+- **Tasks:** one-off and recurring tasks with due dates. Available for
+  [browsers](apps/tasks/) and [Android](apps/tasks-android/README.md).
+- **Lists:** named lists of entries, with descriptions, links, and custom
+  attributes. Available for [browsers](apps/lists/) and
+  [Android](apps/lists-android/README.md).
 
-The core is copyleft; the clients are not.
+The apps use the same server data across browser and Android installations.
+They cache data locally and queue changes while offline.
 
-- **`erisdb/`** — GNU Affero General Public License v3.0, full text in
-  [`erisdb/LICENSE`](erisdb/LICENSE) and
-  [`LICENSE-AGPL-3.0`](LICENSE-AGPL-3.0). Running a modified core as a
-  network service obliges you to offer its source to that service's users.
-- **Everything else here** — MIT, full text in
-  [`LICENSE-MIT`](LICENSE-MIT): `erisdb-client/`, `poker/`, `deploy/`,
-  `apps/tasks/` and `apps/lists/`.
-- **The MCP and Android clients** — MIT, carried in their own trees:
-  `clients/mcp`, `apps/tasks-android`, `apps/lists-android`.
+To try the browser apps locally, run this from the repository root:
 
-Copyright (c) 2026 Isolyth.
+```sh
+python3 -m http.server 8080 --bind 127.0.0.1 --directory apps
+```
 
-There is no single `LICENSE` at the repo root on purpose: this tree holds
-both licenses, and one file there would say the wrong thing about half of
-it.
+Open <http://127.0.0.1:8080/tasks/> or <http://127.0.0.1:8080/lists/>. For remote
+hosting, serve `apps/` over HTTPS, keeping `shared/` beside `tasks/` and `lists/`.
+
+In another terminal, load `server.env` as above and create a pairing ticket:
+
+```sh
+erisdb pair --name ErisDB --client-url http://127.0.0.1:7700
+```
+
+Paste the ticket into the browser app, or scan the QR code/open its deep link
+with an Android app. Compare the fingerprint shown in the app and terminal, then
+approve the requested permissions or a subset. For a remote browser, replace
+`--client-url` with your server's HTTPS URL.
+
+On a fresh server, the browser apps can register their schemas if you approve
+the optional facet permissions. Android apps need those schemas registered
+before saving data; use the browser apps first or the
+[facet API](docs/api.md#items-and-facets).
+
+Build the Android APKs with `scripts/build-android.sh`; the Android READMEs above
+list build requirements. Paired installations renew access automatically until
+revoked. Manage them with `erisdb clients list`, `erisdb clients permissions`,
+and `erisdb clients revoke` as described in the [API docs](docs/api.md#operator-cli).
+
+A separate [MCP client](clients/mcp/README.md) is also included for MCP hosts.
