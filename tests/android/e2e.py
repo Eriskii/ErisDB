@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import sys
 import time
 import urllib.request
 import urllib.error
@@ -156,6 +157,49 @@ def run(app):
         else:
             raise AssertionError('the app schema must reject invalid data')
 
+        # Keep the server unchanged: a later update can hide a lost local cache
+        # by sending the missing item through the change feed again.
+        second_label = label + 'Second'
+        button('add task' if app == 'tasks' else 'add entry')
+        if app == 'tasks':
+            edit(0, second_label)
+        else:
+            edit(0, 'E2E')
+            edit(1, second_label)
+        button('Save')
+        eventually(lambda: len(api('GET', f'/v1/items?facet={app}')['items']) == 2)
+        eventually(lambda: json.loads(next(n.text for n in ET.fromstring(
+            adb('shell', 'run-as', package, 'cat', 'shared_prefs/erisdb.xml')) if n.get('name') == 'outbox')) == [])
+        def saved_labels():
+            saved = json.loads(adb('shell', 'run-as', package, 'cat', 'files/items.json'))
+            return {v['body'].get('title', v['body'].get('name')) for v in saved['items']}
+        eventually(lambda: saved_labels() == {label, second_label})
+        baseline = api('GET', f'/v1/items?facet={app}')['items']
+
+        adb('shell', 'am', 'force-stop', package)
+        adb('shell', 'svc', 'wifi', 'disable')
+        adb('shell', 'svc', 'data', 'disable')
+        try:
+            adb('shell', 'am', 'start', '-W', '-n', component)
+            eventually(lambda: has_text(label) and has_text(second_label))
+        finally:
+            adb('shell', 'svc', 'wifi', 'enable')
+            adb('shell', 'svc', 'data', 'enable')
+        eventually(lambda: has_text(label) and has_text(second_label))
+        assert api('GET', f'/v1/items?facet={app}')['items'] == baseline
+        print(f'{app}: both unchanged saved items survive offline process restart', flush=True)
+        # Actual on-device storage damage: credentials and the server stay intact.
+        # A missing/unreadable cache must never reuse a cursor for absent items.
+        for damage, command in [('unreadable', ('truncate', '-s', '0')),
+                                ('missing', ('rm',))]:
+            adb('shell', 'am', 'force-stop', package)
+            adb('shell', 'run-as', package, *command, 'files/items.json')
+            adb('shell', 'am', 'start', '-W', '-n', component)
+            print(f'{app}: recover unchanged server data after a {damage} local cache', flush=True)
+            eventually(lambda: has_text(label) and has_text(second_label), seconds=35)
+            eventually(lambda: saved_labels() == {label, second_label})
+            assert api('GET', f'/v1/items?facet={app}')['items'] == baseline
+
         adb('shell', 'am', 'force-stop', package)
         print(f'{app}: restart after real token expiration', flush=True)
         time.sleep(6)  # Real expiration while the app is stopped.
@@ -212,7 +256,7 @@ def run(app):
         eventually(lambda: find_button('add task' if app == 'tasks' else 'add entry') is None)
         api('POST', f"/v1/clients/{session['id']}/revoke", {})
         eventually(lambda: has_text('revoked'))
-        print(f'{app}: fresh-schema setup, real deep-link pairing, fingerprint, offline queue/restart, UI create/edit/delete, restart renewal, re-pairing, permissions, revocation passed', flush=True)
+        print(f'{app}: fresh-schema setup, real deep-link pairing, fingerprint, offline queue/restart, unchanged saved items, missing/unreadable cache recovery, UI create/edit/delete, restart renewal, re-pairing, permissions, revocation passed', flush=True)
     except Exception:
         Path('/tmp/erisdb-android-logcat.txt').write_text(adb('logcat', '-d'))
         try:
@@ -227,5 +271,7 @@ def run(app):
 if __name__ == '__main__':
     serial = adb('get-serialno')
     assert serial.startswith('emulator-'), 'this destructive test installs/uninstalls its own apps; use an isolated emulator'
-    for app in ('tasks', 'lists'):
+    apps = sys.argv[1:] or ['tasks', 'lists']
+    assert all(app in ('tasks', 'lists') for app in apps)
+    for app in apps:
         run(app)

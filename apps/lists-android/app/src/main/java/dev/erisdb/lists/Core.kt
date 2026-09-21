@@ -57,7 +57,9 @@ fun jsonObjects(arr: JSONArray): List<JSONObject> =
  * mid-poll waits its turn and is still sent.
  */
 class SyncGate {
-    private val lock = Mutex()
+    // Activities in the same installation share the native client and outbox.
+    // A second activity must not send an operation already being sent elsewhere.
+    private companion object { val lock = Mutex() }
 
     suspend fun <T> serialized(block: suspend () -> T): T = lock.withLock { block() }
 }

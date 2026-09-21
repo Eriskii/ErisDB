@@ -2,6 +2,7 @@ package dev.erisdb.tasks
 
 import android.annotation.SuppressLint
 import android.content.Context
+import android.util.AtomicFile
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -16,7 +17,7 @@ import java.security.SecureRandom
 //
 //   secrets   — the token and the iroh private key, sealed by a keystore
 //               key (Secrets.kt), never in the clear;
-//   settings  — server id, token lifetime, feed cursor: a handful of
+//   settings  — server id and token lifetime: a handful of
 //               small values, which is what SharedPreferences is for;
 //   the cache — one file. SharedPreferences reads its whole XML into
 //               memory and rewrites all of it on every commit, which is
@@ -26,7 +27,7 @@ import java.security.SecureRandom
 class Store(ctx: Context) : OutboxStore {
     private val prefs = ctx.getSharedPreferences("erisdb", Context.MODE_PRIVATE)
     private val secrets: SecretStore = KeystoreSecrets(ctx)
-    private val cacheFile = File(ctx.filesDir, "items.json")
+    private val cacheFile = AtomicFile(File(ctx.filesDir, "items.json"))
 
     // ------------------------------------------------------------ settings
 
@@ -67,16 +68,6 @@ class Store(ctx: Context) : OutboxStore {
             edit.commit()
         }
 
-    /** The feed sequence this device has read up to, or null before first
-     * contact. Held here, so a reinstall reseeds and a restart does not. */
-    var cursor: Long?
-        get() = if (prefs.contains("cursor")) prefs.getLong("cursor", 0L) else null
-        set(value) {
-            val edit = prefs.edit()
-            if (value == null) edit.remove("cursor") else edit.putLong("cursor", value)
-            edit.commit()
-        }
-
     // ------------------------------------------------------------ secrets
 
     /** Durable before returning: a kill right after a refresh must not
@@ -97,22 +88,34 @@ class Store(ctx: Context) : OutboxStore {
 
     // ------------------------------------------------------------ cache
 
-    fun hasCache(): Boolean = cacheFile.exists()
-
-    fun loadItems(): MutableMap<String, JSONObject> {
-        val out = LinkedHashMap<String, JSONObject>()
-        if (!cacheFile.exists()) return out
-        runCatching {
-            val arr = JSONArray(cacheFile.readText())
-            for (item in jsonObjects(arr)) out[item.getString("id")] = item
+    /** Items and the position that produced them are one snapshot. An absent,
+     * unreadable, or different-core snapshot must be fetched again in full. */
+    fun loadSnapshot(): Snapshot? = runCatching {
+        val saved = JSONObject(String(cacheFile.readFully(), Charsets.UTF_8))
+        require(saved.getString("server") == server)
+        val cursor = saved.getLong("cursor")
+        require(cursor >= 0)
+        val items = LinkedHashMap<String, JSONObject>()
+        for (item in jsonObjects(saved.getJSONArray("items"))) {
+            item.getJSONObject("body")
+            items[item.getString("id")] = item
         }
-        return out
-    }
+        Snapshot(items, cursor)
+    }.getOrNull()
 
-    fun saveItems(items: Map<String, JSONObject>) {
-        val tmp = File(cacheFile.parentFile, cacheFile.name + ".tmp")
-        tmp.writeText(JSONArray(items.values.toList()).toString())
-        tmp.renameTo(cacheFile)
+    /** AtomicFile syncs and replaces the whole snapshot. No separately saved
+     * cursor can move past items that failed to reach disk. */
+    fun saveSnapshot(server: String, snapshot: Snapshot) {
+        val bytes = JSONObject().put("server", server).put("cursor", snapshot.cursor)
+            .put("items", JSONArray(snapshot.items.values.toList())).toString().toByteArray(Charsets.UTF_8)
+        val stream = cacheFile.startWrite()
+        try {
+            stream.write(bytes)
+            cacheFile.finishWrite(stream)
+        } catch (error: Exception) {
+            cacheFile.failWrite(stream)
+            throw error
+        }
     }
 
     // ------------------------------------------------------------ outbox

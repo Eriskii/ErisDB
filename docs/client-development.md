@@ -133,6 +133,11 @@ polling and streaming feed the cache, serialize their application, keep sequence
 order, and ignore already-processed rows. Keep unsent local edits separately so
 applying server changes does not discard them.
 
+If that saved snapshot is missing, unreadable, or belongs to another core, start
+initialization again. Never combine an empty cache with a previously advanced
+cursor: unchanged server records would remain invisible. Keep the items and
+their cursor together in memory too, including when several screens can sync.
+
 `GET /v1/items` provides a current snapshot with a maximum of 1000 rows per call.
 Its `updated_since` filter uses strict `>` and has no ID continuation: if a page
 ends inside a group with the same timestamp, advancing to that timestamp skips

@@ -109,7 +109,7 @@ suspend fun pollChanges(
 }
 
 /** The cache and the feed position that go together. */
-data class Seed(val items: Map<String, JSONObject>, val cursor: Long)
+data class Snapshot(val items: Map<String, JSONObject>, val cursor: Long)
 
 /**
  * First contact: read the feed's head, then the items. In that order —
@@ -119,13 +119,13 @@ data class Seed(val items: Map<String, JSONObject>, val cursor: Long)
  * twice lands in the same place.
  *
  */
-suspend fun seed(api: CoreApi, facet: String): Read<Seed> {
+suspend fun seed(api: CoreApi, facet: String): Read<Snapshot> {
     val head = when (val h = feedHead(api, facet)) {
         is Read.Failed -> return h
         is Read.Ok -> h.value
     }
     return when (val items = fetchAllItems(api, facet)) {
         is Read.Failed -> items
-        is Read.Ok -> Read.Ok(Seed(items.value, head))
+        is Read.Ok -> Read.Ok(Snapshot(items.value, head))
     }
 }

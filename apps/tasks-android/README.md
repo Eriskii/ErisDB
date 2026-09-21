@@ -90,13 +90,16 @@ describes complete initialization by replaying the existing change feed from zer
 
 After initialization, the app polls `GET /v1/changes?since=<cursor>&facet=tasks`
 and applies rows to its cache. Created and updated rows carry bodies and
-revisions; deleted rows remove items. The saved cursor resumes across restarts;
-reinstalling or replacing the configuration reseeds the cache.
+revisions; deleted rows remove items. The app saves the core ID, items, and their
+feed cursor together in one file using Android's `AtomicFile`. Memory also holds
+the items and cursor together, so one activity cannot advance another activity's
+cursor past records it has not received.
 
-The cache is one file, written whole and renamed into place. It is not
-SharedPreferences: that reads its entire XML into memory and rewrites all
-of it on every commit, which is the wrong shape for a few hundred
-kilobytes of items.
+An absent, unreadable, or different-core snapshot triggers a full fetch instead
+of resuming from a cursor whose items are missing. This keeps existing pairing
+credentials and pending edits. A valid snapshot displays immediately, including
+when the app restarts offline; a failed save reports that the offline copy could
+not be saved.
 
 ## Offline-first
 

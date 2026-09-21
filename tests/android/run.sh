@@ -9,4 +9,4 @@ for attempt in $(seq 1 600); do
   if ! kill -0 "$fixture_pid" 2>/dev/null; then cat /tmp/erisdb-android-core.log; exit 1; fi
   sleep 1
 done
-python3 tests/android/e2e.py
+python3 tests/android/e2e.py "$@"

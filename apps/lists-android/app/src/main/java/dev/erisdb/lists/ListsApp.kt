@@ -89,8 +89,7 @@ fun ListsApp(pairUri: String? = null, onPairHandled: () -> Unit = {}) {
     var connected by remember { mutableStateOf(false) }
     var connecting by remember { mutableStateOf(false) }
     var status by remember { mutableStateOf("not connected") }
-    var cache by remember { mutableStateOf<Map<String, JSONObject>>(store.loadItems()) }
-    var haveData by remember { mutableStateOf(store.hasCache()) }
+    var snapshot by remember { mutableStateOf(store.loadSnapshot()) }
     var outbox by remember { mutableStateOf(store.ops()) }
     var aliases by remember { mutableStateOf(store.aliases()) }
     var selected by remember { mutableStateOf<String?>(null) }
@@ -136,7 +135,6 @@ fun ListsApp(pairUri: String? = null, onPairHandled: () -> Unit = {}) {
         // feed, so the cursor goes with it — and so does the label, which
         // describes the core that is leaving.
         val moved = newServer != store.server
-        if (moved) store.cursor = null
         store.server = newServer
         store.token = newToken
         store.coreName = name ?: if (moved) "" else store.coreName
@@ -153,10 +151,7 @@ fun ListsApp(pairUri: String? = null, onPairHandled: () -> Unit = {}) {
         token = store.token
         coreName = store.coreName
         grants = Grants.UNKNOWN
-        if (moved) {
-            cache = emptyMap()
-            haveData = false
-        }
+        if (moved) snapshot = null
         // The native client still holds the previous credentials; only
         // connect() feeds it these. Force the reconfigure even when a
         // stale connection looks healthy.
@@ -214,6 +209,7 @@ fun ListsApp(pairUri: String? = null, onPairHandled: () -> Unit = {}) {
      */
     suspend fun sync() = gate.serialized {
         if (!connected || redeeming != null) return@serialized
+        val syncingServer = server
         withContext(Dispatchers.IO) {
             val refreshed = maybeRefresh(store)
             if (refreshed.token != null || refreshed.dead) {
@@ -252,8 +248,9 @@ fun ListsApp(pairUri: String? = null, onPairHandled: () -> Unit = {}) {
 
             val drop = drainOutbox(store, ErisDBApi, FACET)
 
-            val working = LinkedHashMap(cache)
-            var cursor = store.cursor
+            val previous = snapshot
+            val working = LinkedHashMap(previous?.items.orEmpty())
+            var cursor = previous?.cursor
             var error: String? = null
             if (cursor == null) {
                 when (val seeded = seed(ErisDBApi, FACET)) {
@@ -271,18 +268,20 @@ fun ListsApp(pairUri: String? = null, onPairHandled: () -> Unit = {}) {
                 }
             }
 
-            if (error == null) {
-                store.saveItems(working)
-                store.cursor = cursor
+            if (server != syncingServer) return@withContext
+            val updated = if (error == null) Snapshot(working, checkNotNull(cursor)) else null
+            val diskError = updated?.let {
+                runCatching { store.saveSnapshot(syncingServer, it) }.exceptionOrNull()
             }
 
-            withContext(Dispatchers.Main) {
+            withContext(Dispatchers.Main) main@{
+                if (server != syncingServer) return@main
                 outbox = store.ops()
                 aliases = store.aliases()
-                if (error == null) {
-                    cache = working
-                    haveData = true
-                    status = drop ?: if (outbox.isEmpty()) "synced" else "${outbox.size} pending"
+                if (updated != null) {
+                    snapshot = updated
+                    status = diskError?.let { "could not save offline copy: ${it.message}" }
+                        ?: drop ?: if (outbox.isEmpty()) "synced" else "${outbox.size} pending"
                 } else {
                     status = "offline: $error" +
                         if (outbox.isEmpty()) "" else " · ${outbox.size} queued"
@@ -369,7 +368,7 @@ fun ListsApp(pairUri: String? = null, onPairHandled: () -> Unit = {}) {
         }
     }
 
-    val shown = remember(cache, outbox, aliases) { applyPending(cache.values, outbox, aliases) }
+    val shown = remember(snapshot, outbox, aliases) { applyPending(snapshot?.items?.values.orEmpty(), outbox, aliases) }
     val lists = remember(shown, draftList) {
         (shown.map { it.getJSONObject("body").getString("list") } +
             listOfNotNull(draftList)).distinct().sorted()
@@ -410,7 +409,7 @@ fun ListsApp(pairUri: String? = null, onPairHandled: () -> Unit = {}) {
             items = shown,
             lists = lists,
             selected = selected,
-            haveData = haveData || outbox.isNotEmpty(),
+            haveData = snapshot != null || outbox.isNotEmpty(),
             grants = grants,
             statusLine = if (status == "synced") null else status,
             grid = grid,
