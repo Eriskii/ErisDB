@@ -11,6 +11,17 @@ env:
   RUSTFLAGS: -D warnings
 
 jobs:
+  security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo install cargo-audit --version 0.22.2 --locked
+      - name: Audit all locked Rust dependencies
+        run: |
+          cargo audit --deny yanked --file erisdb/Cargo.lock
+          cargo audit --deny yanked --no-fetch --file erisdb-client/Cargo.lock
+          cargo audit --deny yanked --no-fetch --file erisdb-mcp/Cargo.lock
+
   crate:
     name: ${{ matrix.crate }}
     runs-on: ubuntu-latest
@@ -63,6 +74,7 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
+      - run: npm audit --audit-level=low
       - run: npx playwright install --with-deps chromium
       - run: python3 scripts/update-csp.py --check
       - run: cargo build --locked --manifest-path erisdb/Cargo.toml --bin erisdb

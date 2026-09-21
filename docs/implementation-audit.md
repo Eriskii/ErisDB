@@ -107,3 +107,27 @@ fingerprint comparison, UI writes, renewal after a stopped-app expiry, permissio
 changes and revocation. This host has no emulator, connected device or KVM; device
 execution is assigned to the Android CI job and must be reported separately from
 unit/build results.
+
+## Dependency review
+
+The 2026-09-21 UTC RustSec scan found two vulnerable locked dependencies. All
+three component lockfiles now use rustls 0.23.45 or newer for
+[RUSTSEC-2026-0285](https://rustsec.org/advisories/RUSTSEC-2026-0285.html), and the
+core's h2 was updated to 0.4.16 for
+[RUSTSEC-2026-0258](https://rustsec.org/advisories/RUSTSEC-2026-0258.html).
+The other two components already held newer h2 versions. All three also replace
+the withdrawn chacha20 0.10.1 with 0.10.2. The repeated scans report zero known
+vulnerabilities and zero withdrawn releases; npm audit also reports zero.
+
+Two informational warnings remain visible, without blanket suppressions:
+
+- `paste` 1.0.15 is an unmaintained procedural macro used by Iroh's Linux netlink
+  dependencies. It runs at build time; RustSec reports no vulnerability in it.
+- `lru` 0.16.4 is used only by the `rqrr` test dependency. Its warning concerns a
+  panicking key destructor during `LruCache::pop()`. The decoder uses `u8` keys
+  and `pop_lru()`, and it is absent from production builds. No compatible upstream
+  decoder update was available at this check.
+
+CI audits the exact Rust lockfiles and npm dependencies on each run. Dependency
+advisory checks complement the actual authorization and transport tests; they do
+not establish that arbitrary application behavior is secure.
