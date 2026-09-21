@@ -6,7 +6,7 @@ anything else. These pages are the detail behind it.
 
 | page | for |
 |------|-----|
-| [api.md](api.md) | The complete v1 HTTP reference. Every route, parameter, status code, required permission and error. The reference, and the place to check a claim. |
+| [api.md](api.md) | The complete API reference with examples: HTTP/Iroh routes, authentication, pairing, installations, errors, MCP tools, Rust/Android clients, plugin protocol and CLI commands. |
 | [permissions.md](permissions.md) | What a grant is and what it covers. The grammar, the four facet actions, the closed `meta` namespace, enclosure, and why the facet namespace is open. |
 | [capabilities.md](capabilities.md) | The token that carries a grant: the two clocks, refresh, enclosure over scope and time, manual refresh chains and registered revocation. |
 | [facets.md](facets.md) | What a facet is, how to register one, why its name is a permission namespace, schema validation, lapse rules, and the shipped contracts in full. |

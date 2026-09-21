@@ -39,7 +39,7 @@ apps, and deployment files:
 ## Documentation
 
 This file is the tour. [`docs/`](docs/) is the detail:
-[api.md](docs/api.md) is the complete v1 HTTP reference,
+[api.md](docs/api.md) is the complete API reference with HTTP, MCP and native-client examples,
 [permissions.md](docs/permissions.md) what a grant is and what it covers,
 [capabilities.md](docs/capabilities.md) the token that carries one,
 [facets.md](docs/facets.md) how the store gets structure without a deploy,

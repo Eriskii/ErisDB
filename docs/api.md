@@ -1,1080 +1,1367 @@
-# The v1 HTTP API
+# ErisDB API reference
 
-One version, one prefix: everything lives under `/v1`. The same router is
-served over plain TCP and over Iroh QUIC, so every route below behaves
-identically on both paths — the transport changes what `source.addr` says
-and nothing else.
+This is the reference for the implemented public API: all core HTTP routes
+(also available over Iroh), pairing tickets, MCP tools, the Rust client, its
+blocking/Android interface, and the plugin process protocol. Operator CLI
+commands are indexed at the end.
 
-Bodies are JSON. Core responses are JSON, except `204 No Content` and SSE
-streams. A plugin response has the status, content type, allowed headers and
-streaming body its one-shot executable supplies. Every route except
-`/v1/health` needs a capability token:
-
-```
-Authorization: Bearer bz1.<b64url(payload)>.<b64url(sig)>
-```
-
-Every request may also carry `X-Bezel-Client`, a self-declared name that
-lands in the write's attribution. See [clients.md](clients.md).
-
-Each route names the **permission** it requires — one concrete permission
-string the core computes from the request. A token's grants either cover it
-or they do not. [permissions.md](permissions.md) is the authority on the
-grammar and on what covers what; this page names the strings.
-
-Every request and response below was captured from a running core at
-`erisdb 0.1.0`, edited only to line-wrap. Ids and timestamps are real ones
-from that session, which is why they are not all pretty.
+The contract is checked against [the router](../erisdb/src/api.rs),
+[installation authentication](../erisdb/src/installation.rs),
+[the MCP bridge](../erisdb-mcp/src/main.rs), and
+[the native client](../erisdb-client/src/lib.rs). Examples use illustrative IDs,
+timestamps and credentials; obtain real values from your running core.
 
 ## Contents
 
-- [Objects](#objects) — the item and change envelopes
+- [Conventions and authentication](#conventions-and-authentication)
+- [Example setup](#example-setup)
+- [Objects](#objects)
 - [Permissions by route](#permissions-by-route)
-- [Errors](#errors) — the envelope and every code
-- [`GET /v1/health`](#get-v1health)
-- [`GET /v1/plugins`](#get-v1plugins)
-- [`POST /v1/call`](#post-v1call)
-- [`POST /v1/items`](#post-v1items)
-- [`GET /v1/items`](#get-v1items)
-- [`GET /v1/items/{id}`](#get-v1itemsid)
-- [`PUT /v1/items/{id}`](#put-v1itemsid)
-- [`DELETE /v1/items/{id}`](#delete-v1itemsid)
-- [`GET /v1/items/{id}/history`](#get-v1itemsidhistory)
-- [`POST /v1/items/{id}/revert`](#post-v1itemsidrevert)
-- [`GET /v1/changes`](#get-v1changes)
-- [`GET /v1/changes/stream`](#get-v1changesstream)
-- [`POST /v1/tick`](#post-v1tick)
-- [`POST /v1/capabilities`](#post-v1capabilities)
-- [`POST /v1/capabilities/refresh`](#post-v1capabilitiesrefresh)
-- [`GET /v1/permissions`](#get-v1permissions)
-- [`GET /v1/server`](#get-v1server)
-- [Pairing](#pairing) — the six routes of the two-phase flow
+- [Errors](#errors)
+- [Health and server state](#health-and-server-state)
+- [Items and facets](#items-and-facets)
+- [Change feed and ticks](#change-feed-and-ticks)
+- [Capabilities and permissions](#capabilities-and-permissions)
+- [Pairing](#pairing)
+- [Registered installations](#registered-installations)
+- [Plugins](#plugins)
+- [MCP tools](#mcp-tools)
+- [Rust client API](#rust-client-api)
+- [Blocking and Android API](#blocking-and-android-api)
+- [Operator CLI](#operator-cli)
 - [Limits](#limits)
+
+## Conventions and authentication
+
+The core serves `/v1` on plain HTTP, default `127.0.0.1:7700`, and on HTTP/1.1
+streams inside authenticated Iroh QUIC using ALPN `bezel/0`. The routes and
+payloads are shared; transport identity affects authentication and attribution.
+The old ALPN, `bezel://pair/` scheme, `bz1` token prefix and `X-Bezel-Client`
+header are compatibility identifiers, not separate products.
+
+Use HTTPS remotely, with the core behind a **local** TLS reverse proxy; HTTP is
+supported on localhost. Registered HTTP access, enrollment and renewal require
+the core's actual TCP peer to be loopback. Forwarded headers do not satisfy this
+check. Native Iroh clients use the authenticated QUIC identity instead.
+
+| Credential | Used for | How it is sent |
+|---|---|---|
+| Operator/manual token | Routes allowed by its grants | `Authorization: Bearer bz1.…` |
+| Pairing capability | Redeem and poll one temporary pairing session | Same bearer header; the signed token names that session |
+| Registered access token | Data and administrative routes allowed by its effective grants | Same bearer header; the signed token names its installation |
+| Browser/MCP installation secret | Collect approval and renew access | `X-ErisDB-Client-Proof: SECRET`; renewal needs no bearer token |
+| Native installation private key | Collect approval, access and renew | Possession is proved by the Iroh transport; never send the private key in JSON |
+
+Only the application health route is unauthenticated. `POST /v1/clients/{id}/refresh`
+authenticates with installation proof instead of a bearer token. All other
+routes require a valid bearer token. HTTP registered access tokens are bearer
+credentials; the independent installation secret is required for collection
+and renewal, not each ordinary HTTP read/write.
+
+For every registered request, Postgres supplies the installation's current
+status and grants. Effective grants are the intersection of the token's grants
+and the registration's grants. Native access additionally requires the matching
+Iroh key. Missing, expired or revoked authority yields 401; insufficient grants
+yield 403. Legacy/manual tokens have no installation and keep their bounded
+refresh-chain semantics.
+
+Bodies use `Content-Type: application/json`. Responses are JSON except 204,
+SSE, framework rejections, and plugin-defined responses. Core responses carry
+`Cache-Control: no-store`. Do not follow redirects with credentials. CORS is
+permissive; possession of authority, not the browser origin, authorizes requests.
+Extra fields in top-level request envelopes are ignored except for
+`POST /v1/call`, which rejects them. Item bodies follow their own facet schema.
+The router also supplies HEAD for GET routes and unauthenticated CORS OPTIONS
+preflights. HEAD runs the GET handler but omits the response body, so do not use
+HEAD on `/v1/pair/status` as a side-effect-free probe: that handler can collect
+an approval. These framework methods are implicit, not additional application
+operations in the route table.
+
+`X-Bezel-Client` is an optional printable-ASCII attribution label, at most 128
+bytes. It authenticates nothing. There are no cookies, query-string tokens,
+HTTP PATCH operations, item upsert routes, bulk routes, or server-side search
+route. MCP's `search_items` performs a bounded scan using item reads.
+
+## Example setup
+
+Shell examples use Bash, curl, jq, and Python 3. Point these variables at a
+running development core. The creation examples write real data; use a facet
+whose contract matches the example body.
+
+```bash
+BASE=http://127.0.0.1:7700
+# On the operator's machine, with ERISDB_SECRET already supplied privately:
+TOKEN=$(erisdb mint --grant '*' --ttl 3600)
+
+api() {
+  local method=$1 path=$2
+  shift 2
+  curl --fail-with-body --silent --show-error \
+    --request "$method" "$BASE$path" \
+    --header "Authorization: Bearer $TOKEN" \
+    --header 'X-Bezel-Client: API examples' \
+    --header 'Content-Type: application/json' "$@"
+}
+```
+
+`TOKEN` is the acting caller's token, not the server's signing secret. App code
+should use paired, narrowly granted access. Examples below assign `ITEM_ID`,
+`ITEM_REV`, `SNAPSHOT_SEQ`, `PAIR_ID`, `PAIR_TOKEN`, `CLIENT_ID`, and `PROOF`
+from previous responses. If using a section independently, supply its variables.
+The delete example is a separate final operation; keep the item alive while
+trying update, history and revert.
 
 ## Objects
 
-### The item envelope
+### Item
 
-Everything the store holds is an item. The envelope is the core's;
-`body` is the facet's.
-
-| field | type | meaning |
-|-------|------|---------|
-| `id` | UUID v4 | Assigned by the core at create. |
-| `facet` | string | The contract this body answers to, and the permission namespace it lives in. Fixed at create; no route changes it. |
-| `body` | object | The facet's payload. Validated against the facet's schema when the facet is strict. |
-| `revision` | integer | Starts at 1, increments on every body write. The token of optimistic concurrency. |
-| `created_at` | RFC 3339 | Server clock at create. |
-| `updated_at` | RFC 3339 | Server clock at the last body write. |
-| `source` | object or null | Who wrote it last: `{addr, user, client}`. Null only on rows a migration created. |
-
-`source` has a trust gradient, strongest first: `addr` is observed from
-the connection and cannot be forged (`ip:port` over TCP,
-`iroh:<endpoint id>` over QUIC); `user` is signed into the capability;
-`client` is whatever the caller put in `X-Bezel-Client`. Any of the three
-may be null.
-
-A body is stored as `jsonb` and comes back the way Postgres holds it:
-duplicate keys collapse to the last one, and key order is not preserved.
-Neither matters to a JSON object, but it does mean the bytes you sent are
-not the bytes you get.
-
-### The change envelope
-
-| field | type | meaning |
-|-------|------|---------|
-| `seq` | integer | Monotonic, in commit order, assigned by the store. The cursor. |
-| `item_id` | UUID or null | Null only for `tick`, which is about no item. |
-| `facet` | string | The item's facet, or `system` for `tick`. What `?facet=` filters on. |
-| `op` | string | `created`, `updated`, `deleted`, `tick`, `lapsed`. |
-| `at` | RFC 3339 | Commit time. |
-| `body` | object or null | The body this change produced. Null for `deleted` and `tick`. |
-| `revision` | integer or null | The revision this change produced. Null wherever `body` is. |
-| `source` | object or null | Who caused it. |
-
-A `created`, `updated` or `lapsed` row carries the item's full body, so a
-client can apply the feed to its cache without ever refetching an item.
-See [change-feed.md](change-feed.md).
-
-## Permissions by route
-
-`{facet}` is the facet the request names, or — for the by-id routes — the
-facet of the item that id belongs to.
-
-| route | permission |
-|-------|------------|
-| `GET /v1/health` | none; no token either |
-| `GET /v1/plugins` | none beyond a valid token; results are filtered by held grants |
-| `POST /v1/call` | the selected operation's manifest permission |
-| `POST /v1/items` | `{facet}:create` |
-| `GET /v1/items` | `{facet}:read` |
-| `GET /v1/items/{id}` | `{facet}:read` |
-| `PUT /v1/items/{id}` | `{facet}:update` |
-| `DELETE /v1/items/{id}` | `{facet}:delete` |
-| `GET /v1/items/{id}/history` | `{facet}:read` |
-| `POST /v1/items/{id}/revert` | `{facet}:update` |
-| `GET /v1/changes`, `GET /v1/changes/stream` | `{facet}:read` with `?facet=`, `meta:feed:read` without |
-| `POST /v1/tick` | `meta:system:tick` |
-| `POST /v1/capabilities` | `meta:capabilities:mint`, plus enclosure |
-| `POST /v1/capabilities/refresh` | none beyond a valid token |
-| `GET /v1/permissions` | none beyond a valid token |
-| `GET /v1/server` | `meta:server:read` |
-| `POST /v1/pairings` | `meta:pairing:create` |
-| `GET /v1/clients`, `GET /v1/clients/{id}` | `meta:clients:read` |
-| `PUT /v1/clients/{id}` | `meta:clients:write`, plus enclosure |
-| `POST /v1/clients/{id}/revoke` | `meta:clients:revoke` |
-| `POST /v1/clients/{id}/refresh` | Installation proof; no bearer required |
-| `GET /v1/pairings`, `GET /v1/pairings/{id}` | `meta:pairing:read` |
-| `POST /v1/pairings/{id}/approve`, `/deny` | `meta:pairing:approve`, plus enclosure on approve |
-| `POST /v1/pair/redeem`, `GET /v1/pair/status` | `meta:pairing:redeem`, on a token naming a session |
-
-The core's own three facets do not follow the `{facet}:{action}` rule,
-because they are core operations and there is exactly one name for each:
-
-| facet | action | permission |
-|-------|--------|------------|
-| `facet` | `read` | `meta:facets:read` |
-| `facet` | `create`, `update`, `delete` | `meta:facets:write` |
-| `system` | `read` | `meta:system:read` |
-| `pair` | `read` | `meta:pairing:read` |
-| `pair` | `create` | `meta:pairing:create` |
-| `pair` | `update`, `delete` | `meta:pairing:approve` |
-
-Two consequences worth stating plainly. `meta:facets:read` lists every
-contract in the store but grants nothing over the data those contracts
-describe. And `system` and `pair` are not writable as items at all: a
-`POST`, `PUT` or `DELETE` naming either is refused with a 400 naming the
-endpoints that own them, whatever the token holds. Reading a session as an
-item is fine and reveals nothing, because a session never holds a token —
-the token is minted when the client collects it.
-
-## Errors
-
-Every error the core itself raises comes back as:
-
-```json
-{ "error": "forbidden", "detail": "capability does not grant tasks:create" }
-```
-
-`error` is a stable code — branch on it. `detail` is prose for a human and
-may change. A `forbidden` detail names the exact permission the request
-wanted, which is the fastest way to find out what to ask for.
-
-| code | status | what raises it |
-|------|--------|----------------|
-| `unauthorized` | 401 | No `Authorization` header, no `Bearer ` prefix, a token that is not three dot-separated parts, a wrong prefix (anything but `bz1`), payload or signature that is not base64url, a signature that does not verify, a payload that is not a capability, `exp` at or before now, or the chain end at or before now. Also: a refresh whose computed expiry is not in the future, and a pairing route reached with a token that holds `meta:pairing:redeem` but names no session. Every refusal is logged with the path and the peer. |
-| `forbidden` | 403 | No grant covers the permission the route requires. Also: minting or approving a capability the caller's own does not enclose, in scope *or* in time. |
-| `not_found` | 404 | No item with that id; for history, no change rows for that id; for a pairing route, no session with that id. |
-| `unknown_facet` | 422 | The write names a facet with no registration in the `facet` meta-facet. |
-| `schema_violation` | 422 | The body fails the facet's JSON Schema. `detail` carries the validator's own message. |
-| `plugin_not_found` | 404 | The named plugin is not installed, or it has no operation with that name. |
-| `plugin_schema_violation` | 422 | `input` fails the selected operation's manifest JSON Schema. |
-| `plugin_unavailable` | 503 | A required allowlisted environment variable is absent for the selected plugin. The variable name is logged, not returned. |
-| `plugin_failed` | 502 | The executable could not start, timed out before its response header, or violated the process protocol. The actual failure and bounded stderr go to the operator log. Once a valid response header has been sent, a later failure truncates/errors the response stream because its HTTP status is already committed. |
-| `revision_conflict` | 409 | The `revision` supplied is not the item's current revision. Update, revert, and delete-with-revision. |
-| `conflict` | 409 | A unique-index violation, mapped so it is not a 500 — in practice, registering a facet name that already exists, with `detail` `conflict: that value already exists`. Also the pairing state machine: `conflict: this pairing code is already approved`, `conflict: only a redeemed pairing code can be approved`. |
-| `bad_request` | 400 | A `$ref` pointing outside the document, or one whose value is not a string, in a schema being registered; a facet name that is reserved or not a single lowercase segment; a registered schema that does not compile, raised on the first write to that facet; `X-Bezel-Client` that is non-ASCII, longer than 128, or contains a control character; a grant that is not a permission, an empty grant set, more than 64 grants, a grant over 128 characters, a `user` over 128; `ttl_secs` not positive; `max_ttl_secs` over the 31536000-second ceiling; a lifetime that overflows i64 seconds; a `revert` `seq` that is not a body snapshot of this item; a `client` on redeem that is empty or over 128 characters; a pairing code that has expired. |
-| `too_many_requests` | 429 | The token bucket on `/v1/capabilities` and `/v1/capabilities/refresh` is empty. |
-| `unavailable` | 503 | 32 change streams are already open, or 32 plugin processes are already running on this replica. |
-| `internal` | 500 | A store failure or an internal one. `detail` is `the store failed; see the server log` or `internal failure; see the server log` — the real message goes to the log, because it carries constraint names, column names and query fragments. |
-
-### Rejections that are not in the envelope
-
-A request that never reaches a handler is refused by the framework's own
-extractors, and those answer in **plain text** rather than `{error,
-detail}`. A client that parses every failure as JSON breaks on these:
-
-| what | status | body |
-|------|--------|------|
-| Missing or wrong `Content-Type` on a route that takes a body | 415 | ``Expected request with `Content-Type: application/json` `` |
-| A body that is not valid JSON | 400 | `Failed to parse the request body as JSON: …` |
-| Valid JSON missing a required field, or with a wrong type | 422 | ``Failed to deserialize the JSON body into the target type: missing field `revision` …`` |
-| A query string that does not deserialize | 400 | ``Failed to deserialize query string: missing field `facet` `` |
-| A path segment that is not a UUID | 400 | ``Invalid URL: Cannot parse `id` with value `xyz` …`` |
-| A body over 2 MiB (`/v1/call`: over 16 MiB) | 413 | `Failed to buffer the request body: length limit exceeded` |
-
-The token is checked before any of these, because the capability extractor
-runs first: an unauthenticated request with a malformed body is a 401 in
-the ordinary envelope.
-
-## `GET /v1/health`
-
-No capability, no token. Liveness, not readiness: it answers from the
-process and does not touch the store.
-
-```
-GET /v1/health
-```
-
-```json
-{ "ok": true }
-```
-
-**200** always.
-
-## `GET /v1/plugins`
-
-Describe installed one-shot plugin operations this capability can invoke.
-The answer comes entirely from deployment manifests and capability grants;
-the route does not touch Postgres. Operations not covered by the caller's
-token are omitted rather than returned as unusable entries.
-
-**Permission:** none beyond a valid token.
+An item is the durable envelope around a facet-defined JSON body. Registrations
+in `clients` are separate objects, not generic items.
 
 ```json
 {
-  "plugins": [{
-    "name": "openai",
-    "description": "OpenAI API calls through a fresh process per request",
-    "operations": [{
-      "name": "chat.completions",
-      "description": "Create or stream an OpenAI Chat Completion",
-      "permission": "openai:chat",
-      "request_schema": {
-        "type": "object",
-        "required": ["model", "messages"],
-        "additionalProperties": true
-      }
+  "id": "a871b3bb-a77b-4fbd-a289-6f7d04e03c3a",
+  "facet": "notes",
+  "body": {"title": "First note", "done": false},
+  "revision": 1,
+  "created_at": "2026-09-21T12:00:00Z",
+  "updated_at": "2026-09-21T12:00:00Z",
+  "source": {"addr": "127.0.0.1:54321", "user": null, "client": "API examples", "installation": null}
+}
+```
+
+| Field | Type and meaning |
+|---|---|
+| `id` | Server-assigned UUID v4; immutable |
+| `facet` | Registered namespace; immutable through item updates |
+| `body` | JSON value checked against the facet's schema when strict; commonly an object, but the API itself accepts any JSON value |
+| `revision` | Signed 64-bit integer, initially 1; increments on body updates |
+| `created_at`, `updated_at` | RFC 3339 timestamps |
+| `source` | JSON attribution or null for some migration-created rows |
+
+Normal request attribution has `addr` (observed TCP peer or `iroh:ENDPOINT_ID`),
+`user` (signed token label), `client` (self-declared header), and `installation`
+(authenticated registration UUID). Individual values may be null. Migration
+attribution can instead be an object such as `{"migration":"…"}`. Do not
+assume every source has exactly the normal request fields.
+
+Postgres stores bodies as JSONB: key ordering is not preserved and duplicate
+object keys collapse. Timestamps and revisions are server-owned.
+
+### Change and history row
+
+```json
+{
+  "seq": 42,
+  "item_id": "a871b3bb-a77b-4fbd-a289-6f7d04e03c3a",
+  "facet": "notes",
+  "op": "created",
+  "at": "2026-09-21T12:00:00Z",
+  "body": {"title": "First note", "done": false},
+  "revision": 1,
+  "source": {"addr": "127.0.0.1:54321", "user": null, "client": "API examples", "installation": null}
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `seq` | Monotonically increasing committed-feed cursor; gaps are allowed |
+| `item_id` | Item UUID, or null for ticks and installation audit events |
+| `facet` | Item namespace, or `system` for ticks/installation events |
+| `op` | `created`, `updated`, `deleted`, `tick`, or `lapsed` |
+| `at` | Database transaction timestamp, not a substitute for `seq` ordering |
+| `body` | Snapshot after this change; null for deletes/ticks and some legacy migration rows |
+| `revision` | Snapshot revision, or null when no snapshot exists |
+| `source` | Attribution as above |
+
+History rows contain `seq`, `op`, `at`, `body`, `revision`, and `source`; their
+item ID/facet are implicit in the history request. Installation audit events use
+`facet: "system"`, `item_id: null`, and body `{"event":"client","client":…}`.
+Treat them as registry events, not item updates. Deletion leaves prior snapshots
+in history; it does not erase audit records.
+
+### Pairing session and installation
+
+The pairing endpoints return a compact session envelope:
+`{id, revision, created_at, body}`. The body's fields depend on its state;
+[Pairing](#pairing) describes them. Generic item reads of the `pair` facet return
+the full item envelope instead.
+
+Installation objects have their own complete schema under
+[Registered installations](#registered-installations).
+
+## Permissions by route
+
+A grant is a colon-separated pattern, for example `notes:read`, `notes:*`,
+`*:read`, or `*`. Up to 64 nonempty grants are accepted, each at most 128 bytes.
+Segments are `*` or lowercase `[a-z0-9][a-z0-9._-]*`. The `meta` namespace is
+closed: `*:read` covers user facets, not `meta:clients:read` or other administration.
+See [permission matching](permissions.md) for enclosure and wildcard rules.
+
+| Method | Route | Required authority |
+|---|---|---|
+| GET | `/v1/health` | None |
+| GET | `/v1/server` | `meta:server:read` |
+| GET | `/v1/permissions` | Valid token |
+| POST | `/v1/items` | `{facet}:create` |
+| GET | `/v1/items` | `{facet}:read` |
+| GET | `/v1/items/{id}` | `{facet}:read` |
+| PUT | `/v1/items/{id}` | `{facet}:update` |
+| DELETE | `/v1/items/{id}` | `{facet}:delete` |
+| GET | `/v1/items/{id}/history` | `{facet}:read` |
+| POST | `/v1/items/{id}/revert` | `{facet}:update` |
+| GET | `/v1/changes` | `{facet}:read` when filtered; otherwise `meta:feed:read` |
+| GET | `/v1/changes/stream` | Same feed authority |
+| POST | `/v1/tick` | `meta:system:tick` |
+| POST | `/v1/capabilities` | `meta:capabilities:mint`, plus grant/lifetime enclosure |
+| POST | `/v1/capabilities/refresh` | Valid token |
+| POST | `/v1/pairings` | `meta:pairing:create` |
+| GET | `/v1/pairings` | `meta:pairing:read` |
+| GET | `/v1/pairings/{id}` | `meta:pairing:read` |
+| POST | `/v1/pairings/{id}/approve` | `meta:pairing:approve`, plus requested/acting grant enclosure |
+| POST | `/v1/pairings/{id}/deny` | `meta:pairing:approve` |
+| POST | `/v1/pair/redeem` | Pairing capability naming one session |
+| GET | `/v1/pair/status` | Pairing capability and redeemer's installation proof after redemption |
+| GET | `/v1/clients` | `meta:clients:read` |
+| GET | `/v1/clients/{id}` | `meta:clients:read` |
+| PUT | `/v1/clients/{id}` | `meta:clients:write`, plus requested/acting grant enclosure |
+| POST | `/v1/clients/{id}/revoke` | `meta:clients:revoke` |
+| POST | `/v1/clients/{id}/refresh` | Installation proof; no bearer needed |
+| GET | `/v1/plugins` | Valid token; filters operations by effective grants |
+| POST | `/v1/call` | The selected operation's concrete permission |
+
+For the core's facets, `facet` reads require `meta:facets:read` and its writes
+require `meta:facets:write`; `pair` reads require `meta:pairing:read`; `system`
+reads require `meta:system:read`. Generic writes/reverts to `pair` and `system`
+are refused: use their dedicated routes. A client registry UUID is not an item ID.
+
+## Errors
+
+Core-handler errors use the HTTP status plus this JSON envelope:
+
+```json
+{"error":"forbidden","detail":"capability does not grant notes:create"}
+```
+
+Branch on the status and `error`; `detail` is human-readable and may change.
+
+| HTTP | `error` | Cause |
+|---|---|---|
+| 400 | `bad_request` | Invalid grants, unsupported lifetime, invalid challenge/client label, expired pairing, forbidden schema reference, or invalid snapshot |
+| 401 | `unauthorized` | Missing/invalid/expired token, wrong installation proof/transport, revoked/expired/missing registration, or pairing token without a session |
+| 403 | `forbidden` | Missing permission or grants/lifetime outside the caller's authority |
+| 404 | `not_found` | Missing item, history, pairing, or administratively requested installation |
+| 404 | `plugin_not_found` | Unknown plugin or operation |
+| 409 | `revision_conflict` | Stale item/installation revision or stale pairing approval anchor |
+| 409 | `conflict` | Duplicate facet name or invalid pairing-state transition |
+| 422 | `unknown_facet` | Write to an unregistered facet |
+| 422 | `schema_violation` | Item body violates the facet contract |
+| 422 | `plugin_schema_violation` | Plugin input violates its manifest schema |
+| 429 | `too_many_requests` | Shared mint/refresh/installation-renewal bucket exhausted |
+| 503 | `unavailable` | Change-stream or plugin-process capacity reached |
+| 503 | `plugin_unavailable` | Required allowlisted plugin environment variable is absent |
+| 502 | `plugin_failed` | Plugin startup, header protocol, or timeout failure before headers are committed |
+| 500 | `internal` | Database/internal failure; details remain in operator logs |
+
+Framework rejections can be plain text: malformed JSON (400), wrong/missing JSON
+content type (415), missing/wrongly typed JSON fields (422), invalid UUID/query
+(400), oversized body (413), unknown route (404), or unsupported method (405).
+Token extraction normally precedes handler body validation; installation renewal
+is the exception because it has no bearer extractor. Plugin responses can have
+their own body and status, including non-JSON errors.
+
+There is no general idempotency-key API. Retry reads as appropriate; do not
+blindly retry a write after a transport failure with an unknown outcome. An
+explicit core authorization 401 occurs before the mutation: a registered client
+may renew once and retry. Pairing collection is specially repeatable with the
+same proof while its ticket is live. Revocation is idempotent.
+
+## Health and server state
+
+### `GET /v1/health`
+
+No authentication or parameters. **200** `{"ok":true}`. This is process
+liveness, not a database connectivity probe.
+
+```bash
+curl --fail-with-body --silent --show-error "$BASE/v1/health"
+```
+
+### `GET /v1/server`
+
+Requires `meta:server:read`. No parameters. **200**:
+
+```json
+{
+  "version":"0.1.0","feed_head":42,"facets":4,"items":8,"changes":42,
+  "limits":{"streams":32,"streams_free":32,"iroh_connections":64,"client_name":128}
+}
+```
+
+```bash
+api GET /v1/server
+```
+
+Counts include core items/history. `feed_head` is zero for an empty feed and is
+not necessarily equal to `changes` (the row count). `streams_free` is per replica.
+
+## Items and facets
+
+### `POST /v1/items`
+
+Body: required `facet: string` and `body: JSON`. Requires create authority on that
+facet. **201** returns an [Item](#item). There is no client-chosen ID or upsert.
+
+Register a namespace through the same route, with `meta:facets:write`:
+
+```bash
+api POST /v1/items --data '{
+  "facet":"facet",
+  "body":{"name":"notes","version":1,"strict":true,
+    "schema":{"type":"object","required":["title"],
+      "properties":{"title":{"type":"string"},"done":{"type":"boolean"}},
+      "additionalProperties":false}}
+}'
+```
+
+A facet name is one lowercase permission segment, not `notes/v1` or `*`.
+The built-in meta-facet accepts these registration body fields and rejects others:
+
+| Field | Required / default | Meaning |
+|---|---|---|
+| `name` | Required | Unique namespace; reserved core names cannot be registered by an app |
+| `schema` | Required object | JSON Schema for item bodies; `{}` accepts any JSON value |
+| `strict` | Default true | Enforce the schema on writes |
+| `version` | Optional integer ≥ 1 | Contract metadata; does not change the namespace or migrate existing items |
+| `permissions` | Optional object | Action → human-readable description, for example `{"create":"Add notes"}` |
+| `lapse` | Optional object | Required `due` field name, optional `done` field name; the tick sweep uses them |
+
+Local `$ref` values are supported; external references are refused. Changing a
+schema affects subsequent writes, not a retroactive rewrite of existing items.
+See [facet contracts](facets.md) for schema and lapse examples.
+If `notes` already exists, read its contract instead of registering it twice (409).
+
+```bash
+ITEM_JSON=$(api POST /v1/items --data \
+  '{"facet":"notes","body":{"title":"First note","done":false}}')
+ITEM_ID=$(jq -r '.id' <<<"$ITEM_JSON")
+ITEM_REV=$(jq -r '.revision' <<<"$ITEM_JSON")
+printf '%s\n' "$ITEM_JSON"
+```
+
+Missing registration yields 422 `unknown_facet`; schema mismatch yields 422
+`schema_violation`. Creating `pair` or `system` through this route is refused.
+
+### `GET /v1/items`
+
+Requires read authority for the named facet. **200** `{"items":[ITEM,…]}`.
+
+| Query | Required | Default / behavior |
+|---|---|---|
+| `facet` | Yes | Exactly one namespace |
+| `updated_since` | No | RFC 3339; `updated_at` strictly greater than this timestamp |
+| `limit` | No | Integer, default 100, clamped to 1–1000 |
+
+```bash
+api GET '/v1/items?facet=notes&limit=100'
+api GET '/v1/items?facet=facet&limit=1000'
+```
+
+Rows are ordered by `(updated_at, id)`, ascending. An empty or unknown facet
+returns an empty list if authorized. There is no offset or item-list cursor.
+A timestamp-only continuation can miss ties; use the sequence-based change feed
+for complete synchronization of large facets. URL-encode query values; in
+particular encode `+` in timezone offsets or use `Z` timestamps.
+
+### `GET /v1/items/{id}`
+
+Requires read authority on the item's facet. **200** Item; **404** if missing;
+**403** if the item exists but the caller lacks its facet permission.
+
+```bash
+api GET "/v1/items/$ITEM_ID"
+```
+
+### `PUT /v1/items/{id}`
+
+Requires update authority. Body: required `body: JSON`, `revision: integer`.
+This replaces the **whole body**; omitted fields disappear. **200** returns the
+updated Item with an incremented revision. A stale revision yields **409**.
+
+```bash
+ITEM_JSON=$(api PUT "/v1/items/$ITEM_ID" --data \
+  "$(jq -nc --argjson revision "$ITEM_REV" \
+    '{revision:$revision,body:{title:"Edited note",done:false}}')")
+ITEM_REV=$(jq -r '.revision' <<<"$ITEM_JSON")
+```
+
+The facet stays fixed. Read first, preserve the fields you intend to keep, and
+handle 409 by reading the current value and resolving the concurrent edit.
+
+### `DELETE /v1/items/{id}`
+
+Requires delete authority. Optional integer query `revision` makes deletion
+conditional. **204** has no body. Missing item yields **404**; a supplied stale
+revision yields **409**. Without `revision`, the current item is deleted.
+
+```bash
+# Run after the history/revert examples if trying the full item lifecycle.
+api DELETE "/v1/items/$ITEM_ID?revision=$ITEM_REV"
+```
+
+Prior bodies remain in history. Generic deletion cannot remove pairing or
+system records, and it does not revoke an installation.
+
+### `GET /v1/items/{id}/history`
+
+Requires read authority on the original facet. No query parameters or pagination.
+**200** `{"history":[HISTORY_ROW,…]}`, ordered by `seq`, oldest first. Works after
+deletion; **404** means no history exists for that ID.
+
+```bash
+HISTORY_JSON=$(api GET "/v1/items/$ITEM_ID/history")
+SNAPSHOT_SEQ=$(jq -r '.history | map(select(.body != null)) | first | .seq' <<<"$HISTORY_JSON")
+printf '%s\n' "$HISTORY_JSON"
+```
+
+### `POST /v1/items/{id}/revert`
+
+Requires update authority. Body: required `seq: integer`, `revision: integer`.
+Writes the chosen historical body as a new revision; history never rewinds.
+**200** Item. The item must still exist (404 otherwise). A sequence belonging
+to another item or a null snapshot is **400**; stale revision is **409**. The
+snapshot must satisfy the facet's **current** schema (422 otherwise).
+
+```bash
+ITEM_JSON=$(api POST "/v1/items/$ITEM_ID/revert" --data \
+  "$(jq -nc --argjson seq "$SNAPSHOT_SEQ" --argjson revision "$ITEM_REV" \
+    '{seq:$seq,revision:$revision}')")
+ITEM_REV=$(jq -r '.revision' <<<"$ITEM_JSON")
+```
+
+## Change feed and ticks
+
+### `GET /v1/changes`
+
+With `facet`, requires read authority on that facet; without it requires
+`meta:feed:read`. **200** `{"changes":[CHANGE,…],"next":42}`.
+
+| Query | Default / behavior |
+|---|---|
+| `since` | Integer, default 0; only `seq > since` |
+| `facet` | Optional single namespace; absent means global feed |
+| `limit` | Integer, default 500, clamped to 1–5000 |
+
+```bash
+PAGE=$(api GET '/v1/changes?facet=notes&since=0&limit=500')
+CURSOR=$(jq -r '.next' <<<"$PAGE")
+api GET "/v1/changes?facet=notes&since=$CURSOR&limit=500"
+```
+
+`next` is the last returned sequence, or the supplied `since` when empty. Apply
+rows in sequence order and persist the last processed cursor. Filtered feeds
+have gaps because other facets share the sequence. Item deletion is a tombstone;
+`lapsed` carries a snapshot without changing the item's revision.
+
+### `GET /v1/changes/stream`
+
+Same authorization and `since`/`facet` semantics. The query parser accepts
+`limit`, but streaming ignores it and drains internal batches of 500.
+**200** `Content-Type: text/event-stream`:
+
+```text
+event: change
+data: {"seq":42,"item_id":"a871b3bb-a77b-4fbd-a289-6f7d04e03c3a","facet":"notes","op":"created","at":"2026-09-21T12:00:00Z","body":{"title":"First note","done":false},"revision":1,"source":null}
+
+```
+
+```bash
+api GET '/v1/changes/stream?facet=notes&since=0' --no-buffer
+```
+
+The stream catches up, then waits for new changes. Keepalive comments can appear.
+It sends no SSE `id` or `retry` field and does not consume `Last-Event-ID`; reconnect
+with the last processed `seq` in `since`. Browser clients need a streaming fetch
+that can set the bearer header (native EventSource cannot set it).
+
+Expiry, loss of feed permission, revocation, or backend failure closes the stream;
+an already-started response cannot become a new HTTP error. Registered authority
+is rechecked before each event, and registry notifications wake idle streams across
+replicas. Reconnect after renewal if still authorized. Capacity exhaustion before
+stream creation yields **503**. Already delivered events are not retracted.
+
+### `POST /v1/tick`
+
+Requires `meta:system:tick`. Takes no body. **200** `{"seq":43,"lapsed":0}`.
+
+```bash
+api POST /v1/tick
+```
+
+`seq` identifies the tick row, not necessarily the final feed head. In one
+transaction the core appends a system tick and emits `lapsed` changes for overdue,
+unfinished items in facets declaring lapse rules. An item lapses at most once
+per edit. Ticks do not themselves rewrite item bodies.
+
+## Capabilities and permissions
+
+### `POST /v1/capabilities`
+
+Requires `meta:capabilities:mint`. Issues a token enclosed by the caller's
+**effective** grants and token lifetime. **201** `{"token":"bz1.…"}`.
+
+| JSON field | Required | Behavior |
+|---|---|---|
+| `grants` | Yes | 1–64 valid permission patterns; cannot exceed the caller |
+| `ttl_secs` | Yes | Positive integer access lifetime |
+| `max_ttl_secs` | No | Refresh-chain lifetime; defaults to 2592000 seconds (30 days), raised to at least `ttl_secs`; resulting chain cannot exceed 31536000 seconds |
+| `user` | No | Signed attribution label, at most 128 bytes; does not add permissions |
+
+```bash
+CHILD_JSON=$(api POST /v1/capabilities --data \
+  '{"grants":["notes:read"],"ttl_secs":300,"user":"report-reader"}')
+CHILD_TOKEN=$(jq -r '.token' <<<"$CHILD_JSON")
+```
+
+An omitted chain is bounded to the parent's remaining authority; an explicitly
+requested chain outside it is refused. Invalid input yields 400, failed enclosure
+403, and rate limiting 429. The bearer token is authenticated before the rate
+check; the mint permission is checked after it.
+
+Delegation from a registered token retains its installation ID, so current grants,
+identity binding and revocation still apply to the child. A child token alone
+cannot obtain the installation's independent renewal authority.
+
+Token format is `bz1.BASE64URL(JSON).BASE64URL(HMAC_SHA256)`, without base64
+padding. The signed payload contains `grants` and optional `exp`, `max_exp`,
+`user`, `pair` (pairing session), and `client` (installation UUID). Unix deadlines
+are seconds. Payloads are signed, not encrypted; decoding is not verification.
+See [capability semantics](capabilities.md) for the exact signing contract.
+
+### `POST /v1/capabilities/refresh`
+
+Requires a still-valid bearer token, no extra grant. Body: required positive
+integer `ttl_secs`. **201**:
+
+```json
+{"token":"bz1.…","exp":1790000300,"chain_ends":1790003600}
+```
+
+```bash
+curl --fail-with-body --silent --show-error \
+  --request POST "$BASE/v1/capabilities/refresh" \
+  --header "Authorization: Bearer $CHILD_TOKEN" \
+  --header 'Content-Type: application/json' --data '{"ttl_secs":300}'
+```
+
+This is **bounded token refresh**, not independent installation renewal. The new
+expiry is clamped to the existing chain end; without `max_exp`, the old token's
+expiry is the ceiling. Effective grants, signed user and installation binding
+carry forward. An expired token is 401. Refreshing a non-expiring manual token
+produces a bounded token, not another non-expiring one. The endpoint shares the
+mint/renewal rate limit.
+
+Paired clients that have an installation proof should use
+[`POST /v1/clients/{id}/refresh`](#post-v1clientsidrefresh), including after expiry.
+
+### `GET /v1/permissions`
+
+Requires a valid token, no additional grant. No parameters. **200**:
+
+```json
+{
+  "grants":["notes:read","notes:create"],
+  "exp":1790000300,"max_exp":null,"user":null,
+  "client_id":"ad6caf6b-ece2-442a-a178-a93cc5aa0802"
+}
+```
+
+```bash
+api GET /v1/permissions
+```
+
+`exp`, `max_exp`, `user`, and `client_id` can be null. For registered callers,
+`grants` reflects live registry reductions and may be narrower than the signed
+token's payload. Use this result to render available actions. A revoked client
+gets 401 rather than a successful empty grant list.
+
+## Pairing
+
+A **ticket** locates a core and carries short-lived permission to request
+pairing. A **pairing session** records the request and human decision. An
+**installation** is the durable identity created or updated on collection.
+An **access token** temporarily authorizes use of that installation.
+
+```mermaid
+stateDiagram-v2
+    [*] --> pending: create
+    pending --> requested: redeem with identity
+    requested --> approved: human approves requested scope
+    approved --> collected: same identity collects
+    pending --> denied: deny
+    requested --> denied: deny
+    approved --> denied: cancel before collection
+```
+
+The session's `expires` deadline applies to redemption, approval and collection.
+It does not expire the installation subsequently created. A collected session
+remains readable for audit; denial after collection is refused. Repeating
+collection with the same proof is permitted while the ticket remains live.
+
+### Ticket format
+
+QR, deep links and pasted tickets contain exactly the same URI:
+
+```text
+bezel://pair/BASE64URL_WITHOUT_PADDING(JSON)
+```
+
+| JSON field | Required | Meaning |
+|---|---|---|
+| `v` | Yes | Integer `1`; other versions are refused |
+| `token` | Yes | Pairing capability returned as `secret` by session creation |
+| `eid` | At least one of `eid`/`url` | 64-character hexadecimal Iroh endpoint ID |
+| `url` | At least one of `eid`/`url` | HTTP client base URL; HTTPS remotely, HTTP localhost |
+| `name` | No | Untrusted display label for the core |
+
+Native clients need `eid`; browser/MCP HTTP clients need `url` (MCP also permits
+an explicit URL override). There is no mDNS or short-code broker API. The operator
+CLI creates both the URI and terminal QR, optionally a PNG:
+
+```bash
+erisdb pair --name my-core --client-url https://db.example.com \
+  --qr-output /tmp/erisdb-pair.png
+```
+
+### `POST /v1/pairings`
+
+Requires `meta:pairing:create`. Optional JSON body with integer `ttl_secs`;
+default 600 seconds, clamped to 60–3600. **201**:
+
+```json
+{"id":"ad6caf6b-ece2-442a-a178-a93cc5aa0802","secret":"bz1.…","expires":1790000600}
+```
+
+```bash
+PAIR_JSON=$(api POST /v1/pairings --data '{"ttl_secs":600}')
+PAIR_ID=$(jq -r '.id' <<<"$PAIR_JSON")
+PAIR_TOKEN=$(jq -r '.secret' <<<"$PAIR_JSON")
+```
+
+`secret` is returned at creation and is not stored in the pairing record. It
+names this one session and grants only `meta:pairing:redeem`; it cannot read or
+write application data. An ordinary `*` token without a signed session claim
+cannot replace it on the client pairing routes.
+
+### `POST /v1/pair/redeem`
+
+Send the pairing capability as bearer. Required JSON: `client: string`,
+`requested: string[]`; HTTP also requires `challenge: string`.
+
+| Field | Constraint |
+|---|---|
+| `client` | Nonblank, at most 128 bytes, no control characters; an untrusted display name |
+| `requested` | 1–64 valid grants; asking adds no authority |
+| `challenge` | HTTP: canonical unpadded base64url of a 32-byte SHA-256 digest; native Iroh derives identity from its authenticated peer and does not need this field |
+
+Generate a fresh **installation** secret on the client, once, and preserve it.
+The challenge is `base64url(SHA256(ASCII(secret)))`, where `secret` is the
+unpadded base64url encoding of 32 random bytes. Reuse that installation secret
+when re-pairing the same installation with the same core.
+
+```bash
+PROOF=$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')
+CHALLENGE=$(printf '%s' "$PROOF" | python3 -c \
+  'import sys,hashlib,base64; print(base64.urlsafe_b64encode(hashlib.sha256(sys.stdin.buffer.read()).digest()).decode().rstrip("="))')
+REDEEMED=$(curl --fail-with-body --silent --show-error \
+  --request POST "$BASE/v1/pair/redeem" \
+  --header "Authorization: Bearer $PAIR_TOKEN" \
+  --header 'Content-Type: application/json' \
+  --data "$(jq -nc --arg challenge "$CHALLENGE" \
+    '{client:"Notes browser",requested:["notes:read","notes:create"],challenge:$challenge}')")
+jq '{id,fingerprint:.body.fingerprint,requested:.body.requested}' <<<"$REDEEMED"
+```
+
+The operator token is not used in this client-side request. **200** returns the
+compact session, now `requested`, including the bound identity and fingerprint:
+
+```json
+{
+  "id":"ad6caf6b-ece2-442a-a178-a93cc5aa0802","revision":2,
+  "created_at":"2026-09-21T12:00:00Z",
+  "body":{
+    "status":"requested","expires":1790000600,"client":"Notes browser",
+    "requested":["notes:read","notes:create"],
+    "identity":{"kind":"browser","key":"<S256 commitment>"},
+    "fingerprint":"12AB-34CD-56EF"
+  }
+}
+```
+
+Compare the fingerprint shown by the client with the operator's session before
+approving. It binds the session, installation identity and requested grants.
+The display name alone is not verification. **409** means the session was
+already redeemed or otherwise changed; **400** covers invalid input/session
+expiry, while an expired pairing bearer can be rejected earlier with **401**.
+
+### `GET /v1/pairings`
+
+Requires `meta:pairing:read`. No parameters. **200** `{"pairings":[SESSION,…]}`,
+newest first, at most 100 records. Includes completed, denied and expired records;
+expiry is represented by the deadline, not a separate `expired` state.
+
+```bash
+api GET /v1/pairings
+```
+
+### `GET /v1/pairings/{id}`
+
+Requires `meta:pairing:read`. **200** compact session; **404** if absent or not a
+`pair` item. The body contains no issued access token or raw installation secret.
+
+```bash
+api GET "/v1/pairings/$PAIR_ID"
+```
+
+State-dependent body fields are `status`, `expires`, `client`, `requested`,
+`identity`, `fingerprint`, and, after approval, `granted`, `access_ttl_secs`,
+`approval_anchor`, `exp`, optional `max_exp` and `user`. After collection,
+`client_id` identifies the actual registration; on re-pairing it may differ
+from the session ID. `approval_anchor` is null or `{id,revision}` and prevents
+stale approvals overwriting later registry changes.
+
+### `POST /v1/pairings/{id}/approve`
+
+Requires `meta:pairing:approve`. The operator compares fingerprints and chooses
+the requested permissions or a subset. Body is optional; `{}` approves all
+requested grants with the defaults below.
+
+| JSON field | Default | Constraint |
+|---|---|---|
+| `granted` | Session's `requested` | Nonempty valid grants enclosed by both the request and the acting operator's effective grants |
+| `ttl_secs` | 604800 (7 days) | Access lifetime, integer 1–604800 |
+| `max_ttl_secs` | No installation deadline | Optional installation lifetime, integer 1–31536000 |
+| `user` | No signed user label | At most 128 bytes; attribution only |
+
+```bash
+# Operator side: only after comparing the client's fingerprint.
+APPROVED=$(api POST "/v1/pairings/$PAIR_ID/approve" --data \
+  '{"granted":["notes:read","notes:create"],"ttl_secs":3600}')
+jq '.body | {status,granted,access_ttl_secs,fingerprint}' <<<"$APPROVED"
+```
+
+**200** compact session with `status: "approved"`. The operator receives no
+access token. Approval creates durable authority independent of the operator's
+own login-token expiry; it is not bounded delegation. `max_ttl_secs`, when set,
+runs from approval time. Access is issued at collection with its own expiry,
+bounded by that optional installation deadline.
+
+**403** for grants outside the request/operator; **409** unless the session is
+`requested` or if another write changed its revision; **400** for invalid fields
+or an expired session. There is no grant-everything override.
+
+### `GET /v1/pair/status`
+
+Client side: requires the session's bearer capability. After redemption, also
+requires the bound Iroh peer or `X-ErisDB-Client-Proof`. Polling while `pending`
+returns **200** `{"status":"pending"}` without an established identity proof.
+Once requested: **200** `{"status":"requested","fingerprint":"12AB-34CD-56EF"}`.
+A denied redeemed session returns `status: "denied"` and its fingerprint.
+
+```bash
+COLLECTED=$(curl --fail-with-body --silent --show-error \
+  "$BASE/v1/pair/status" \
+  --header "Authorization: Bearer $PAIR_TOKEN" \
+  --header "X-ErisDB-Client-Proof: $PROOF")
+printf '%s\n' "$COLLECTED"
+```
+
+After approval, **200**:
+
+```json
+{
+  "status":"approved","granted":["notes:read","notes:create"],
+  "token":"bz1.…","client_id":"ad6caf6b-ece2-442a-a178-a93cc5aa0802",
+  "exp":1790003600,"fingerprint":"12AB-34CD-56EF"
+}
+```
+
+```bash
+CLIENT_ID=$(jq -r '.client_id' <<<"$COLLECTED")
+ACCESS_TOKEN=$(jq -r '.token' <<<"$COLLECTED")
+```
+
+Despite being GET, this endpoint **collects approval and writes registration
+state**. Do not prefetch/cache it. Collection is one transaction; the stored
+session becomes `collected`, while the successful client-facing result remains
+`approved`. The same proof can collect again until ticket expiry if a response
+was lost; no token is persisted in the session/history.
+
+A photographed QR without the redeemer's proof cannot collect (401). Changed
+registration state since approval causes 409 `revision_conflict`; obtain a fresh
+approval. A revoked/expired registration cannot collect again. If a pending
+session was denied before any identity was recorded, polling is unauthorized
+rather than returning an identity-bound denial.
+
+If initial submission failed, poll first: only `pending` confirms that the
+client may submit again. Do not blindly replay redemption after an ambiguous
+transport failure.
+
+### `POST /v1/pairings/{id}/deny`
+
+Requires `meta:pairing:approve`. No body. **200** compact session with
+`status: "denied"`, with granted permissions and approval deadlines removed.
+Pending, requested and approved-but-uncollected sessions can be denied, including
+after session expiry. Already denied sessions can be denied again.
+
+```bash
+# Alternative to approving a separate, still-uncollected request:
+api POST "/v1/pairings/$PAIR_ID/deny"
+```
+
+A collected session yields **409**; revoke its installation instead. Denying
+never revokes a credential already issued through collection.
+
+## Registered installations
+
+The registry is separate from items and is shared by all replicas. One active
+registration exists per installation proof. Re-pairing that proof updates its
+existing registration/permissions. Revoked registrations remain revoked; fresh
+human approval creates a new UUID so older tokens stay invalid.
+
+### Installation object
+
+```json
+{
+  "id":"ad6caf6b-ece2-442a-a178-a93cc5aa0802",
+  "name":"Notes browser",
+  "identity":{"kind":"browser","key":"<S256 commitment>"},
+  "requested":["notes:read","notes:create"],
+  "grants":["notes:read","notes:create"],
+  "user_name":null,"access_ttl_secs":3600,"expires":null,
+  "revoked_at":null,"revision":1,"created_at":"2026-09-21T12:00:00Z"
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `id` | Registration UUID; not necessarily the latest pairing session UUID |
+| `name` | App's untrusted display name |
+| `identity` | `{kind:"iroh",key:ENDPOINT_ID}` or `{kind:"browser",key:S256_COMMITMENT}`; HTTP MCP uses `browser` too |
+| `requested` | Grant ceiling from the latest successful enrollment |
+| `grants` | Current approved grant set |
+| `user_name` | Optional signed attribution label used in newly issued tokens |
+| `access_ttl_secs` | Default and maximum lifetime of each renewed access token |
+| `expires` | Optional absolute installation deadline, Unix seconds; null means renewal until revoked |
+| `revoked_at` | RFC 3339 timestamp or null; revocation is irreversible |
+| `revision` | Optimistic concurrency version, initially 1 |
+| `created_at` | RFC 3339 creation time |
+
+### `GET /v1/clients`
+
+Requires `meta:clients:read`. No query parameters. **200** `{"clients":[INSTALLATION,…]}`.
+Returns all registrations, including revoked/expired ones, ordered by creation
+time then ID. There is currently no filter or pagination.
+
+```bash
+api GET /v1/clients
+```
+
+### `GET /v1/clients/{id}`
+
+Requires `meta:clients:read`. **200** Installation; **404** if absent.
+
+```bash
+CLIENT_JSON=$(api GET "/v1/clients/$CLIENT_ID")
+CLIENT_REV=$(jq -r '.revision' <<<"$CLIENT_JSON")
+```
+
+### `PUT /v1/clients/{id}`
+
+Requires `meta:clients:write`. Body: required `grants: string[]` and
+`revision: integer`. Replaces the grant set; this route does not change the
+name, identity, requested ceiling, user label or lifetime. **200** Installation
+with its revision incremented.
+
+```bash
+CLIENT_JSON=$(api PUT "/v1/clients/$CLIENT_ID" --data \
+  "$(jq -nc --argjson revision "$CLIENT_REV" \
+    '{revision:$revision,grants:["notes:read"]}')")
+CLIENT_REV=$(jq -r '.revision' <<<"$CLIENT_JSON")
+```
+
+Grants must fit both `requested` and the acting administrator's effective grants
+(403 otherwise). Empty grants are invalid (400); use revocation to remove all
+access. Missing registration gives 404, inactive registration 401, stale revision
+409. Decreases affect existing tokens on their next authorization check;
+increases require a newly issued token before an older narrower token can use
+them. Registry writes append system audit events and notify subscribers.
+
+### `POST /v1/clients/{id}/refresh`
+
+Uses installation proof, **not a bearer token**. Required JSON body `{}` or
+`{"ttl_secs":300}`. The optional lifetime must be 1 through the registration's
+`access_ttl_secs`; it defaults to that maximum. The token expiry is also bounded
+by any installation deadline.
+
+```bash
+RENEWED=$(curl --fail-with-body --silent --show-error \
+  --request POST "$BASE/v1/clients/$CLIENT_ID/refresh" \
+  --header "X-ErisDB-Client-Proof: $PROOF" \
+  --header 'Content-Type: application/json' --data '{}')
+ACCESS_TOKEN=$(jq -r '.token' <<<"$RENEWED")
+```
+
+Native clients make the same request over their persistent Iroh identity and
+omit the HTTP proof header. **200**:
+
+```json
+{"token":"bz1.…","exp":1790003600,"grants":["notes:read"],"client_id":"ad6caf6b-ece2-442a-a178-a93cc5aa0802"}
+```
+
+Works after the previous access token expires and after signing-key rotation,
+provided the core address is reachable and the installation remains active.
+Missing, revoked or expired registrations and wrong proof all give **401**;
+invalid lifetime gives **400**; rate exhaustion gives **429**. A valid old bearer
+token without proof is insufficient. Store the new token for subsequent calls.
+
+### `POST /v1/clients/{id}/revoke`
+
+Requires `meta:clients:revoke`. No body or revision parameter. **200** Installation
+with `revoked_at` populated and revision incremented. Repeated revocation returns
+the same revoked record without another increment. Missing ID gives **404**.
+
+```bash
+api POST "/v1/clients/$CLIENT_ID/revoke"
+```
+
+Blocks subsequent access and renewal on every replica, including delegated
+tokens. Idle subscriptions wake and close; each event rechecks authority. It
+does not undo already delivered data, already-authorized transactions, or plugin
+calls already launched. The API has no un-revoke or registry-delete route.
+
+## Plugins
+
+### `GET /v1/plugins`
+
+Requires a valid token, no additional grant. **200** `{"plugins":[…]}`. Each
+plugin has `name`, `description`, and an `operations` array. Each operation has
+`name`, `description`, `permission`, and `request_schema` (JSON Schema).
+Only operations the caller's effective grants allow are visible; plugins with
+no visible operations are omitted. No configured plugins means an empty array.
+
+```bash
+api GET /v1/plugins
+```
+
+Example with the shipped OpenAI plugin installed and `openai:chat` granted:
+
+```json
+{
+  "plugins":[{
+    "name":"openai","description":"OpenAI API calls through a fresh process per request",
+    "operations":[{
+      "name":"chat.completions","description":"Create or stream an OpenAI Chat Completion",
+      "permission":"openai:chat",
+      "request_schema":{"type":"object","required":["model","messages"]}
     }]
   }]
 }
 ```
 
-**200** with `plugins`, possibly empty.
+Descriptions and schemas are deployment-defined; this example abbreviates the
+schema. Discovery does not expose executable paths or secret environment values.
 
-## `POST /v1/call`
+### `POST /v1/call`
 
-Validate and invoke one plugin operation. This is a direct exchange, not a
-durable job: it starts one fresh executable, writes one invocation to stdin,
-streams stdout into this response, and exits. It never reads or writes
-Postgres and the core never retries it.
+Body: required `plugin: string`, `operation: string`, and `input: JSON`.
+Unknown envelope fields are refused (422). The selected manifest determines
+permission and input schema. The core authorizes, validates, starts one process,
+and streams its response. It creates no item, history row, job or conversation.
 
-**Permission:** the operation's manifest permission; `openai:chat` for the
-shipped operation.
+```bash
+# Requires the shipped plugin to be installed/configured and a provider model
+# name supplied in MODEL. This invokes the external provider.
+MODEL='<provider-model-name>'
+api POST /v1/call --no-buffer --data \
+  "$(jq -nc --arg model "$MODEL" \
+    '{plugin:"openai",operation:"chat.completions",input:{model:$model,
+      messages:[{role:"user",content:"Hello"}],stream:true}}')"
+```
+
+The response status, content type and bytes come from the executable. They may
+be JSON, SSE or another media type. Check status/content type before decoding;
+stream with curl `--no-buffer` or equivalent. The shipped plugin forwards its
+`input` to the provider's Chat Completions endpoint and returns the provider's
+response; model options and tool execution belong to the caller/provider.
+
+Core-level failures include unknown plugin/operation (404), insufficient grants
+(403), schema violation (422), unavailable required environment (503), process
+capacity (503), and process/protocol failure (502). A failure after headers are
+sent truncates/errors the stream instead of changing its status. Disconnect or
+timeout kills the child; there is no automatic replay of an ambiguous invocation.
+
+### Plugin process protocol v1
+
+Plugins are operator-installed executables, not network registrations. A manifest
+loaded with `erisdb serve --plugin-dir DIR` has these fields:
+
+| Field | Required / default | Contract |
+|---|---|---|
+| `protocol` | Required | `1` |
+| `name` | Required | Lowercase permission-segment name |
+| `description` | Default empty string | Discovery text |
+| `executable` | Required | Absolute executable path |
+| `args` | Default empty array | String arguments passed to the executable |
+| `environment` | Default empty map | Environment-name → boolean; true required, false optional; values come from the service environment |
+| `timeout_secs` | Default 600 | Integer 1–3600 |
+| `operations` | Required nonempty object | Operation name → `{description?, permission, request_schema}` |
+
+Operation permissions must be concrete, under the plugin's namespace, with no
+wildcards. Unknown manifest, operation-definition, and response-header JSON fields
+are rejected. Schemas reject external references. The child environment is cleared
+and rebuilt from the allowlist; bearer tokens and undeclared core secrets are
+not forwarded. The process runs as the core service user, not in a hostile-code
+sandbox. Complete installation examples are in [plugins.md](plugins.md).
+
+Stdin receives one JSON line then EOF:
 
 ```json
-{
-  "plugin": "openai",
-  "operation": "chat.completions",
-  "input": {
-    "model": "gpt-5.4",
-    "messages": [{"role": "user", "content": "hello"}],
-    "tools": [{
-      "type": "function",
-      "function": {
-        "name": "lookup",
-        "parameters": {"type": "object"}
-      }
-    }],
-    "stream": true
-  }
+{"protocol":1,"plugin":"example","operation":"echo","input":{"message":"hello"},"context":{"user":"alice"}}
+```
+
+`context.user` is omitted when the caller has no signed user label. Stdout starts
+with one JSON header line, followed immediately by raw response bytes:
+
+```text
+{"protocol":1,"status":200,"content_type":"application/json","headers":{"x-request-id":"example-1"}}
+{"message":"hello"}
+```
+
+`headers` defaults to an empty map. Hop-by-hop, credential, cookie,
+content-length and content-type entries are filtered; `content_type` controls
+the content type. The core supplies `Cache-Control: no-store`. Status must be
+200–599. Flush streaming output. Use stderr for diagnostics;
+the core captures only a bounded amount. Header limit: 16 KiB; retained stderr:
+64 KiB. Full process behavior and the shipped manifest are in
+[the plugin guide](plugins.md) and [deploy/plugins/openai.json](../deploy/plugins/openai.json).
+
+## MCP tools
+
+`erisdb-mcp` exposes **17 tools over MCP stdio**. It is an HTTP client of the
+core, so core permissions and registration revocation remain authoritative.
+It advertises tools, not custom resources or prompts. Use MCP initialization,
+then `tools/list` to obtain the runtime JSON schemas and `tools/call` to invoke.
+Messages on stdio are newline-delimited JSON-RPC, not core HTTP requests.
+
+Pair and start a profile:
+
+```bash
+erisdb-mcp pair 'bezel://pair/PASTE_REAL_PAYLOAD' --profile notes \
+  --grant notes:read,notes:create,notes:update,meta:facets:read
+erisdb-mcp --profile notes
+```
+
+The bridge remembers its installation automatically. The default profile is
+`default`; `--profile`/`ERISDB_PROFILE` selects another identity. Advanced storage
+is `--session-file`/`ERISDB_SESSION_FILE`. `pair` also accepts `--name` and `--url`
+(`ERISDB_URL`) for an Iroh-only ticket. Manual-token mode uses `ERISDB_URL` plus
+`ERISDB_TOKEN_FILE` or `ERISDB_TOKEN`; an explicit profile/storage override selects
+paired mode. Pairing renews automatically after a core 401, then retries once;
+ambiguous transport failures do not repeat writes. See [MCP setup](../erisdb-mcp/README.md).
+
+### Tool arguments and examples
+
+Every row below gives a complete example `arguments` object. Fields marked `?`
+are optional. IDs/revisions refer to existing records.
+
+| Tool | Arguments | Example `arguments` | Result / authority |
+|---|---|---|---|
+| `list_facets` | None | `{}` | `{items:[…]}`; reads `facet`, limit 1000; `meta:facets:read` |
+| `read_items` | `facet: string`, `updated_since?: string`, `limit?: integer` | `{"facet":"notes","limit":20}` | Core item-list result; facet read |
+| `get_item` | `id: string` | `{"id":"a871b3bb-a77b-4fbd-a289-6f7d04e03c3a"}` | Item; facet read |
+| `search_items` | `query: string`, `facet?: string`, `limit?: nonnegative integer` | `{"query":"note","facet":"notes","limit":20}` | `{items,scanned_facets,truncated}`; readable facets only |
+| `create_item` | `facet: string`, `body: JSON` | `{"facet":"notes","body":{"title":"MCP note","done":false}}` | Item; facet create |
+| `update_item` | `id: string`, `body: JSON`, `revision: integer` | `{"id":"a871b3bb-a77b-4fbd-a289-6f7d04e03c3a","body":{"title":"Edited","done":false},"revision":1}` | Replaces whole body; facet update |
+| `delete_item` | `id: string`, `confirm: boolean` | `{"id":"a871b3bb-a77b-4fbd-a289-6f7d04e03c3a","confirm":false}` | False previews with facet read; true deletes with facet delete |
+| `item_history` | `id: string` | `{"id":"a871b3bb-a77b-4fbd-a289-6f7d04e03c3a"}` | `{history:[…]}`; facet read |
+| `revert_item` | `id: string`, `seq: integer`, `revision: integer` | `{"id":"a871b3bb-a77b-4fbd-a289-6f7d04e03c3a","seq":42,"revision":2}` | New Item revision; facet update |
+| `read_changes` | `since?: integer`, `facet?: string`, `limit?: integer` | `{"since":0,"facet":"notes","limit":100}` | `{changes,next}`; same feed authority as HTTP |
+| `mint_capability` | `grants: string[]`, `ttl_secs: integer`, `user?: string` | `{"grants":["notes:read"],"ttl_secs":300}` | `{token,ttl_secs}`; mint grant and operator switch |
+| `my_permissions` | None | `{}` | Effective core permissions; valid credential |
+| `server_state` | None | `{}` | Core state; `meta:server:read` |
+| `list_pairings` | None | `{}` | `{pairings:[…]}`; `meta:pairing:read` |
+| `get_pairing` | `id: string` | `{"id":"ad6caf6b-ece2-442a-a178-a93cc5aa0802"}` | Compact session; `meta:pairing:read` |
+| `approve_pairing` | `id: string`, `granted: string[]`, `ttl_secs?: integer`, `user?: string` | `{"id":"ad6caf6b-ece2-442a-a178-a93cc5aa0802","granted":["notes:read"],"ttl_secs":300}` | Compact session plus top-level `ttl_secs`; approve grant and operator switch |
+| `deny_pairing` | `id: string` | `{"id":"ad6caf6b-ece2-442a-a178-a93cc5aa0802"}` | Denied session; `meta:pairing:approve` |
+
+Example call after MCP initialization:
+
+```json
+{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"read_items","arguments":{"facet":"notes","limit":20}}}
+```
+
+Success is a standard MCP result containing a text block whose text is the
+pretty-printed core JSON. A successful empty HTTP response becomes `{"ok":true}`:
+
+```json
+{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"{\"items\":[]}"}],"isError":false}}
+```
+
+Core failures become tool results with `isError: true` and text such as
+`HTTP 403: {"error":"forbidden",…}`. Transport failures and local policy
+refusals also use tool errors. Protocol/argument errors may instead be JSON-RPC
+errors. Do not treat receipt of a JSON-RPC result alone as tool success.
+
+### MCP-specific behavior
+
+- `search_items` is a case-insensitive substring match against serialized bodies
+  or exact case-insensitive item ID. Default hit limit 50, clamped to 1–200;
+  scans at most 25 facets and the first 1000 items per facet. Without `facet`,
+  it first needs `meta:facets:read`. Facet reads that fail are skipped. `truncated`
+  marks hit/facet limits, but does not detect every per-facet 1000-item truncation;
+  this is a convenience search, not an exhaustive database query.
+- `delete_item(confirm=false)` returns `{deleted:false,item,next}`. With true,
+  it calls unconditional HTTP DELETE: there is no revision argument on this tool.
+- `mint_capability` is disabled unless `ERISDB_MCP_ALLOW_MINT=1`; its token appears
+  in tool text. `approve_pairing` is disabled unless `ERISDB_MCP_ALLOW_APPROVE=1`,
+  requires explicit nonempty `granted`, and refuses bare `*`.
+- Both tools cap requested TTL to `ERISDB_MCP_MAX_MINT_TTL` (default 86400 seconds).
+  Approval defaults to that TTL, still subject to the core's seven-day ceiling.
+  This cap is an access-token lifetime, not an installation-renewal deadline.
+- There are currently no MCP tools for client-registry administration, plugin
+  invocation, ticks or live subscriptions. Use their HTTP/Iroh endpoints.
+
+## Rust client API
+
+Crate: `erisdb-client`, library name `erisdb_client`. It uses Iroh, not the
+core's TCP URL. All asynchronous methods return `anyhow::Result<…>`.
+
+### Entry points
+
+`Client::dial(server: &str, token: &str, client_name: &str,
+identity: Option<[u8;32]>) -> Result<Client>` is async. `server` is a bare endpoint
+ID, `iroh:ID`, or JSON-serialized Iroh `EndpointAddr`. `dial_addr` takes an
+`EndpointAddr` directly. Supplying `None` creates a fresh key; registered clients
+must preserve and reuse their actual installation key. Dialing binds the local
+endpoint; the remote connection is established when used.
+
+| Async method on `Client` | Return value / behavior |
+|---|---|
+| `request(method, path, body: Option<Value>)` | `(u16, Value)`; non-2xx status is returned, not automatically an error; 204 body is JSON null |
+| `permissions()` | `Permissions {grants, exp, max_exp, user, raw}`; `raw` also contains `client_id` |
+| `refresh_capability(ttl_secs: i64)` | New token String; switches the in-memory token; selects installation renewal for registered tokens and bounded refresh for manual tokens |
+| `redeem_pairing(client_name, requested: &[&str])` | Compact session JSON, including comparison fingerprint |
+| `pairing_status()` | `Pairing` state for one collection poll |
+| `await_pairing(within: Duration, cancel: &Cancel)` | Polls for a final `Pairing` result or timeout/cancellation |
+| `pair(client_name, requested, within, cancel)` | Redeem then await; does not persist credentials |
+| `subscribe_changes(since: i64, facet: Option<&str>)` | `Subscription`; consume with async `next()` |
+| `call_plugin(plugin, operation, input: Value)` | Buffered `(u16, Value)` response |
+| `stream_plugin(plugin, operation, input: Value)` | `PluginStream`; preserves status and raw streamed bytes |
+
+Top-level async `pair(ticket: &Ticket, client_name, requested,
+identity: Option<[u8;32]>, within, cancel)` dials the ticket and pairs.
+`Ticket::parse(&str)` performs local validation and returns
+`{v, name: Option<String>, eid: Option<String>, url: Option<String>, token}`.
+`ticket.endpoint_id()` returns the endpoint ID or an error for a URL-only ticket.
+
+`Pairing` variants are `Waiting`, `Approved {token, granted}`, `Denied`, `TimedOut`,
+and `Cancelled`. The convenience enum combines HTTP `pending` and `requested`
+into `Waiting`; use raw `request` when those states must be distinguished for
+initial-submission recovery. `Cancel::new()`, `.cancel()` and `.is_cancelled()`
+provide a clonable cancellation signal. The pairing poll interval is 500 ms.
+
+### Pair, compare, then read
+
+This function receives an installation key the application generated and saved.
+It returns the approved token for the application to persist. The comparison
+code must be shown to the human before approval on the core.
+
+```rust
+use anyhow::{bail, Result};
+use erisdb_client::{Cancel, Client, Pairing, Ticket};
+use std::time::Duration;
+
+async fn enroll(text: &str, identity: [u8; 32]) -> Result<(Client, String)> {
+    let ticket = Ticket::parse(text)?;
+    let pending = Client::dial(
+        ticket.endpoint_id()?, &ticket.token, "Notes native", Some(identity),
+    ).await?;
+    let session = pending.redeem_pairing("Notes native", &["notes:read"]).await?;
+    println!("Compare on the core: {}", session["body"]["fingerprint"]);
+    let cancel = Cancel::new();
+    let Pairing::Approved { token, .. } =
+        pending.await_pairing(Duration::from_secs(300), &cancel).await?
+    else { bail!("pairing did not complete") };
+    drop(pending);
+    let client = Client::dial(
+        ticket.endpoint_id()?, &token, "Notes native", Some(identity),
+    ).await?;
+    let (status, items) = client.request("GET", "/v1/items?facet=notes", None).await?;
+    println!("HTTP {status}: {items}");
+    Ok((client, token))
 }
 ```
 
-The response is whatever the operation emits. The OpenAI executable forwards
-Chat Completions JSON, errors, tool-call objects and `text/event-stream`
-chunks without rewriting their bodies. The core adds `Cache-Control:
-no-store` and removes unsafe or hop-by-hop headers.
+`request` can renew registered access after an explicit 401 and retry once. It
+retries transport failure only before request bytes were sent or for a method
+it treats as safe (GET/HEAD/OPTIONS). Native connection attempts have a 30-second
+establishment deadline; this is not a deadline for the entire API operation.
+Do not add blanket write retries around it. Persist a token returned by explicit
+refresh; preserving the installation key lets a restarted client recover even
+with an expired saved access token.
 
-**Any valid HTTP status** may be supplied by a correctly running plugin. A
-failure before that response begins uses the core error envelope documented
-above. The request limit is 16 MiB, the manifest timeout is at most one hour,
-and dropping the client response kills the process.
+### Streaming and error types
 
-The manifest and stdin/stdout protocol are specified in
-[plugins.md](plugins.md).
-
-## `POST /v1/items`
-
-Create an item. Registering a facet is this route with `"facet": "facet"`
-— there is no separate registration endpoint and no deploy.
-
-**Permission:** `{facet}:create`.
-
-```http
-POST /v1/items HTTP/1.1
-Authorization: Bearer bz1.eyJncmFudHMiOlsidGFza3M6Y3JlYXRlIl0s…
-X-Bezel-Client: Tasks (Web) v0.1
-Content-Type: application/json
-```
-
-```json
-{
-  "facet": "tasks",
-  "body": { "title": "water the plants", "done": false }
-}
-```
-
-**201 Created**, the whole item:
-
-```json
-{
-  "id": "7fe22cf5-9928-40f2-be3d-6168f66f5fc8",
-  "facet": "tasks",
-  "body": { "done": false, "title": "water the plants" },
-  "revision": 1,
-  "created_at": "2026-08-23T23:52:13.245452Z",
-  "updated_at": "2026-08-23T23:52:13.245452Z",
-  "source": {
-    "addr": "127.0.0.1:59294",
-    "client": "Tasks (Web) v0.1",
-    "user": "alice"
-  }
-}
-```
-
-The order of checks matters, because it decides which error you get:
-
-1. `{facet}:create`, or **403**. This runs before anything looks at the
-   store, so a token for the wrong facet learns nothing about whether that
-   facet exists.
-2. If the facet is `facet`, the submitted `schema` is walked for external
-   `$ref`s, or **400**.
-3. The facet's registration is loaded, or **422 `unknown_facet`**.
-4. If the facet is strict, the body is validated, or **422
-   `schema_violation`**.
-5. If the facet is `facet`, the submitted `name` is checked as a permission
-   namespace, or **400**. This is deliberately *after* the schema, so a
-   registration with no name at all is a schema violation rather than a
-   naming complaint.
-6. Insert, and append the `created` change row in the same transaction.
-
-**409 `conflict`** if the insert violates a unique index — the only one is
-the facet-name index, so this means "a facet by that name is already
-registered".
-
-## `GET /v1/items`
-
-Every item in one facet.
-
-**Permission:** `{facet}:read`.
-
-| param | required | default | meaning |
-|-------|----------|---------|---------|
-| `facet` | yes | — | Exactly one facet. There is no cross-facet list. Omitting it is a plain-text 400 from the query extractor. |
-| `updated_since` | no | — | RFC 3339. Returns items with `updated_at` **strictly greater** than this. Anything that is not a timestamp is a plain-text 400. |
-| `limit` | no | `100` | Clamped to `1..=1000`. Out-of-range values are clamped, not refused; a non-number is a plain-text 400. |
-
-Ordered by `updated_at`, then `id`. The id is a tiebreaker so that items
-sharing a timestamp come back in one fixed order rather than whatever the
-planner felt like.
-
-The registration is never consulted, so listing a facet nobody has
-registered is `{"items": []}` and a 200, not a 422.
-
-```
-GET /v1/items?facet=tasks&limit=2
-```
-
-```json
-{
-  "items": [
-    {
-      "id": "7fe22cf5-9928-40f2-be3d-6168f66f5fc8",
-      "facet": "tasks",
-      "body": { "done": false, "title": "water the plants" },
-      "revision": 1,
-      "created_at": "2026-08-23T23:52:13.245452Z",
-      "updated_at": "2026-08-23T23:52:13.245452Z",
-      "source": { "addr": "127.0.0.1:59294", "client": "Tasks (Web) v0.1", "user": "alice" }
-    },
-    {
-      "id": "1f05c80f-a57c-4af6-8524-ea5032e2bc68",
-      "facet": "tasks",
-      "body": { "done": false, "due": "2026-09-01T00:00:00Z", "title": "renew the domain" },
-      "revision": 1,
-      "created_at": "2026-08-23T23:52:22.238888Z",
-      "updated_at": "2026-08-23T23:52:22.238888Z",
-      "source": { "addr": "127.0.0.1:47840", "client": "Tasks (Web) v0.1", "user": "alice" }
+```rust
+async fn follow(client: &erisdb_client::Client, cursor: i64) -> anyhow::Result<()> {
+    let mut subscription = client.subscribe_changes(cursor, Some("notes")).await?;
+    while let Some(change) = subscription.next().await? {
+        println!("{} {}", change.seq, change.op);
+        // Apply change, then persist change.seq as the resume cursor.
     }
-  ]
+    Ok(())
 }
 ```
 
-`updated_since` is a bulk-load filter, not a sync cursor. It is a
-timestamp with strict `>`, so a group of items sharing one `updated_at`
-cannot be split across pages: page past part of the group and the rest is
-skipped forever. Use it to seed a cache and then hold a `seq` cursor on
-[the change feed](change-feed.md), which is what every app in this tree
-does.
+`Subscription::next()` returns `Result<Option<ChangeEvent>>`; None is EOF.
+`ChangeEvent` has `seq`, `facet`, `op`, optional `item_id`, `body`, `revision`,
+and `raw` (including timestamp/source). Reopen with the last processed cursor;
+the SDK does not persist cursors or automatically reconnect an ended subscription.
 
-## `GET /v1/items/{id}`
+`PluginStream` exposes `status`, optional `content_type` and `request_id`.
+`next_chunk()` returns `Result<Option<Vec<u8>>>`. Dropping it closes the stream.
+The streaming plugin call does not perform the ordinary request's automatic
+401 renewal/retry; refresh explicitly when needed. Its bytes are not parsed as
+SSE or JSON by the SDK.
 
-One item, by id.
+Typed helper refusals use `Refused {status, body}` inside `anyhow::Error`; raw
+`request`/`call_plugin` return HTTP statuses normally. Transport/parse failures
+are errors. Public constants: `ALPN = b"bezel/0"`, `TICKET_SCHEME = "bezel://pair/"`,
+`TICKET_VERSION = 1`, `PAIR_POLL_INTERVAL = 500 ms`.
 
-**Permission:** `{facet}:read` — which the core knows only after it has
-fetched the row.
+## Blocking and Android API
 
-```
-GET /v1/items/7fe22cf5-9928-40f2-be3d-6168f66f5fc8
-```
+`erisdb_client::blocking` owns one process-wide runtime and configured client,
+one pending convenience pairing, and handle-addressed subscriptions. It blocks
+the caller. Serialize reconfiguration/pairing against normal requests so a
+background sync cannot use a temporary pairing credential.
 
-**200** with the item envelope, unwrapped.
+| Blocking Rust function | Contract |
+|---|---|
+| `configure(server, token, client_name, identity: &[u8])` | Identity must be 32 bytes; returns `Result<(), String>` |
+| `request(method, path, body_json: Option<&str>)` | JSON string `{"status":200,"body":…}` or `{"status":0,"error":"…"}`; HTTP failures retain their actual status |
+| `permissions()` | JSON string `{"ok":true,"permissions":…}` or failure envelope |
+| `refresh_capability(ttl_secs: i64)` | JSON string `{"ok":true,"token":"…"}`; swaps in-memory token |
+| `parse_ticket(ticket)` | Local JSON string `{"ok":true,"ticket":…}` or `{"ok":false,"error":"…"}` |
+| `pair_redeem(server, code, client_name, requested_json, identity: &[u8])` | Starts convenience pairing; requested JSON is an array; returns `{"ok":true,"pairing":SESSION}` |
+| `pair_poll(timeout_ms: u64)` | `{"ok":true,"status":"waiting"}`, `approved` with token/granted, `denied`, or `cancelled`; settled results clear the local pending slot |
+| `pair_cancel()` | Cancels/drops pending convenience pairing; no server-side denial request |
+| `subscribe_changes(since: i64, facet: Option<&str>)` | `Result<SubscriptionHandle, String>`, where handle is `u64` |
+| `next_change(handle, timeout_ms: u64)` | JSON `{"ok":true,"change":…}`; timeout `{"ok":true}`; EOF/error `{"ok":false,"error":"…"}` |
+| `close_subscription(handle)` | Closes the handle; unknown handles are a no-op |
 
-**404** if no such id. **403** if the id exists and no grant covers its
-facet. That ordering is deliberate: answering 403 tells a caller something
-true about an id it already holds, and item ids are v4 UUIDs, so it is not
-a way to discover one.
+Helper failures normally use `{"ok":false,"status":N,"error":"…"}`, with status
+0 for local/transport errors. Subscription and ticket helpers have their specific
+shapes above. A settled convenience pairing returns its token once locally;
+this differs from the server's repeatable collection API. Persist the result.
 
-## `PUT /v1/items/{id}`
+Public FFI utilities are `decode_identity_hex(&str) -> Option<[u8;32]>`,
+`panic_envelope(String) -> String`, and `guard(f, on_panic) -> T`. They support
+binding implementations; applications normally use the operations above.
 
-Replace the body. **Whole-body, not a patch** — whatever you send is what
-the item becomes, so a caller that renders a partial view and writes it
-back destroys every field it did not echo.
+### JNI and Kotlin
 
-**Permission:** `{facet}:update`.
+Native library: `liberisdb_client.so`; JNI class: `dev.erisdb.client.ErisDB`.
+The exports use the blocking operations with Java strings and long integers:
 
-```json
-{
-  "body": { "title": "water the plants", "done": true },
-  "revision": 1
-}
-```
+| JNI method | Arguments / result |
+|---|---|
+| `nativeConfigure` | `(server, token, clientName, identityHex) -> String`; empty success, error text otherwise |
+| `nativeRequest` | `(method, path, bodyOrNull) -> String`; request envelope |
+| `nativeRefreshCapability` | `(ttlSecs: long) -> String`; refresh envelope |
+| `nativePermissions` | `() -> String`; permissions envelope |
+| `nativeParseTicket` | `(ticket) -> String`; parse envelope |
+| `nativePairRedeem` | `(server, code, clientName, requestedJson, identityHex) -> String` |
+| `nativePairPoll` | `(timeoutMs: long) -> String` |
+| `nativePairCancel` | `() -> void` |
+| `nativeSubscribeChanges` | `(since: long, facetOrNull) -> long`; zero means failure |
+| `nativeNextChange` | `(handle: long, timeoutMs: long) -> String` |
+| `nativeCloseSubscription` | `(handle: long) -> void` |
 
-`revision` is required and is the revision the caller believes is
-current. The UPDATE is `WHERE id = … AND revision = …`; zero rows affected
-is **409 `revision_conflict`**.
+`identityHex` is exactly 64 hexadecimal characters representing the persistent
+32-byte private key. JNI clamps negative poll timeouts to zero. Entry points
+contain panics; Java string allocation failure can still return null.
 
-**200** with the item at its new revision:
+The shipped Kotlin wrapper currently exposes `configure`, `request`, and
+`refreshCapability`; other JNI exports are available to a binding that declares
+them. It converts native JSON strings to `JSONObject`, and maps an empty
+configure result to null. Run these blocking operations on `Dispatchers.IO`:
 
-```json
-{
-  "id": "7fe22cf5-9928-40f2-be3d-6168f66f5fc8",
-  "facet": "tasks",
-  "body": { "done": true, "title": "water the plants" },
-  "revision": 2,
-  "created_at": "2026-08-23T23:52:13.245452Z",
-  "updated_at": "2026-08-23T23:52:22.266840Z",
-  "source": { "addr": "127.0.0.1:47850", "client": "Tasks (Web) v0.1", "user": "alice" }
-}
-```
-
-**404** if the id is unknown; the row is looked up and locked before the
-permission check, so an unknown id is 404 whatever the token says. **422**
-if the new body fails the facet's schema — updates are validated exactly as
-creates are, and against the registration as it stands now, so a facet
-whose registration has since been deleted answers **422 `unknown_facet`**.
-`facet`, `id` and `created_at` are not writable.
-
-## `DELETE /v1/items/{id}`
-
-**Permission:** `{facet}:delete`.
-
-| param | required | meaning |
-|-------|----------|---------|
-| `revision` | no | The revision the caller believes is current. |
-
-Pass `revision` and a delete racing someone else's edit is **409
-`revision_conflict`** instead of a silent win. Omit it and the delete is
-unconditional.
-
-```
-DELETE /v1/items/7fe22cf5-9928-40f2-be3d-6168f66f5fc8?revision=2
-```
-
-**204 No Content**, no body. **404** for an unknown id.
-
-The row leaves `items`. It does not leave `changes`: a `deleted` row is
-appended with a null `body` — the state after a delete is absence — and
-every prior snapshot stays exactly where it was. Deleting is not
-forgetting; see [change-feed.md](change-feed.md).
-
-## `GET /v1/items/{id}/history`
-
-Every state the item has ever been in, oldest first.
-
-**Permission:** `{facet}:read`, where the facet is read off the item's
-*first* change row. This works for items that no longer exist: history
-outlives its item.
-
-```
-GET /v1/items/7fe22cf5-9928-40f2-be3d-6168f66f5fc8/history
-```
-
-```json
-{
-  "history": [
-    {
-      "seq": 2,
-      "op": "created",
-      "at": "2026-08-23T23:52:13.245452Z",
-      "body": { "done": false, "title": "water the plants" },
-      "revision": 1,
-      "source": { "addr": "127.0.0.1:59294", "client": "Tasks (Web) v0.1", "user": "alice" }
-    },
-    {
-      "seq": 4,
-      "op": "updated",
-      "at": "2026-08-23T23:52:22.266840Z",
-      "body": { "done": true, "title": "water the plants" },
-      "revision": 2,
-      "source": { "addr": "127.0.0.1:47850", "client": "Tasks (Web) v0.1", "user": "alice" }
+```kotlin
+withContext(Dispatchers.IO) {
+    val error = ErisDB.configure(endpointId, accessToken, "Notes Android", savedIdentityHex)
+    check(error == null) { error ?: "configuration failed" }
+    val reply = ErisDB.request("GET", "/v1/items?facet=notes")
+    if (reply.getInt("status") == 200) {
+        val items = reply.getJSONObject("body").getJSONArray("items")
+        // Apply items to the application's local cache.
     }
-  ]
 }
 ```
 
-Rows are the change envelope minus `item_id` and `facet`, both of which
-are constant across the response.
-
-**404** when the item has no change rows at all. That is not quite the same
-as "no such item", and it catches two real ones: the bootstrap `facet`
-registration and the bootstrap `pair` registration, both inserted by
-migrations, never written through the API, and so without a history despite
-being perfectly real items.
-
-## `POST /v1/items/{id}/revert`
-
-Git-revert, not time travel. The body snapshotted at `seq` is written as a
-**new** revision and lands on the feed as an ordinary `updated`. History
-never rewinds.
-
-**Permission:** `{facet}:update`. Reverting is editing; there is no
-separate revert permission, and a token that may change an item may change
-it to something it already was.
-
-```json
-{ "seq": 2, "revision": 2 }
-```
-
-- `seq` — the change whose body to restore. It must be a row for *this*
-  item and it must carry a body, or **400 `bad_request`** with
-  `no snapshot at seq N for this item`. A `deleted` row has a null body,
-  so it is never a revert target.
-- `revision` — optimistic concurrency, exactly as on `PUT`. Stale is
-  **409**.
-
-**200** with the item at its new revision: reverting to seq 2 while the
-item stands at revision 2 returns revision 3, carrying the body that
-revision 1 held.
-
-The restored body is re-validated against the facet's *current* schema, so
-a snapshot taken before the schema tightened is **422** rather than a way
-around it.
-
-**404** if the item does not currently exist. Reverting is not undelete:
-recovering a deleted item means reading its history and creating a new one
-from the last snapshot. It will get a new id.
-
-## `GET /v1/changes`
-
-The feed, cursor-paged. This is the bus and the audit log both.
-
-**Permission:** `{facet}:read` when `facet` is given; **`meta:feed:read`**
-when it is not. The unfiltered feed crosses every facet, so it is its own
-permission rather than the sum of the ones it would reveal — which is why
-`*:read` cannot read it, and why a token scoped to one facet can tail that
-facet and nothing else.
-
-| param | required | default | meaning |
-|-------|----------|---------|---------|
-| `since` | no | `0` | Exclusive: rows with `seq > since`. `0` is the beginning of time. |
-| `facet` | no | — | One facet. Omit for the global feed. |
-| `limit` | no | `500` | Clamped to `1..=5000`. |
-
-```
-GET /v1/changes?since=1&facet=tasks
-```
-
-```json
-{
-  "changes": [
-    {
-      "seq": 2,
-      "item_id": "7fe22cf5-9928-40f2-be3d-6168f66f5fc8",
-      "facet": "tasks",
-      "op": "created",
-      "at": "2026-08-23T23:52:13.245452Z",
-      "body": { "done": false, "title": "water the plants" },
-      "revision": 1,
-      "source": { "addr": "127.0.0.1:59294", "client": "Tasks (Web) v0.1", "user": "alice" }
-    },
-    {
-      "seq": 4,
-      "item_id": "7fe22cf5-9928-40f2-be3d-6168f66f5fc8",
-      "facet": "tasks",
-      "op": "updated",
-      "at": "2026-08-23T23:52:22.266840Z",
-      "body": { "done": true, "title": "water the plants" },
-      "revision": 2,
-      "source": { "addr": "127.0.0.1:47850", "client": "Tasks (Web) v0.1", "user": "alice" }
-    }
-  ],
-  "next": 4
-}
-```
-
-`next` is the last `seq` in the page, or `since` unchanged when the page
-is empty. Pass it back as `since`. It is a page cursor, not a high-water
-mark of the whole feed: an empty page means you are caught up *for this
-filter*.
-
-Filtering by facet skips `tick`, which is filed under `system`. It does
-not skip `lapsed`, which carries the item's own facet.
-
-## `GET /v1/changes/stream`
-
-The same rows, pushed. Server-Sent Events over one long-lived response,
-woken by Postgres `NOTIFY` rather than polled.
-
-**Permission:** identical to `GET /v1/changes`, and checked once, at
-subscribe.
-
-| param | required | default | meaning |
-|-------|----------|---------|---------|
-| `since` | no | `0` | Exclusive, as above. The stream first drains everything after `since`, then goes live — so no window is missed between catching up and subscribing. |
-| `facet` | no | — | One facet, or the global feed. |
-
-`limit` is accepted by the parser and ignored; the stream always drains in
-batches of 500.
-
-Every event is named `change` and its data is one change object, the same
-shape `GET /v1/changes` returns:
-
-```
-event: change
-data: {"seq":2,"item_id":"7fe22cf5-9928-40f2-be3d-6168f66f5fc8","facet":"tasks","op":"created","at":"2026-08-23T23:52:13.245452Z","body":{"done":false,"title":"water the plants"},"revision":1,"source":{"addr":"127.0.0.1:59294","client":"Tasks (Web) v0.1","user":"alice"}}
-
-:
-
-event: change
-data: {"seq":4,…}
-```
-
-Bare `:` lines are keep-alive comments. There is no `id:` field — the
-cursor is `seq` inside the data, held by the client, so `Last-Event-ID`
-plays no part.
-
-**503 `unavailable`** when 32 streams are already open: each one holds a
-Postgres connection of its own, outside the pool.
-
-The stream **ends when the subscribing token expires**. Authorization is
-checked once, so without that a token with a minute left would hold an
-open firehose for as long as the process ran. The response simply closes;
-there is no final event. A client that reconnects with a refreshed token
-and its last `seq` loses nothing.
-
-A stream also ends on any store error. Treat every end as ordinary, catch
-up with `GET /v1/changes?since=<cursor>`, and reconnect.
-
-## `POST /v1/tick`
-
-The poker's endpoint: put a tick on the bus, then sweep every facet that
-declares a lapse rule.
-
-**Permission:** `meta:system:tick`. It is the poker's whole job, and the
-only thing that permission is for.
-
-Takes no body, and needs no `Content-Type`: the handler never reads one.
-
-```http
-POST /v1/tick HTTP/1.1
-Authorization: Bearer bz1.eyJncmFudHMiOlsibWV0YTpzeXN0ZW06dGljayJdLCJleHAiOm51bGx9.<sig>
-```
-
-```json
-{ "seq": 7, "lapsed": 1 }
-```
-
-`seq` is the tick's own change row: `{item_id: null, facet: "system", op:
-"tick", body: null, revision: null}`. `lapsed` counts the `lapsed` rows
-this call appended.
-
-The sweep is idempotent by construction. The tick's change row takes the
-feed's append lock first and holds it for the whole transaction, so
-overlapping pokes run one at a time and the second sees the first's rows
-and finds nothing to do. An item lapses at most once per edit; see
-[facets.md](facets.md) for the rule that decides.
-
-**200** always when authorized — a sweep that finds nothing reports
-`"lapsed": 0`, which is the normal answer most minutes.
-
-## `POST /v1/capabilities`
-
-Mint a narrower token from the one you hold. Delegation, not issuance:
-there is no route that creates authority out of nothing. That needs the
-secret and the CLI.
-
-**Permission:** `meta:capabilities:mint`, plus enclosure of everything
-requested.
-
-| field | required | default | meaning |
-|-------|----------|---------|---------|
-| `grants` | yes | — | 1 to 64 permission patterns, each at most 128 characters. Each must be segments of `[a-z0-9][a-z0-9._-]*` or `*`, joined by `:`. The core does not check that a namespace exists. |
-| `ttl_secs` | yes | — | Seconds from now. Must be positive. There is no HTTP spelling for a token that never expires. |
-| `max_ttl_secs` | no | 2592000 (30 days) | How long the minted token may keep refreshing. Raised to `ttl_secs` if shorter, and refused over 31536000 (365 days). |
-| `user` | no | — | A signed identity, at most 128 characters, stamped into `source.user` on every write the token makes. Attribution, never privilege — enclosure ignores it entirely. |
-
-```json
-{
-  "grants": ["tasks:read", "tasks:create", "tasks:update"],
-  "ttl_secs": 604800,
-  "user": "agent-1"
-}
-```
-
-**201 Created**:
-
-```json
-{
-  "token": "bz1.eyJncmFudHMiOlsidGFza3M6cmVhZCIsInRhc2tzOmNyZWF0ZSIsInRhc2tzOnVwZGF0ZSJdLCJleHAiOjE3ODgxMzM5NTcsInVzZXIiOiJhZ2VudC0xIiwibWF4X2V4cCI6MTc5MDEyMTEzM30.GsaBWfSbx22BiXYSmrfg8CfrOGWtEbQlQ93eUKlNmiU"
-}
-```
-
-The response is only the token. Decode the payload yourself if you want
-its `exp` — the middle segment is unpadded base64url of the JSON
-`{grants, exp, user?, max_exp?, pair?}` — or ask
-[`GET /v1/permissions`](#get-v1permissions) while holding it. It is
-signed, not encrypted.
-
-Refusals, in the order they happen:
-
-- **429** — the rate limit, checked *before* authorization. A caller
-  without `meta:capabilities:mint` that grinds this route sees 429 rather
-  than 403, which is confusing exactly once.
-- **403** — no grant covers `meta:capabilities:mint`.
-- **400** — the grant set is empty, oversized, or misspelt; `ttl_secs` is
-  not positive; `max_ttl_secs` is over the ceiling.
-- **403** — the caller's own capability does not enclose the request.
-  Enclosure is scope *and* time: a token that dies in a minute cannot mint
-  one that lives an hour, and a token holding `tasks:read` cannot mint
-  `tasks:*`.
-
-Leaving `max_ttl_secs` out never costs a refusal — an unrequested chain
-silently takes whatever is left of the parent's. Naming one explicitly is
-taken at face value, so asking for more than the parent has is a 403 and
-not a surprise. [capabilities.md](capabilities.md) has the rules in full.
-
-## `POST /v1/capabilities/refresh`
-
-Trade a still-valid token for one with the same grants and a later expiry.
-
-**Permission:** none beyond a valid token. This is how an app outlives its
-TTL without a human re-minting.
-
-```json
-{ "ttl_secs": 86400 }
-```
-
-**201 Created**:
-
-```json
-{
-  "token": "bz1.eyJncmFudHMiOlsidGFza3M6cmVhZCJdLCJleHAiOjE3ODc2MTU1NTcsIm1heF9leHAiOjE3ODc2MTU1NTd9.Akj5fRpXLEQ8PP6LUgOJOO9noUUoLjOdx55heGojExY",
-  "exp": 1787615557,
-  "chain_ends": 1787615557
-}
-```
-
-`exp` is the new token's expiry in unix seconds; `chain_ends` is the end
-of its refresh chain — the ceiling that does not move. When the requested
-TTL reaches past the chain, `exp` is clamped to `chain_ends` and the
-request still succeeds, so a client asking for a day and being given the
-four hours it has left gets a 201 and can read what it actually got. The
-response above is exactly that case: a token with a day of chain left,
-asked for a day, given the chain.
-
-Grants and the signed `user` carry over untouched. Refresh moves time, not
-privilege: a token without `meta:capabilities:mint` cannot refresh itself
-into one that has it, and a refreshed token cannot outlive the chain of the
-token it came from — refreshing repeatedly does not walk the ceiling
-forward.
-
-- **429** — the rate limit, shared with `POST /v1/capabilities`.
-- **400** — `ttl_secs` is not positive.
-- **401** — the presenting token is already expired or past its chain
-  (verification refuses it before the handler runs), or the computed
-  expiry is not in the future. Refresh keeps a session alive; it cannot
-  resurrect one.
-
-A token minted with no expiry has no chain to run out. Refreshing it
-returns a *bounded* token — the trade only ever narrows — so a daemon
-holding a `--no-expiry` token should not call this route.
-
-## `GET /v1/permissions`
-
-What this token is. **No permission**: a caller may always ask what it
-already holds, and the answer tells it nothing it could not learn by
-decoding its own token.
-
-```
-GET /v1/permissions
-```
-
-```json
-{
-  "grants": ["*"],
-  "exp": 1787532733,
-  "max_exp": 1790121133,
-  "user": "alice"
-}
-```
-
-`exp`, `max_exp` and `user` are null when unset — a `--no-expiry` token
-reports `"exp": null`. This is the route a dashboard uses to decide which
-buttons to draw, and a client uses to check what a pairing actually
-granted.
-
-## `GET /v1/server`
-
-Counts and bounds, for a dashboard or a health check with more to say than
-`ok`.
-
-**Permission:** `meta:server:read`. It is deliberately not covered by
-`*:read`: how much is in the store and how loaded the process is are
-facts about the deployment, not about any facet's data.
-
-```json
-{
-  "version": "0.1.0",
-  "feed_head": 5,
-  "facets": 3,
-  "items": 5,
-  "changes": 5,
-  "limits": {
-    "streams": 32,
-    "streams_free": 32,
-    "iroh_connections": 64,
-    "client_name": 128
-  }
-}
-```
-
-`version` is the core's crate version. `feed_head` is the highest `seq` in
-`changes`, which is what a client compares its cursor against to know how
-far behind it is. `streams_free` is this replica's remaining stream slots,
-so it moves; the other limits are constants compiled in.
-
-## Pairing
-
-Seven routes and one state machine. The client half (`/v1/pair/*`) is
-reached with the pairing code; the operator half (`/v1/pairings*`) with an
-ordinary token holding the `meta:pairing:*` permissions.
-
-```
-pending  ── redeem ──▶  requested  ── approve ──▶  approved
-                                   ── deny ─────▶  denied
-```
-
-A session is an ordinary item in the `pair` facet, so it survives a
-restart, is visible from every replica, and lands on the change feed —
-which is how a dashboard sees a request arrive live. [pairing.md](pairing.md) is
-the authority on the ticket format and on why the flow has two phases.
-
-### `POST /v1/pairings`
-
-Cut a code.
-
-**Permission:** `meta:pairing:create`.
-
-The body is optional. `ttl_secs` defaults to 600 and is clamped to
-`60..=3600` — asking for 5 gets 60, silently.
-
-```json
-{ "ttl_secs": 600 }
-```
-
-**201 Created**:
-
-```json
-{
-  "id": "6e10cf80-8142-488b-afc5-9ecab365247e",
-  "expires": 1787529757,
-  "secret": "bz1.eyJncmFudHMiOlsibWV0YTpwYWlyaW5nOnJlZGVlbSJdLCJleHAiOjE3ODc1Mjk3NTcsIm1heF9leHAiOjE3ODc1Mjk3NTcsInBhaXIiOiI2ZTEwY2Y4MC04MTQyLTQ4OGItYWZjNS05ZWNhYjM2NTI0N2UifQ.Gci71EteM_kVnSHgXFy1tx5xdG1wif--30q3_xgKOAk"
-}
-```
-
-`secret` is the code that goes in the QR. Decoded, it is
-`{"grants":["meta:pairing:redeem"],"exp":…,"max_exp":…,"pair":"6e10cf80-…"}`
-— a token that can do exactly one thing to exactly one session. It reads
-no data and writes none; presenting it to `GET /v1/items` is a 403.
-`expires` is the session's deadline in unix seconds, and the code's too.
-
-### `POST /v1/pair/redeem`
-
-The native identity is taken from the authenticated Iroh connection. HTTP clients
-must include `challenge` (an unpadded base64url SHA-256 commitment to a fresh
-installation secret) in the JSON body. The returned session contains `identity`
-and `fingerprint`. HTTP collection and renewal prove the secret in
-`X-ErisDB-Client-Proof`; redemption never sends the secret itself. See
-[registered installations](clients.md) for transport and credential details.
-
-Say who you are and what you want.
-
-**Permission:** `meta:pairing:redeem`, on a token that names a session.
-
-| field | required | meaning |
-|-------|----------|---------|
-| `client` | yes | 1 to 128 characters. Shown to the human, trusted for nothing. |
-| `requested` | yes | The permissions the client would like, validated as grants. Asking is free. |
-
-```json
-{
-  "client": "Tasks (Android) v0.3",
-  "requested": ["tasks:read", "tasks:create", "tasks:update"]
-}
-```
-
-**200** with the session, token field removed:
-
-```json
-{
-  "id": "f17df84d-fde1-4d38-8797-d83afd574a4c",
-  "revision": 2,
-  "created_at": "2026-08-23T23:50:38.694082Z",
-  "body": {
-    "status": "requested",
-    "client": "Tasks (Android) v0.3",
-    "requested": ["tasks:read", "tasks:create", "tasks:update"],
-    "expires": 1787529638
-  }
-}
-```
-
-**403** if the token does not hold `meta:pairing:redeem`. **401** if it
-holds it but names no session — an ordinary `*` token cannot redeem
-anything, which is what keeps the code the only key to its own session.
-**400** if the session has expired. **409** if it is not `pending`: a code
-is redeemed once, and a denied one cannot be retried for a better answer.
-
-### `GET /v1/pair/status`
-
-Requires the pairing capability and the same installation proof used at redemption:
-the authenticated Iroh key, or `X-ErisDB-Client-Proof` for HTTP clients. A different
-key or missing/wrong HTTP proof returns 401, even if the QR ticket is valid.
-
-Before approval: `200 {status: "requested", fingerprint: "12AB-34CD-56EF"}`.
-After approval: `200 {status: "approved", granted: [...], token: "bz1.…",
-client_id: "UUID", exp: 1234567890, fingerprint: "12AB-34CD-56EF"}`.
-
-Collection creates the client and marks the pairing collected in one transaction.
-It is repeatable by that same installation while the ticket remains live, so a
-lost response does not lose the enrollment. No token is persisted in the pairing
-or audit log. A revoked registration cannot collect again. Requested/denied
-states contain no access credential. Responses have `Cache-Control: no-store`.
-
-### `GET /v1/pairings`
-
-Every session, newest first, capped at 100.
-
-**Permission:** `meta:pairing:read`.
-
-```json
-{
-  "pairings": [
-    {
-      "id": "f17df84d-fde1-4d38-8797-d83afd574a4c",
-      "revision": 2,
-      "created_at": "2026-08-23T23:50:38.694082Z",
-      "body": {
-        "status": "requested",
-        "client": "Tasks (Android) v0.3",
-        "requested": ["tasks:read", "tasks:create", "tasks:update"],
-        "expires": 1787529638
-      }
-    },
-    {
-      "id": "499616f3-7a27-46d6-b7aa-381314fcc1de",
-      "revision": 1,
-      "created_at": "2026-08-23T23:50:38.686887Z",
-      "body": { "status": "pending", "expires": 1787529638 }
-    }
-  ]
-}
-```
-
-The `token` field is stripped from every body. It is not stripped by the
-generic item routes, which reach the same rows under the same permission —
-see [Permissions by route](#permissions-by-route).
-
-### `GET /v1/pairings/{id}`
-
-One session, same shape, same redaction. **404** for an id that is not a
-`pair` item.
-
-**Permission:** `meta:pairing:read`.
-
-### `POST /v1/pairings/{id}/approve`
-
-Answer yes, to all of it or some of it.
-
-**Permission:** `meta:pairing:approve`, plus enclosure — approving is
-minting, so nobody grants what they do not hold.
-
-The body is optional. Omit it entirely to approve exactly what was asked
-for, with default lifetimes.
-
-| field | required | default | meaning |
-|-------|----------|---------|---------|
-| `granted` | no | whatever was `requested` | What to actually grant. Must be the requested set or a subset, also enclosed by the approver. |
-| `ttl_secs` | no | 604800 (7 days) | Access-token lifetime, 1–604800 seconds. |
-| `max_ttl_secs` | no | no deadline | Optional installation lifetime, 1–31536000 seconds. |
-| `user` | no | — | The signed identity the paired client writes as. |
-
-```json
-{ "granted": ["tasks:read", "tasks:create"], "ttl_secs": 604800 }
-```
-
-**200** with the session, token still redacted — the token belongs to the
-client that redeemed the code, and the approver never sees it:
-
-```json
-{
-  "id": "f17df84d-fde1-4d38-8797-d83afd574a4c",
-  "revision": 3,
-  "created_at": "2026-08-23T23:50:38.694082Z",
-  "body": {
-    "status": "approved",
-    "client": "Tasks (Android) v0.3",
-    "requested": ["tasks:read", "tasks:create", "tasks:update"],
-    "granted": ["tasks:read", "tasks:create"],
-    "expires": 1787529638
-  }
-}
-```
-
-**409** unless the session is `requested`: there is nothing to approve
-before a client has asked. **400** if the session has expired, or a
-lifetime is out of range. **403** if the approval is not enclosed by the
-approver's own capability — an operator holding only `tasks:*` cannot
-grant `lists:read`, whatever the client asked for, and cannot answer a
-request for `*` at all.
-
-### `POST /v1/pairings/{id}/deny`
-
-Answer no. Takes no body.
-
-**Permission:** `meta:pairing:approve`.
-
-**200** with the session at `"status": "denied"`, with `token` and
-`granted` removed. Unlike approve, deny does not check the session's state
-or its expiry: a session can be denied whenever, including after it was
-approved, which cancels an approval the client has not collected yet. It
-returns 409 after collection; use `POST /v1/clients/{id}/revoke` to revoke the registration.
-
-## Registered installations
-
-The complete registry API, revision semantics, renewal and revocation contract
-are documented in [clients.md](clients.md#administration).
+## Operator CLI
+
+These commands wrap or host the API; they do not add HTTP routes. All secret
+flags accept protected environment variables so secrets need not appear in
+command history. Built-in `--help` lists parser details.
+
+| Command | Main arguments | Example |
+|---|---|---|
+| `erisdb serve` | `--database-url`/`DATABASE_URL`, `--secret`/`ERISDB_SECRET`; optional `--listen`/`ERISDB_LISTEN`, `--iroh-secret`/`ERISDB_IROH_SECRET`, `--no-iroh`, `--plugin-dir`/`ERISDB_PLUGIN_DIR` | `erisdb serve --listen 127.0.0.1:7700` |
+| `erisdb endpoint-id` | Same signing/optional Iroh secret environment | `erisdb endpoint-id` |
+| `erisdb mint` | Required repeatable/comma-separated `--grant`; `--ttl` or `--no-expiry`; optional `--max-ttl`, `--user`; signing secret | `erisdb mint --grant notes:read --ttl 3600` |
+| `erisdb pair` | `--url`/`ERISDB_URL`; optional `--name`, `--ttl` (600), `--token-ttl` (604800), `--qr-output`, `--client-url`, `--no-iroh`; signing/optional Iroh secret | `erisdb pair --name laptop --client-url https://db.example.com` |
+| `erisdb clients list` | Parent `--url`/`ERISDB_URL`, `--secret`/`ERISDB_SECRET` | `erisdb clients list` |
+| `erisdb clients show ID` | Registration UUID | `erisdb clients show "$CLIENT_ID"` |
+| `erisdb clients permissions ID` | Required repeatable/comma-separated `--grant`; fetches current revision first | `erisdb clients permissions "$CLIENT_ID" --grant notes:read` |
+| `erisdb clients revoke ID` | Registration UUID | `erisdb clients revoke "$CLIENT_ID"` |
+
+Put parent options before the clients subcommand, for example
+`erisdb clients --url http://127.0.0.1:7700 list`. Administration prints JSON.
+`mint --no-expiry` is for manual/operator authority; it has no individually
+revocable registration. Pairing offers approve-requested, select-subset, or deny;
+it never silently grants beyond the request. The MCP launcher/pair command is
+covered in [MCP tools](#mcp-tools).
 
 ## Limits
 
-| bound | value | why |
-|-------|-------|-----|
-| Live change streams | 32 | Each holds a Postgres connection outside the pool, so this bounds the store as much as the process. Over it is 503. |
-| Iroh connections | 64 | Bounded before authentication: the endpoint id is public by design, and a capability check costs more than a refusal. Over it, the connection is dropped. |
-| Iroh streams per connection | 32 | Over it, the stream is dropped. |
-| Capability endpoints | burst of 10, then 1 per 5 seconds | A token bucket per caller, keyed by observed address. Minting is rare for an honest client and attractive to grind on. Soft state: a restart forgives everyone, and replicas do not share buckets. |
-| `X-Bezel-Client` | 128 characters, printable ASCII | It is copied into every change row this caller writes, so an unbounded one is a way to grow the table. |
-| Grants per token | 64, each ≤ 128 chars | Attacker-controlled strings baked into a payload that is HMAC'd on every request. |
-| `user` per token | 128 characters | Same reason. |
-| Refresh chain | 31536000 seconds over HTTP | Applies to manual/delegated refresh chains; registered installation renewal is independently revocable. |
-| Pairing code lifetime | 60 to 3600 seconds, default 600 | Long enough to walk to the other device, short enough that a photographed screen goes stale. |
-| Request body | 2 MiB | The framework default. Over it is 413. |
-| Store connection pool | 16 | Per replica. |
+| Surface | Limit / behavior |
+|---|---|
+| Ordinary HTTP JSON body | 2 MiB; 413 beyond it |
+| Plugin call body | 16 MiB; 413 beyond it |
+| Item list | Default 100, clamp 1–1000; no cursor |
+| Change page | Default 500, clamp 1–5000 |
+| Item history | No API pagination |
+| Pairing list | Newest 100; no pagination |
+| Installation list | All rows; no pagination |
+| Live change streams | 32 per replica; excess 503; each holds a Postgres listener connection |
+| Plugin processes | 32 per replica; excess 503 |
+| Iroh connections / streams | 64 connections, 32 streams per connection; excess dropped |
+| Store pool | 16 connections per core replica |
+| Mint and renewal rate | Shared bucket for `/v1/capabilities`, `/v1/capabilities/refresh`, `/v1/clients/{id}/refresh`: burst 10, replenishes one token per five seconds |
+| Rate identity | Observed TCP **IP**, not source port; authenticated Iroh peer key for native clients; a local proxy's callers share its IP bucket |
+| Rate durability | Per replica, reset by restart; no `Retry-After` contract |
+| Grant count / size | 1–64 grants, each at most 128 bytes |
+| User / client label | At most 128 bytes; client header additionally printable ASCII |
+| Pairing session lifetime | Default 600 seconds, clamped 60–3600 |
+| Paired access lifetime | Default and maximum 604800 seconds (7 days); an approval may choose a shorter renewal maximum |
+| Installation lifetime | No deadline by default; explicitly temporary registrations allow 1–31536000 seconds |
+| Manual/delegated HTTP mint chain | Resulting chain at most 31536000 seconds (365 days) |
+| Plugin timeout | Default 600 seconds, configured 1–3600 |
+| Plugin header / retained stderr | 16 KiB / 64 KiB |
+| Native connection establishment | 30 seconds per connection attempt; safe retry may make more than one attempt |
 
-On the plain-TCP path the rate-limit key is the peer's `ip:port`, so a
-caller that opens a fresh connection per request gets a fresh bucket and
-the limit is close to meaningless there — one more reason that listener
-belongs on loopback. Over Iroh the key is the remote endpoint id, a
-cryptographic identity, and the bucket means what it says.
+For deployment, transport setup, backup, migration and compatibility details see
+[operations](operations.md), [registered installations](clients.md), and
+[rename notes](renaming.md).
