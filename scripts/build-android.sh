@@ -11,7 +11,7 @@ for app in tasks lists; do
     mkdir -p "$destination"
     # Hashed dependency filenames change after updates; remove obsolete generated
     # libraries only after their replacements have built successfully.
-    rm -f "$destination"/liberisdb_client.so "$destination"/libbezel_client.so "$destination"/libiroh*.so
+    rm -f "$destination"/liberisdb_client.so "$destination"/libiroh*.so
     cp -a "$native_dir/$abi/." "$destination/"
   done
   "./apps/$app-android/gradlew" -p "apps/$app-android" --no-daemon testDebugUnitTest assembleDebug "$@"

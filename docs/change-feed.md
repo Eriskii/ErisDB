@@ -44,7 +44,7 @@ parameters; the semantics are:
   or `since` unchanged when the page is empty. Feed it back as `since`.
   It is a page cursor, not a high-water mark of the feed — an empty page
   means caught up *for this filter*.
-- `facet` narrows to one contract. Reading one facet's feed needs
+- `facet` narrows to one facet. Reading one facet's feed needs
   `{facet}:read`; reading the feed unfiltered needs `meta:feed:read`,
   which is its own permission rather than the sum of the ones it would
   reveal. Without that rule any token could read every write in the system
@@ -96,8 +96,8 @@ it works even after the facet's definition is gone.
 
 And it returns **404 for an item with no change rows**, which is not quite
 the same as "no such item". The rows this actually catches are the two
-bootstrap registrations, `facet` and `pair`: both were inserted by
-migrations, never written through the API, and so have no history at all
+bootstrap registrations, `facet` and `pair`: both were inserted during
+initialization, never written through the API, and so have no history at all
 despite being perfectly real items.
 
 `POST /v1/items/{id}/revert` takes a `seq` from that history and writes
@@ -137,7 +137,7 @@ The other half of the same fact: **restoring `items` without `changes` is
 not a restore.** Every sync client holds a cursor into the feed, and a feed
 that has lost its tail leaves those cursors pointing at a history that no
 longer exists. Back up and restore the whole database, including the `clients`
-registry, together; see [migration and recovery](clients.md#migration-and-recovery).
+registry, together; see [signing keys and backups](clients.md#signing-keys-and-backups).
 
 If a body should never be in the store, it must never be written. There is
 no route that removes a row from `changes` — deleting the item does not,

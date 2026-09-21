@@ -169,7 +169,7 @@ fun PairingPanel(
         codeField,
         { codeField = it },
         Modifier.fillMaxWidth(),
-        label = { Text("bezel://pair/…") },
+        label = { Text("erisdb://pair/…") },
         maxLines = 3,
     )
     Button(
@@ -205,7 +205,7 @@ fun PairingPanel(
                 tokenField,
                 { tokenField = it },
                 Modifier.fillMaxWidth(),
-                label = { Text("capability token (bz1.…)") },
+                label = { Text("capability token (erisdb1.…)") },
                 singleLine = true,
                 visualTransformation =
                     if (revealed) VisualTransformation.None else PasswordVisualTransformation(),

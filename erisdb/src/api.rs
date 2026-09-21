@@ -35,14 +35,14 @@ pub const FACET_FACET: &str = "facet";
 /// The facet holding pairing sessions.
 pub const PAIR_FACET: &str = "pair";
 /// Postgres NOTIFY channel fanned out to change-stream subscribers.
-pub const NOTIFY_CHANNEL: &str = "bezel_changes";
+pub const NOTIFY_CHANNEL: &str = "erisdb_changes";
 
 /// Live change streams allowed at once. Each one holds a Postgres connection
 /// of its own, outside the pool, so this is a bound on the store as much as
 /// on the process.
 pub const MAX_STREAMS: usize = 32;
 
-/// The longest `X-Bezel-Client` the core will stamp. It lands in every change
+/// The longest `X-ErisDB-Client` the core will stamp. It lands in every change
 /// row this caller writes, so an unbounded one is a way to grow the table.
 pub const MAX_CLIENT_LEN: usize = 128;
 
@@ -53,7 +53,7 @@ pub const MAX_CLIENT_LEN: usize = 128;
 /// transaction-scoped lock from the append through the commit makes seq order
 /// and commit order the same thing, which is what lets a cursor be a single
 /// number.
-const CHANGES_LOCK: i64 = 0x0062_657a_656c_0001;
+const CHANGES_LOCK: i64 = 0x0065_7269_7364_6201;
 
 /// Facet name to the schema it was compiled from and the validator for it.
 type ValidatorCache = Arc<Mutex<HashMap<String, (Value, Arc<jsonschema::Validator>)>>>;
@@ -227,7 +227,7 @@ impl FromRequestParts<AppState> for Capability {
 // ---------------------------------------------------------------- source
 // Every write is attributed: {addr, user, client} with a trust gradient —
 // addr is observed from the connection, user is signed into the capability
-// token, client is whatever the caller claims via X-Bezel-Client.
+// token, client is whatever the caller claims via X-ErisDB-Client.
 
 /// The caller's transport identity over Iroh (`iroh:<endpoint id>`),
 /// inserted into request extensions by the QUIC acceptor.
@@ -257,19 +257,19 @@ impl<S: Send + Sync> FromRequestParts<S> for SourceParts {
         // The claimed rung of the trust gradient, and the only one a caller
         // writes. It is copied into every change row, so it is bounded and
         // printable or it is refused.
-        let client = match parts.headers.get("x-bezel-client") {
+        let client = match parts.headers.get("x-erisdb-client") {
             None => None,
             Some(v) => {
                 let name = v.to_str().map_err(|_| {
-                    Error::BadRequest("X-Bezel-Client must be printable ASCII".into())
+                    Error::BadRequest("X-ErisDB-Client must be printable ASCII".into())
                 })?;
                 if name.len() > MAX_CLIENT_LEN {
                     return Err(Error::BadRequest(format!(
-                        "X-Bezel-Client is longer than {MAX_CLIENT_LEN}"
+                        "X-ErisDB-Client is longer than {MAX_CLIENT_LEN}"
                     )));
                 }
                 if name.chars().any(|c| c.is_control()) {
-                    return Err(Error::BadRequest("X-Bezel-Client must be printable".into()));
+                    return Err(Error::BadRequest("X-ErisDB-Client must be printable".into()));
                 }
                 Some(name.to_string())
             }
@@ -305,7 +305,7 @@ struct Item {
     revision: i64,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
-    /// The last writer's source; null only for rows minted by migrations.
+    /// The last writer's source; null for initialized facet definitions.
     source: Option<Value>,
 }
 
@@ -316,11 +316,11 @@ struct Change {
     facet: String,
     op: String,
     at: DateTime<Utc>,
-    /// The body this change produced; null for deletes and migration rows.
+    /// The body this change produced; null for deletes and ticks.
     body: Option<Value>,
     /// The revision this change produced; null wherever body is.
     revision: Option<i64>,
-    /// Who produced it; null for migration rows.
+    /// Who produced it; null when no request source is recorded.
     source: Option<Value>,
 }
 

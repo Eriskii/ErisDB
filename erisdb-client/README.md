@@ -1,7 +1,7 @@
 # erisdb-client
 
 Dials an ErisDB over Iroh. One QUIC connection, one HTTP/1.1 exchange per
-bi-stream, ALPN `bezel/0` — the same router the core serves over TCP,
+bi-stream, ALPN `erisdb/0` — the same router the core serves over TCP,
 reached from anywhere without a port to forward or a certificate to
 manage. Registered tokens are bound to the caller’s persistent Iroh installation key.
 Postgres supplies current grants and revocation status on every request.
@@ -27,7 +27,7 @@ through discovery; a JSON `EndpointAddr` dials directly.
 ```rust
 let client = erisdb_client::Client::dial(
     "iroh:8f1c…",              // or the addr JSON, or the bare id
-    &token,                     // bz1.…
+    &token,                     // erisdb1.…
     "Lists (Android) v0.1",     // stamped into every write's source
     Some(identity),             // 32 bytes, pinning this device's endpoint key
 ).await?;
@@ -51,7 +51,7 @@ erisdb endpoint-id --secret …
 that id:
 
 ```sh
-ERISDB_SERVER=$(erisdb endpoint-id --secret …) ERISDB_TOKEN=bz1.… \
+ERISDB_SERVER=$(erisdb endpoint-id --secret …) ERISDB_TOKEN=erisdb1.… \
   cargo run --example dial
 ```
 
@@ -70,7 +70,7 @@ approving; display names are untrusted. A photographed ticket can race to reques
 enrollment, but it cannot collect another installation's approved credential.
 
 ```rust
-let ticket = erisdb_client::Ticket::parse(scanned)?;   // bezel://pair/…
+let ticket = erisdb_client::Ticket::parse(scanned)?;   // erisdb://pair/…
 let cancel = erisdb_client::Cancel::new();             // the back button
 
 match erisdb_client::pair(
@@ -244,7 +244,7 @@ using it — dialing with the granted token and watching the core refuse
 the one permission the human withheld.
 
 The retry tests instead put a deliberately broken peer on the wire — a
-real Iroh endpoint speaking `bezel/0` that reads a request and then dies
+real Iroh endpoint speaking `erisdb/0` that reads a request and then dies
 without answering. Whether a call was safe to repeat is invisible from
 the calling side, where a lost request and a lost response look alike;
 only the server knows how many requests actually arrived.
@@ -265,5 +265,5 @@ explicit 401 is safe to retry because authorization preceded effects; ambiguous
 transport failures retain the existing no-retry rule for writes.
 
 `refresh_capability` selects installation renewal when the token carries a
-`client` ID, and the old bounded-chain endpoint for manual tokens. Current
+`client` ID, and the bounded-chain endpoint for manual tokens. Current
 registration permissions bound every request, including delegated tokens.

@@ -1,7 +1,7 @@
 //! Pairing tickets: where the core is and what to say, as one scannable
 //! string.
 //!
-//! `bezel://pair/<base64url-nopad(JSON)>`. The payload carries a capability
+//! `erisdb://pair/<base64url-nopad(JSON)>`. The payload carries a capability
 //! token and at least one address — an iroh endpoint id, a plain HTTP URL,
 //! or both, so one ticket serves a browser on the LAN and a phone anywhere.
 //!
@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::{Error, Result};
 
 /// The literal prefix. Everything after it is the encoded payload.
-pub const SCHEME: &str = "bezel://pair/";
+pub const SCHEME: &str = "erisdb://pair/";
 
 /// The only ticket version there is. A client that meets a version it does
 /// not know refuses the ticket rather than guessing at the fields.
@@ -98,7 +98,7 @@ mod tests {
     use super::*;
 
     fn token() -> String {
-        "bz1.eyJmYWNldHMiOlsiKiJdfQ.c2ln".to_string()
+        "erisdb1.eyJmYWNldHMiOlsiKiJdfQ.c2ln".to_string()
     }
 
     fn eid() -> String {

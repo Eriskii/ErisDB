@@ -28,36 +28,6 @@ interface SecretStore {
 }
 
 /**
- * Carry `keys` out of a store that should never have held them, and leave
- * nothing behind. A value already sealed wins: the migration runs once,
- * and a token refreshed since must not be rolled back to the stale one
- * still lying in the clear.
- */
-fun migrateSecrets(from: SecretStore, to: SecretStore, keys: List<String>) {
-    for (key in keys) {
-        val carried = from.get(key) ?: continue
-        if (to.get(key) == null) to.put(key, carried)
-        from.clear(key)
-    }
-}
-
-/** Plain SharedPreferences, which is where secrets are migrated *from*. */
-@SuppressLint("ApplySharedPref")
-class PrefsSecrets(private val ctx: Context, private val name: String) : SecretStore {
-    private val prefs by lazy { ctx.getSharedPreferences(name, Context.MODE_PRIVATE) }
-
-    override fun get(key: String): String? = prefs.getString(key, null)
-
-    override fun put(key: String, value: String) {
-        prefs.edit().putString(key, value).commit()
-    }
-
-    override fun clear(key: String) {
-        prefs.edit().remove(key).commit()
-    }
-}
-
-/**
  * Secrets sealed under a keystore key, one file of `base64(iv‖ciphertext)`.
  *
  * A value that will not open reads as absent. That is the honest answer:
@@ -114,9 +84,9 @@ class KeystoreSecrets(ctx: Context) : SecretStore {
     }
 
     private companion object {
-        const val FILE = "bezel-secrets"
+        const val FILE = "erisdb-secrets"
         const val KEYSTORE = "AndroidKeyStore"
-        const val ALIAS = "bezel.lists.secrets"
+        const val ALIAS = "erisdb.lists.secrets"
         const val TRANSFORM = "AES/GCM/NoPadding"
         const val IV_BYTES = 12
         const val TAG_BITS = 128

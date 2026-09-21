@@ -1,5 +1,5 @@
 //! Dial an ErisDB by endpoint id and issue one request — a reachability
-//! probe: `ERISDB_SERVER=<id> ERISDB_TOKEN=<bz1…> cargo run --example dial`.
+//! probe: `ERISDB_SERVER=<id> ERISDB_TOKEN=<erisdb1…> cargo run --example dial`.
 
 fn main() {
     let server = std::env::var("ERISDB_SERVER").expect("ERISDB_SERVER");

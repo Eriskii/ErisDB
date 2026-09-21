@@ -6,7 +6,7 @@
   Content-Security-Policy, inline because this is a single file served
   from anywhere — a file:// path, a static host, whatever.
 
-  script-src 'sha256-Sxxu/DWt8DEIYmS/2h2LmaoYRgsBUa9T2UIAci7WMP8=' 'sha256-2oURPQzQhf71gaus/YD5r40xTQ50+M5jTgtQbzs6cxc='; recompute
+  script-src 'sha256-Sxxu/DWt8DEIYmS/2h2LmaoYRgsBUa9T2UIAci7WMP8=' 'sha256-UqPy84V0OJdTefJ7fRwwCQNNqxZ6noqeV6VxIZ/O3nw='; recompute
   with:
 
     { printf '\n'; sed -n '/^<script>$/,/^<\/script>$/p' index.html \
@@ -23,7 +23,7 @@
   BarcodeDetector reads the <video> element directly with no canvas and
   no blob: URL in between.
 -->
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'sha256-Sxxu/DWt8DEIYmS/2h2LmaoYRgsBUa9T2UIAci7WMP8=' 'sha256-2oURPQzQhf71gaus/YD5r40xTQ50+M5jTgtQbzs6cxc='; style-src 'unsafe-inline'; connect-src *; base-uri 'none'; form-action 'none'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'sha256-Sxxu/DWt8DEIYmS/2h2LmaoYRgsBUa9T2UIAci7WMP8=' 'sha256-UqPy84V0OJdTefJ7fRwwCQNNqxZ6noqeV6VxIZ/O3nw='; style-src 'unsafe-inline'; connect-src *; base-uri 'none'; form-action 'none'">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>ErisDB · tasks</title>
 <style>
@@ -170,7 +170,7 @@
           <div id="scan-note" class="hint"></div>
 
           <label class="hint" for="cfg-ticket">Paste a pairing code</label>
-          <textarea id="cfg-ticket" rows="2" placeholder="bezel://pair/…"
+          <textarea id="cfg-ticket" rows="2" placeholder="erisdb://pair/…"
                     autocomplete="off" spellcheck="false"></textarea>
           <button id="cfg-pair" type="button">Pair</button>
 
@@ -178,7 +178,7 @@
             <summary>Enter details manually</summary>
             <div class="stack">
               <input id="cfg-url" placeholder="core url, e.g. http://127.0.0.1:7700">
-              <input id="cfg-token" placeholder="capability token (bz1.…)" type="password"
+              <input id="cfg-token" placeholder="capability token (erisdb1.…)" type="password"
                      autocomplete="off" spellcheck="false">
               <button id="cfg-save" type="button">Connect</button>
             </div>
@@ -245,11 +245,11 @@ const WANT_SAYS = {
 };
 
 const LS = {
-  config: "bezel.tasks.config",
-  items: "bezel.tasks.items",
-  cursor: "bezel.tasks.cursor",
-  notified: "bezel.tasks.notified",
-  outbox: "bezel.tasks.outbox",
+  config: "erisdb.tasks.config",
+  items: "erisdb.tasks.items",
+  cursor: "erisdb.tasks.cursor",
+  notified: "erisdb.tasks.notified",
+  outbox: "erisdb.tasks.outbox",
 };
 
 const $ = s => document.querySelector(s);
@@ -301,7 +301,7 @@ async function api(method, path, body, retry = true) {
     method,
     headers: {
       "Authorization": "Bearer " + session.token,
-      "X-Bezel-Client": CLIENT,
+      "X-ErisDB-Client": CLIENT,
       ...(body !== undefined ? { "Content-Type": "application/json" } : {}),
     },
     body: body !== undefined ? JSON.stringify(body) : undefined,
@@ -319,7 +319,7 @@ async function api(method, path, body, retry = true) {
 }
 
 // ---------------------------------------------------------------- capability
-// A token is `bz1.<b64url(payload)>.<b64url(sig)>` and the payload is JSON
+// A token is `erisdb1.<b64url(payload)>.<b64url(sig)>` and the payload is JSON
 // carrying an optional `exp` in unix seconds. The client reads exp to know
 // when to refresh; the signature is the core's business, and the token
 // goes nowhere but the API. It is never written back into the DOM: the
@@ -450,7 +450,7 @@ function disconnect() {
 }
 
 // ---------------------------------------------------------------- pairing
-// A ticket is `bezel://pair/<base64url-nopad(JSON)>` naming where the core
+// A ticket is `erisdb://pair/<base64url-nopad(JSON)>` naming where the core
 // is and carrying a pairing CODE. The format is docs/pairing.md, and it is
 // base64url of JSON precisely so that a browser reads one with atob and
 // JSON.parse and nothing else.
@@ -467,7 +467,7 @@ function disconnect() {
 // took it as far as raising a prompt on the operator's screen, naming an
 // app they did not install and asking for permissions they can refuse.
 
-const PAIR_PREFIX = "bezel://pair/";
+const PAIR_PREFIX = "erisdb://pair/";
 
 // These apps speak HTTP over fetch(). A ticket carrying only an endpoint
 // id names a core reachable over iroh, and no browser can dial one.
@@ -603,7 +603,7 @@ async function codeFetch(base, code, method, path, body, proof) {
     headers: {
       "Authorization": "Bearer " + code,
       ...(proof ? { "X-ErisDB-Client-Proof": proof } : {}),
-      "X-Bezel-Client": CLIENT,
+      "X-ErisDB-Client": CLIENT,
       ...(body !== undefined ? { "Content-Type": "application/json" } : {}),
     },
     body: body !== undefined ? JSON.stringify(body) : undefined,
@@ -931,31 +931,11 @@ const FACET_BODY = {
 // error nobody can act on.
 let facetMissing = false;
 
-/**
- * Register the facet, or bring a narrower registration up to this one.
- *
- * Runs only when the operator approved `meta:facets:write`. That grant is
- * asked for so a fresh core needs no terminal work, and doing without it is
- * an ordinary state rather than a failure: the app skips this entirely and
- * `permissionNote` says who to ask if the facet turns out to be missing.
- * Asking the core and taking a 403 for an answer would say the same thing
- * less politely.
- */
+/** Register the schema when absent and explicitly authorized. */
 async function ensureFacet() {
   if (!can("meta:facets:write")) return;
   const r = await api("POST", "/v1/items", { facet: "facet", body: FACET_BODY });
-  if (r.status === 201) { facetMissing = false; renderPermissions(); return; }
-  if (r.status !== 409) return;
-  // A registration under this name exists. Reading it is what says whether
-  // it is this one, and reading it needs its own grant.
-  if (!can("meta:facets:read")) return;
-  const facets = await api("GET", "/v1/items?facet=facet&limit=1000");
-  if (facets.status !== 200) return;
-  const reg = facets.body.items.find(i => i.body.name === FACET);
-  if (!reg) return;
-  const current = !!reg.body.schema?.properties?.repeat && !!reg.body.lapse;
-  if (current) return;
-  await api("PUT", "/v1/items/" + reg.id, { body: FACET_BODY, revision: reg.revision });
+  if (r.status === 201) { facetMissing = false; renderPermissions(); }
 }
 
 // ---------------------------------------------------------------- outbox
@@ -1219,7 +1199,7 @@ async function stream() {
   try {
     const res = await fetch(ErisDBAuth.baseURL(config.url) +
       `/v1/changes/stream?since=${cursor}&facet=${encodeURIComponent(FACET)}`, {
-      headers: { "Authorization": "Bearer " + config.token, "X-Bezel-Client": CLIENT },
+      headers: { "Authorization": "Bearer " + config.token, "X-ErisDB-Client": CLIENT },
       signal: ctl.signal, redirect: "error", cache: "no-store",
     });
     if (res.status === 401) { expired(); return false; }

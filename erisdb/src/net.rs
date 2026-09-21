@@ -16,11 +16,11 @@ use iroh::{Endpoint, EndpointAddr};
 use tower::ServiceExt;
 
 /// The erisdb wire protocol: HTTP/1.1 inside QUIC bi-streams.
-pub const ALPN: &[u8] = b"bezel/0";
+pub const ALPN: &[u8] = b"erisdb/0";
 
 /// Domain-separation tag for deriving the iroh key from the deployment
 /// secret. Changing this string changes every deployment's iroh identity.
-const IROH_KEY_TAG: &[u8] = b"bezel/iroh-endpoint-key/0";
+const IROH_KEY_TAG: &[u8] = b"erisdb/iroh-endpoint-key/0";
 
 /// The endpoint's ed25519 key, derived deterministically from the
 /// deployment secret (HMAC-SHA256 as a KDF, domain-separated). Same

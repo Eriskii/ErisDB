@@ -9,8 +9,7 @@ android {
     namespace = "dev.erisdb.lists"
     compileSdk = 37
     defaultConfig {
-        // Preserve installed app data when updating from the previous name.
-        applicationId = "dev.bezel.lists"
+        applicationId = "dev.erisdb.lists"
         minSdk = 24
         targetSdk = 36
         // Matches the CLIENT string this app pairs and writes under, which

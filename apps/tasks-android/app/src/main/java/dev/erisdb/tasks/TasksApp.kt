@@ -73,7 +73,7 @@ private sealed class Screen {
 }
 
 /**
- * @param pairUri the `bezel://pair/…` this app was opened with, from the
+ * @param pairUri the `erisdb://pair/…` this app was opened with, from the
  *   camera app's scan or any other link — null on an ordinary launch.
  * @param onPairHandled called once that ticket has been acted on, so the
  *   same one does not land twice.
@@ -195,7 +195,7 @@ fun TasksApp(pairUri: String? = null, onPairHandled: () -> Unit = {}) {
     }
 
     /**
-     * Act on a `bezel://pair/…` ticket, from a scan or a paste. A ticket
+     * Act on a `erisdb://pair/…` ticket, from a scan or a paste. A ticket
      * that would replace a working config is asked about first; one that
      * cannot be read says what was wrong with it and changes nothing.
      */

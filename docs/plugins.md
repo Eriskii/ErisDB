@@ -150,7 +150,7 @@ The shipped `erisdb-plugin-openai` forwards `input` as the request body of
 `POST /v1/chat/completions`. It does not reinterpret messages, tools,
 `tool_choice`, structured output settings, model-specific options, or future
 fields. OpenAI's JSON response or SSE stream is returned unchanged.
-The upstream contract is the
+The plugin uses the
 [OpenAI Chat Completions reference](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create).
 
 Function tools behave exactly as they do through the OpenAI API: the model's

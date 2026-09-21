@@ -1,28 +1,25 @@
-# erisdb-mcp
+# ErisDB MCP client
 
-The core's API as MCP tools — everything a clod needs to read tables,
-search, write, delete, and audit an ErisDB. Built on rmcp (the official MCP
-Rust SDK), speaking MCP over stdio; the server is just another client
-holding a capability token, so what the token grants is the outer bound of
-what the tools can do. Hand it a read-only token and every write comes
-back as a tool error.
+This is a separate client application. An MCP host launches the `erisdb-mcp`
+binary over stdio. The application calls ErisDB's HTTP API using its own paired
+installation credential. The ErisDB server does not import or launch this program.
 
-That bound is not the only one. Three things a token cannot express — do
-not hand the model a credential, do not let it answer a prompt that
-exists so a *human* answers it, and do not let it overwrite a record it
-only half read — are held here instead, by two env switches and by
-making the dangerous field required.
+Build it from the repository root with:
+
+```sh
+cargo build --release --manifest-path clients/mcp/Cargo.toml
+```
 
 ## Pair a connection
 
 ```sh
-erisdb-mcp pair 'bezel://pair/…' \
+erisdb-mcp pair 'erisdb://pair/…' \
   --grant tasks:read,tasks:create,meta:facets:read
 # Compare the fingerprint and approve on the core's terminal.
 erisdb-mcp
 ```
 
-The connector remembers its pairing automatically in your user configuration
+The client remembers its pairing automatically in your user configuration
 directory. Restarting it requires no token, URL or file-path setup. To give two
 applications independent permissions and revocation, use `--profile coding` and
 `--profile chat` respectively, both when pairing and in each application's MCP
@@ -38,7 +35,7 @@ directory. Credential files have Unix mode 0600 and are never returned through
 MCP tools. `--session-file PATH` / `ERISDB_SESSION_FILE` remains an advanced storage
 override. `--profile NAME` also accepts `ERISDB_PROFILE`. An HTTPS URL is required
 remotely; localhost HTTP is accepted. An Iroh-only ticket needs `--url` naming its
-HTTPS endpoint because this bridge speaks HTTP.
+HTTPS endpoint because this client uses HTTP.
 
 Access renews after expiry, including after process restart, using the installation
 secret in that file. Revocation is checked by the core on each call. Only an explicit
@@ -48,7 +45,7 @@ cleanup needed. An existing saved login remains usable with its current permissi
 
 Existing `ERISDB_URL` plus `ERISDB_TOKEN_FILE`/`ERISDB_TOKEN` configuration still
 works with manual tokens and their original lifetime. For individually revocable,
-automatically renewing access, pair instead. See [client administration](../docs/clients.md).
+automatically renewing access, pair instead. See [client administration](../../docs/clients.md).
 
 ## Tools
 
@@ -199,7 +196,7 @@ ERISDB_MCP_MAX_MINT_TTL    ceiling on the lifetime of any token this server
                           Default 86400.
 ```
 
-For manual tokens, prefer `ERISDB_TOKEN_FILE`. A token in `--env ERISDB_TOKEN=bz1.…` is written
+For manual tokens, prefer `ERISDB_TOKEN_FILE`. A token in `--env ERISDB_TOKEN=erisdb1.…` is written
 in cleartext into the MCP client's config, ends up in this process's
 environment where anything else running as you can read it, and tends to
 be copied into shell history and screenshots on the way. A path is a
@@ -263,8 +260,7 @@ dependency — so a bare clone of this repo builds and tests on its own. The
 tests that need a core find one in this order:
 
 1. `ERISDB_BIN`, if it names an executable.
-2. `../erisdb`, built on demand — this repo cloned inside a ErisDB
-   checkout, as `ErisDB/erisdb-mcp`, next to `erisdb/`.
+2. `../../erisdb`, the server crate in this repository, built on demand.
 3. `erisdb` on `PATH`.
 
 Missing prerequisites fail the suite; real-core tests are never silently skipped.

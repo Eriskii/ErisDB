@@ -53,20 +53,10 @@ new client cost zero backend changes: register a facet with
 `meta:facets:write`, pair the client, approve the grants it asks for. There
 is no deploy, no allowlist, and no core release in that path.
 
-**The core carries grants it does not understand.** A permission whose
-namespace is not a facet, or whose action is not one of the four, is stored,
-delegated and enclosed like any other — the core just never requires it. A
-bridge can define `imap:sync` and enforce it itself, and the token, the
-approval screen and the enclosure rules all handle it correctly without the
-core knowing what IMAP is.
-
-One-shot plugins make that enforcement concrete. Each operation manifest
-names one required permission under the plugin namespace: the shipped
-OpenAI operation requires `openai:chat`; a future IMAP executable might
-declare `imap:search` and `imap:sync`. `POST /v1/call` reads the manifest,
-requires that permission, validates the operation input, and only then
-starts the executable. No plugin permission implies any facet permission,
-or vice versa, unless a wildcard grant explicitly covers both.
+Operation manifests name their required permissions. The shipped OpenAI
+operation requires `openai:chat`. `POST /v1/call` checks that permission and
+validates the input before starting the executable. This grant gives no access
+to stored items; facet permissions are checked separately.
 
 ## Meta permissions
 

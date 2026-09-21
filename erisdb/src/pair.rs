@@ -285,7 +285,7 @@ mod tests {
 
     #[test]
     fn blocks_render_a_square_with_a_quiet_zone() {
-        let art = to_blocks("bezel://pair/test").expect("encodes");
+        let art = to_blocks("erisdb://pair/test").expect("encodes");
         let lines: Vec<&str> = art.lines().collect();
         assert!(!lines.is_empty());
         let width = lines[0].chars().count();
@@ -306,7 +306,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("erisdb-qr-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("t.png");
-        write_png("bezel://pair/test", &path, 4).expect("writes");
+        write_png("erisdb://pair/test", &path, 4).expect("writes");
         let bytes = std::fs::read(&path).unwrap();
         assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n", "not a png");
         assert!(bytes.len() > 100);
@@ -353,7 +353,7 @@ mod tests {
     fn a_ticket_sized_payload_still_encodes() {
         // A real ticket is an endpoint id plus a token: several hundred
         // characters, which is the case that has to keep working.
-        let payload = format!("bezel://pair/{}", "A".repeat(600));
+        let payload = format!("erisdb://pair/{}", "A".repeat(600));
         assert!(to_blocks(&payload).is_ok());
     }
 }

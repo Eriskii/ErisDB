@@ -59,43 +59,16 @@ replica reads it. Two things are per-replica and worth knowing:
 The e2e suite pins this: two replicas over one store, an item written
 through one and read through the other immediately.
 
-## Migrations
+## Database initialization
 
-The migrations are compiled into the binary (`sqlx::migrate!`) and run at
-the start of every `erisdb serve`. There is no separate migrate step, no
-migrations directory to ship, and no way for the binary and the schema it
-expects to disagree.
+`erisdb serve` runs the embedded `0001_init.sql` before opening its listeners.
+It creates `items`, `changes`, and `clients`, the facet and pairing definitions,
+and the `safe_ts` function. SQLx records the schema checksum and verifies it on
+subsequent starts. Concurrent starts are serialized by SQLx's database lock.
+A schema error stops startup.
 
-The practical consequences:
-
-- **Deploying is replacing the binary and restarting.** The new one
-  migrates on the way up.
-- **Rollback needs a compatible binary and data model.** A pre-registry binary
-  cannot enforce installation binding or revocation; do not roll back to one
-  after enabling registered clients.
-- **Two replicas starting at once are fine.** sqlx takes a lock; the
-  second waits and then finds nothing to do.
-- **A migration that fails stops the process** with `migrating the store`
-  in the message. It does not serve on a half-migrated schema.
-
-Seven migrations exist. `0001_init` creates `items` and `changes` and
-bootstraps the `facet` meta-facet. `0002_lapse` adds the `lapsed` op and
-the `safe_ts` helper. `0003_source_history` adds attribution and the body
-snapshots that make the feed a full audit log. `0004_safe_ts_stable`
-corrects `safe_ts` to `STABLE`, because `'now'::timestamptz` reads the
-clock and an `IMMUTABLE` declaration would let the planner constant-fold a
-call — and would silently corrupt any expression index built on it.
-`0005_namespaced_permissions` moves the schema version out of facet names
-and into their bodies, rewrites `items.facet` and `changes.facet` to
-match, grows the meta-facet with `version` and `permissions`, and
-bootstraps the `pair` facet. `0006_registered_clients` adds the installation
-registry and denies unfinished pairings without installation binding.
-`0007_one_active_registration` enforces one active registration per identity,
-audits retirement of duplicates, and denies uncollected approvals lacking a
-registration revision anchor. See [migration and recovery](clients.md#migration-and-recovery).
-
-`0005` is also the one to read before rolling a binary backwards, since a
-core that predates it looks for `tasks/v1` and finds `tasks`.
+This version initializes a fresh ErisDB database. It contains no upgrade or
+import path for earlier schemas, credentials, or application storage.
 
 ## The poker
 
@@ -214,15 +187,15 @@ Rotating `ERISDB_SECRET` does exactly one irreversible thing, or two:
 - **Outstanding token signatures become invalid.** Registered installations
   can renew using their installation proof. Manual tokens must be re-minted.
 - **The address moves too, unless `ERISDB_IROH_SECRET` is set separately.**
-  Every Android client, every MCP config, every `erisdb-client` caller is
+  Every Android client and every `erisdb-client` caller is
   pinned to an endpoint id, and after a rotation they dial an address
   nobody answers. Print the new one with `erisdb endpoint-id` and re-pin
   each of them.
 
 Revoke one paired installation with `erisdb clients revoke CLIENT_UUID`.
 This immediately blocks subsequent access, renewal and active change feeds.
-Legacy/manual tokens without a registration still require expiry or signing-key
-rotation. [Client administration](clients.md) explains migration and recovery.
+Manual tokens without a registration still require expiry or signing-key
+rotation. [Client administration](clients.md) explains renewal and revocation.
 
 `/etc/erisdb/*.env` stays mode 0600 and root-owned: systemd reads it as the
 manager, before dropping to the `erisdb` user, so the service account never
@@ -234,7 +207,7 @@ Two paths into the same router, with very different properties. The
 [root README](../README.md#transport) has the summary; the operational
 reading is:
 
-**Iroh is the reachable path.** ALPN `bezel/0`, HTTP/1.1 per QUIC
+**Iroh is the reachable path.** ALPN `erisdb/0`, HTTP/1.1 per QUIC
 bi-stream, authenticated and encrypted end to end by the transport, with
 no port to forward and no certificate to manage. The endpoint id is public
 and stable by design, so anyone may dial — and nobody reads or writes
@@ -272,7 +245,7 @@ Bounds the core enforces, and what hitting one looks like:
 | Iroh connections | 64 | The connection is dropped, with a warning logged. Bounded *before* authentication, because the endpoint id is public and a capability check costs more than a refusal. |
 | Iroh streams per connection | 32 | The stream is dropped, with a warning naming the peer. |
 | Capability endpoints | burst 10, then 1 per 5s | **429** `too_many_requests`, per caller, per replica. Checked before authorization, so a caller that cannot mint at all still sees 429 rather than 403. |
-| `X-Bezel-Client` | 128 chars, printable ASCII | **400**. It lands in every change row this caller writes. |
+| `X-ErisDB-Client` | 128 chars, printable ASCII | **400**. It lands in every change row this caller writes. |
 | Grants per token / grant length | 64 / 128 chars | **400** at mint. |
 | Refresh chain over HTTP | 365 days | **400**. The CLI has no ceiling; it holds the secret. |
 | Pairing code lifetime | 60s to 1h, default 10m | Clamped silently, not refused. |
@@ -284,7 +257,7 @@ The rate-limit key is the authenticated `iroh:<endpoint id>` over QUIC and
 the actual peer IP over TCP. Opening new TCP connections does not reset a bucket.
 Clients behind the same local TLS proxy share its bucket; forwarded headers do
 not override the observed peer. Buckets are per replica and cover minting,
-legacy refresh and registered renewal.
+manual-token refresh and registered renewal.
 
 ## Watching it
 
@@ -296,7 +269,7 @@ journalctl -u erisdb -f
 journalctl -u erisdb-poker.service --since -1h
 ```
 
-Three lines are worth watching for:
+The server logs these events:
 
 - `rejected capability token` — warn, with the path and the peer. A
   refused token is the only trace of somebody probing, and also what a

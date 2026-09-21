@@ -68,7 +68,7 @@ Browsers and MCP accept HTTPS remotely and HTTP only on localhost. HTTP
 redirects are refused for credential-bearing calls. Run the core's TCP listener
 on loopback behind a local TLS reverse proxy. The registry's HTTP authentication
 checks the actual loopback TCP peer, never `Forwarded` or `X-Forwarded-For`.
-A reverse proxy on another host/container bridge needs a local forwarding hop;
+A reverse proxy on another host or container needs a local forwarding hop;
 do not expose an unencrypted proxy on a remote interface. Iroh supplies its own
 mutually authenticated encryption and needs no TLS proxy.
 
@@ -108,18 +108,7 @@ before emitting another event and close when revoked. This does not undo data
 already delivered or transactions already authorized and in flight. Plugin
 invocations are authorized at invocation, not retroactively cancelled.
 
-## Migration and recovery
-
-Migration 0006 adds the registry and denies old unfinished pairings, because they
-have no installation binding. Cut fresh QR tickets after updating core and apps.
-Already issued legacy tokens remain valid under their existing scope and expiry;
-they have no `client` claim and cannot be individually revoked. Re-pair apps to
-register them. Manual/operator tokens keep their bounded refresh-chain behavior.
-
-Migration 0007 enforces one active registration per proof. If an early registry
-contains duplicates, it retains the newest and revokes the older registrations
-with audit records. Approved but uncollected pairings without revision anchors
-are denied and must be restarted.
+## Signing keys and backups
 
 Signing-key rotation invalidates old token signatures, but a registered client
 can obtain a new token using its still-valid installation proof. Revoke the

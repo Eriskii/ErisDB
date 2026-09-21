@@ -1,15 +1,10 @@
-# ErisDB API reference
+# ErisDB server API
 
-This is the reference for the implemented public API: all core HTTP routes
-(also available over Iroh), pairing tickets, MCP tools, the Rust client, its
-blocking/Android interface, and the plugin process protocol. Operator CLI
-commands are indexed at the end.
-
-The contract is checked against [the router](../erisdb/src/api.rs),
-[installation authentication](../erisdb/src/installation.rs),
-[the MCP bridge](../erisdb-mcp/src/main.rs), and
-[the native client](../erisdb-client/src/lib.rs). Examples use illustrative IDs,
-timestamps and credentials; obtain real values from your running core.
+The server exposes the HTTP routes below over TCP and authenticated Iroh.
+Routes are implemented in [api.rs](../erisdb/src/api.rs), with installation
+authentication in [installation.rs](../erisdb/src/installation.rs).
+Examples use illustrative IDs, timestamps and credentials; obtain those values
+from your running server.
 
 ## Contents
 
@@ -25,19 +20,14 @@ timestamps and credentials; obtain real values from your running core.
 - [Pairing](#pairing)
 - [Registered installations](#registered-installations)
 - [Plugins](#plugins)
-- [MCP tools](#mcp-tools)
-- [Rust client API](#rust-client-api)
-- [Blocking and Android API](#blocking-and-android-api)
 - [Operator CLI](#operator-cli)
 - [Limits](#limits)
 
 ## Conventions and authentication
 
 The core serves `/v1` on plain HTTP, default `127.0.0.1:7700`, and on HTTP/1.1
-streams inside authenticated Iroh QUIC using ALPN `bezel/0`. The routes and
+streams inside authenticated Iroh QUIC using ALPN `erisdb/0`. The routes and
 payloads are shared; transport identity affects authentication and attribution.
-The old ALPN, `bezel://pair/` scheme, `bz1` token prefix and `X-Bezel-Client`
-header are compatibility identifiers, not separate products.
 
 Use HTTPS remotely, with the core behind a **local** TLS reverse proxy; HTTP is
 supported on localhost. Registered HTTP access, enrollment and renewal require
@@ -46,10 +36,10 @@ check. Native Iroh clients use the authenticated QUIC identity instead.
 
 | Credential | Used for | How it is sent |
 |---|---|---|
-| Operator/manual token | Routes allowed by its grants | `Authorization: Bearer bz1.…` |
+| Operator/manual token | Routes allowed by its grants | `Authorization: Bearer erisdb1.…` |
 | Pairing capability | Redeem and poll one temporary pairing session | Same bearer header; the signed token names that session |
 | Registered access token | Data and administrative routes allowed by its effective grants | Same bearer header; the signed token names its installation |
-| Browser/MCP installation secret | Collect approval and renew access | `X-ErisDB-Client-Proof: SECRET`; renewal needs no bearer token |
+| HTTP installation secret | Collect approval and renew access | `X-ErisDB-Client-Proof: SECRET`; renewal needs no bearer token |
 | Native installation private key | Collect approval, access and renew | Possession is proved by the Iroh transport; never send the private key in JSON |
 
 Only the application health route is unauthenticated. `POST /v1/clients/{id}/refresh`
@@ -62,7 +52,7 @@ For every registered request, Postgres supplies the installation's current
 status and grants. Effective grants are the intersection of the token's grants
 and the registration's grants. Native access additionally requires the matching
 Iroh key. Missing, expired or revoked authority yields 401; insufficient grants
-yield 403. Legacy/manual tokens have no installation and keep their bounded
+yield 403. Manual tokens have no installation and keep their bounded
 refresh-chain semantics.
 
 Bodies use `Content-Type: application/json`. Responses are JSON except 204,
@@ -77,16 +67,16 @@ HEAD on `/v1/pair/status` as a side-effect-free probe: that handler can collect
 an approval. These framework methods are implicit, not additional application
 operations in the route table.
 
-`X-Bezel-Client` is an optional printable-ASCII attribution label, at most 128
+`X-ErisDB-Client` is an optional printable-ASCII attribution label, at most 128
 bytes. It authenticates nothing. There are no cookies, query-string tokens,
 HTTP PATCH operations, item upsert routes, bulk routes, or server-side search
-route. MCP's `search_items` performs a bounded scan using item reads.
+route.
 
 ## Example setup
 
 Shell examples use Bash, curl, jq, and Python 3. Point these variables at a
 running development core. The creation examples write real data; use a facet
-whose contract matches the example body.
+whose schema matches the example body.
 
 ```bash
 BASE=http://127.0.0.1:7700
@@ -99,7 +89,7 @@ api() {
   curl --fail-with-body --silent --show-error \
     --request "$method" "$BASE$path" \
     --header "Authorization: Bearer $TOKEN" \
-    --header 'X-Bezel-Client: API examples' \
+    --header 'X-ErisDB-Client: API examples' \
     --header 'Content-Type: application/json' "$@"
 }
 ```
@@ -137,13 +127,11 @@ in `clients` are separate objects, not generic items.
 | `body` | JSON value checked against the facet's schema when strict; commonly an object, but the API itself accepts any JSON value |
 | `revision` | Signed 64-bit integer, initially 1; increments on body updates |
 | `created_at`, `updated_at` | RFC 3339 timestamps |
-| `source` | JSON attribution or null for some migration-created rows |
+| `source` | JSON attribution or null for initialized facet definitions |
 
 Normal request attribution has `addr` (observed TCP peer or `iroh:ENDPOINT_ID`),
 `user` (signed token label), `client` (self-declared header), and `installation`
-(authenticated registration UUID). Individual values may be null. Migration
-attribution can instead be an object such as `{"migration":"…"}`. Do not
-assume every source has exactly the normal request fields.
+(authenticated registration UUID). Individual values may be null.
 
 Postgres stores bodies as JSONB: key ordering is not preserved and duplicate
 object keys collapse. Timestamps and revisions are server-owned.
@@ -170,7 +158,7 @@ object keys collapse. Timestamps and revisions are server-owned.
 | `facet` | Item namespace, or `system` for ticks/installation events |
 | `op` | `created`, `updated`, `deleted`, `tick`, or `lapsed` |
 | `at` | Database transaction timestamp, not a substitute for `seq` ordering |
-| `body` | Snapshot after this change; null for deletes/ticks and some legacy migration rows |
+| `body` | Snapshot after this change; null for deletes and ticks |
 | `revision` | Snapshot revision, or null when no snapshot exists |
 | `source` | Attribution as above |
 
@@ -255,7 +243,7 @@ Branch on the status and `error`; `detail` is human-readable and may change.
 | 409 | `revision_conflict` | Stale item/installation revision or stale pairing approval anchor |
 | 409 | `conflict` | Duplicate facet name or invalid pairing-state transition |
 | 422 | `unknown_facet` | Write to an unregistered facet |
-| 422 | `schema_violation` | Item body violates the facet contract |
+| 422 | `schema_violation` | Item body violates the facet schema |
 | 422 | `plugin_schema_violation` | Plugin input violates its manifest schema |
 | 429 | `too_many_requests` | Shared mint/refresh/installation-renewal bucket exhausted |
 | 503 | `unavailable` | Change-stream or plugin-process capacity reached |
@@ -332,14 +320,14 @@ The built-in meta-facet accepts these registration body fields and rejects other
 | `name` | Required | Unique namespace; reserved core names cannot be registered by an app |
 | `schema` | Required object | JSON Schema for item bodies; `{}` accepts any JSON value |
 | `strict` | Default true | Enforce the schema on writes |
-| `version` | Optional integer ≥ 1 | Contract metadata; does not change the namespace or migrate existing items |
+| `version` | Optional integer ≥ 1 | Schema metadata; does not change the namespace or migrate existing items |
 | `permissions` | Optional object | Action → human-readable description, for example `{"create":"Add notes"}` |
 | `lapse` | Optional object | Required `due` field name, optional `done` field name; the tick sweep uses them |
 
 Local `$ref` values are supported; external references are refused. Changing a
 schema affects subsequent writes, not a retroactive rewrite of existing items.
-See [facet contracts](facets.md) for schema and lapse examples.
-If `notes` already exists, read its contract instead of registering it twice (409).
+See [facet schemas](facets.md) for schema and lapse examples.
+If `notes` already exists, read its schema instead of registering it twice (409).
 
 ```bash
 ITEM_JSON=$(api POST /v1/items --data \
@@ -508,7 +496,7 @@ per edit. Ticks do not themselves rewrite item bodies.
 ### `POST /v1/capabilities`
 
 Requires `meta:capabilities:mint`. Issues a token enclosed by the caller's
-**effective** grants and token lifetime. **201** `{"token":"bz1.…"}`.
+**effective** grants and token lifetime. **201** `{"token":"erisdb1.…"}`.
 
 | JSON field | Required | Behavior |
 |---|---|---|
@@ -532,11 +520,11 @@ Delegation from a registered token retains its installation ID, so current grant
 identity binding and revocation still apply to the child. A child token alone
 cannot obtain the installation's independent renewal authority.
 
-Token format is `bz1.BASE64URL(JSON).BASE64URL(HMAC_SHA256)`, without base64
+Token format is `erisdb1.BASE64URL(JSON).BASE64URL(HMAC_SHA256)`, without base64
 padding. The signed payload contains `grants` and optional `exp`, `max_exp`,
 `user`, `pair` (pairing session), and `client` (installation UUID). Unix deadlines
 are seconds. Payloads are signed, not encrypted; decoding is not verification.
-See [capability semantics](capabilities.md) for the exact signing contract.
+See [capability semantics](capabilities.md) for the signing format.
 
 ### `POST /v1/capabilities/refresh`
 
@@ -544,7 +532,7 @@ Requires a still-valid bearer token, no extra grant. Body: required positive
 integer `ttl_secs`. **201**:
 
 ```json
-{"token":"bz1.…","exp":1790000300,"chain_ends":1790003600}
+{"token":"erisdb1.…","exp":1790000300,"chain_ends":1790003600}
 ```
 
 ```bash
@@ -613,7 +601,7 @@ collection with the same proof is permitted while the ticket remains live.
 QR, deep links and pasted tickets contain exactly the same URI:
 
 ```text
-bezel://pair/BASE64URL_WITHOUT_PADDING(JSON)
+erisdb://pair/BASE64URL_WITHOUT_PADDING(JSON)
 ```
 
 | JSON field | Required | Meaning |
@@ -624,8 +612,7 @@ bezel://pair/BASE64URL_WITHOUT_PADDING(JSON)
 | `url` | At least one of `eid`/`url` | HTTP client base URL; HTTPS remotely, HTTP localhost |
 | `name` | No | Untrusted display label for the core |
 
-Native clients need `eid`; browser/MCP HTTP clients need `url` (MCP also permits
-an explicit URL override). There is no mDNS or short-code broker API. The operator
+Iroh clients need `eid`; HTTP clients need `url`. There is no mDNS or short-code broker API. The operator
 CLI creates both the URI and terminal QR, optionally a PNG:
 
 ```bash
@@ -639,7 +626,7 @@ Requires `meta:pairing:create`. Optional JSON body with integer `ttl_secs`;
 default 600 seconds, clamped to 60–3600. **201**:
 
 ```json
-{"id":"ad6caf6b-ece2-442a-a178-a93cc5aa0802","secret":"bz1.…","expires":1790000600}
+{"id":"ad6caf6b-ece2-442a-a178-a93cc5aa0802","secret":"erisdb1.…","expires":1790000600}
 ```
 
 ```bash
@@ -781,7 +768,7 @@ After approval, **200**:
 ```json
 {
   "status":"approved","granted":["notes:read","notes:create"],
-  "token":"bz1.…","client_id":"ad6caf6b-ece2-442a-a178-a93cc5aa0802",
+  "token":"erisdb1.…","client_id":"ad6caf6b-ece2-442a-a178-a93cc5aa0802",
   "exp":1790003600,"fingerprint":"12AB-34CD-56EF"
 }
 ```
@@ -847,7 +834,7 @@ human approval creates a new UUID so older tokens stay invalid.
 |---|---|
 | `id` | Registration UUID; not necessarily the latest pairing session UUID |
 | `name` | App's untrusted display name |
-| `identity` | `{kind:"iroh",key:ENDPOINT_ID}` or `{kind:"browser",key:S256_COMMITMENT}`; HTTP MCP uses `browser` too |
+| `identity` | `{kind:"iroh",key:ENDPOINT_ID}` or `{kind:"browser",key:S256_COMMITMENT}` |
 | `requested` | Grant ceiling from the latest successful enrollment |
 | `grants` | Current approved grant set |
 | `user_name` | Optional signed attribution label used in newly issued tokens |
@@ -916,7 +903,7 @@ Native clients make the same request over their persistent Iroh identity and
 omit the HTTP proof header. **200**:
 
 ```json
-{"token":"bz1.…","exp":1790003600,"grants":["notes:read"],"client_id":"ad6caf6b-ece2-442a-a178-a93cc5aa0802"}
+{"token":"erisdb1.…","exp":1790003600,"grants":["notes:read"],"client_id":"ad6caf6b-ece2-442a-a178-a93cc5aa0802"}
 ```
 
 Works after the previous access token expires and after signing-key rotation,
@@ -1006,7 +993,7 @@ timeout kills the child; there is no automatic replay of an ambiguous invocation
 Plugins are operator-installed executables, not network registrations. A manifest
 loaded with `erisdb serve --plugin-dir DIR` has these fields:
 
-| Field | Required / default | Contract |
+| Field | Required / default | Meaning |
 |---|---|---|
 | `protocol` | Required | `1` |
 | `name` | Required | Lowercase permission-segment name |
@@ -1046,270 +1033,6 @@ the core captures only a bounded amount. Header limit: 16 KiB; retained stderr:
 64 KiB. Full process behavior and the shipped manifest are in
 [the plugin guide](plugins.md) and [deploy/plugins/openai.json](../deploy/plugins/openai.json).
 
-## MCP tools
-
-`erisdb-mcp` exposes **17 tools over MCP stdio**. It is an HTTP client of the
-core, so core permissions and registration revocation remain authoritative.
-It advertises tools, not custom resources or prompts. Use MCP initialization,
-then `tools/list` to obtain the runtime JSON schemas and `tools/call` to invoke.
-Messages on stdio are newline-delimited JSON-RPC, not core HTTP requests.
-
-Pair and start a profile:
-
-```bash
-erisdb-mcp pair 'bezel://pair/PASTE_REAL_PAYLOAD' --profile notes \
-  --grant notes:read,notes:create,notes:update,meta:facets:read
-erisdb-mcp --profile notes
-```
-
-The bridge remembers its installation automatically. The default profile is
-`default`; `--profile`/`ERISDB_PROFILE` selects another identity. Advanced storage
-is `--session-file`/`ERISDB_SESSION_FILE`. `pair` also accepts `--name` and `--url`
-(`ERISDB_URL`) for an Iroh-only ticket. Manual-token mode uses `ERISDB_URL` plus
-`ERISDB_TOKEN_FILE` or `ERISDB_TOKEN`; an explicit profile/storage override selects
-paired mode. Pairing renews automatically after a core 401, then retries once;
-ambiguous transport failures do not repeat writes. See [MCP setup](../erisdb-mcp/README.md).
-
-### Tool arguments and examples
-
-Every row below gives a complete example `arguments` object. Fields marked `?`
-are optional. IDs/revisions refer to existing records.
-
-| Tool | Arguments | Example `arguments` | Result / authority |
-|---|---|---|---|
-| `list_facets` | None | `{}` | `{items:[…]}`; reads `facet`, limit 1000; `meta:facets:read` |
-| `read_items` | `facet: string`, `updated_since?: string`, `limit?: integer` | `{"facet":"notes","limit":20}` | Core item-list result; facet read |
-| `get_item` | `id: string` | `{"id":"a871b3bb-a77b-4fbd-a289-6f7d04e03c3a"}` | Item; facet read |
-| `search_items` | `query: string`, `facet?: string`, `limit?: nonnegative integer` | `{"query":"note","facet":"notes","limit":20}` | `{items,scanned_facets,truncated}`; readable facets only |
-| `create_item` | `facet: string`, `body: JSON` | `{"facet":"notes","body":{"title":"MCP note","done":false}}` | Item; facet create |
-| `update_item` | `id: string`, `body: JSON`, `revision: integer` | `{"id":"a871b3bb-a77b-4fbd-a289-6f7d04e03c3a","body":{"title":"Edited","done":false},"revision":1}` | Replaces whole body; facet update |
-| `delete_item` | `id: string`, `confirm: boolean` | `{"id":"a871b3bb-a77b-4fbd-a289-6f7d04e03c3a","confirm":false}` | False previews with facet read; true deletes with facet delete |
-| `item_history` | `id: string` | `{"id":"a871b3bb-a77b-4fbd-a289-6f7d04e03c3a"}` | `{history:[…]}`; facet read |
-| `revert_item` | `id: string`, `seq: integer`, `revision: integer` | `{"id":"a871b3bb-a77b-4fbd-a289-6f7d04e03c3a","seq":42,"revision":2}` | New Item revision; facet update |
-| `read_changes` | `since?: integer`, `facet?: string`, `limit?: integer` | `{"since":0,"facet":"notes","limit":100}` | `{changes,next}`; same feed authority as HTTP |
-| `mint_capability` | `grants: string[]`, `ttl_secs: integer`, `user?: string` | `{"grants":["notes:read"],"ttl_secs":300}` | `{token,ttl_secs}`; mint grant and operator switch |
-| `my_permissions` | None | `{}` | Effective core permissions; valid credential |
-| `server_state` | None | `{}` | Core state; `meta:server:read` |
-| `list_pairings` | None | `{}` | `{pairings:[…]}`; `meta:pairing:read` |
-| `get_pairing` | `id: string` | `{"id":"ad6caf6b-ece2-442a-a178-a93cc5aa0802"}` | Compact session; `meta:pairing:read` |
-| `approve_pairing` | `id: string`, `granted: string[]`, `ttl_secs?: integer`, `user?: string` | `{"id":"ad6caf6b-ece2-442a-a178-a93cc5aa0802","granted":["notes:read"],"ttl_secs":300}` | Compact session plus top-level `ttl_secs`; approve grant and operator switch |
-| `deny_pairing` | `id: string` | `{"id":"ad6caf6b-ece2-442a-a178-a93cc5aa0802"}` | Denied session; `meta:pairing:approve` |
-
-Example call after MCP initialization:
-
-```json
-{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"read_items","arguments":{"facet":"notes","limit":20}}}
-```
-
-Success is a standard MCP result containing a text block whose text is the
-pretty-printed core JSON. A successful empty HTTP response becomes `{"ok":true}`:
-
-```json
-{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"{\"items\":[]}"}],"isError":false}}
-```
-
-Core failures become tool results with `isError: true` and text such as
-`HTTP 403: {"error":"forbidden",…}`. Transport failures and local policy
-refusals also use tool errors. Protocol/argument errors may instead be JSON-RPC
-errors. Do not treat receipt of a JSON-RPC result alone as tool success.
-
-### MCP-specific behavior
-
-- `search_items` is a case-insensitive substring match against serialized bodies
-  or exact case-insensitive item ID. Default hit limit 50, clamped to 1–200;
-  scans at most 25 facets and the first 1000 items per facet. Without `facet`,
-  it first needs `meta:facets:read`. Facet reads that fail are skipped. `truncated`
-  marks hit/facet limits, but does not detect every per-facet 1000-item truncation;
-  this is a convenience search, not an exhaustive database query.
-- `delete_item(confirm=false)` returns `{deleted:false,item,next}`. With true,
-  it calls unconditional HTTP DELETE: there is no revision argument on this tool.
-- `mint_capability` is disabled unless `ERISDB_MCP_ALLOW_MINT=1`; its token appears
-  in tool text. `approve_pairing` is disabled unless `ERISDB_MCP_ALLOW_APPROVE=1`,
-  requires explicit nonempty `granted`, and refuses bare `*`.
-- Both tools cap requested TTL to `ERISDB_MCP_MAX_MINT_TTL` (default 86400 seconds).
-  Approval defaults to that TTL, still subject to the core's seven-day ceiling.
-  This cap is an access-token lifetime, not an installation-renewal deadline.
-- There are currently no MCP tools for client-registry administration, plugin
-  invocation, ticks or live subscriptions. Use their HTTP/Iroh endpoints.
-
-## Rust client API
-
-Crate: `erisdb-client`, library name `erisdb_client`. It uses Iroh, not the
-core's TCP URL. All asynchronous methods return `anyhow::Result<…>`.
-
-### Entry points
-
-`Client::dial(server: &str, token: &str, client_name: &str,
-identity: Option<[u8;32]>) -> Result<Client>` is async. `server` is a bare endpoint
-ID, `iroh:ID`, or JSON-serialized Iroh `EndpointAddr`. `dial_addr` takes an
-`EndpointAddr` directly. Supplying `None` creates a fresh key; registered clients
-must preserve and reuse their actual installation key. Dialing binds the local
-endpoint; the remote connection is established when used.
-
-| Async method on `Client` | Return value / behavior |
-|---|---|
-| `request(method, path, body: Option<Value>)` | `(u16, Value)`; non-2xx status is returned, not automatically an error; 204 body is JSON null |
-| `permissions()` | `Permissions {grants, exp, max_exp, user, raw}`; `raw` also contains `client_id` |
-| `refresh_capability(ttl_secs: i64)` | New token String; switches the in-memory token; selects installation renewal for registered tokens and bounded refresh for manual tokens |
-| `redeem_pairing(client_name, requested: &[&str])` | Compact session JSON, including comparison fingerprint |
-| `pairing_status()` | `Pairing` state for one collection poll |
-| `await_pairing(within: Duration, cancel: &Cancel)` | Polls for a final `Pairing` result or timeout/cancellation |
-| `pair(client_name, requested, within, cancel)` | Redeem then await; does not persist credentials |
-| `subscribe_changes(since: i64, facet: Option<&str>)` | `Subscription`; consume with async `next()` |
-| `call_plugin(plugin, operation, input: Value)` | Buffered `(u16, Value)` response |
-| `stream_plugin(plugin, operation, input: Value)` | `PluginStream`; preserves status and raw streamed bytes |
-
-Top-level async `pair(ticket: &Ticket, client_name, requested,
-identity: Option<[u8;32]>, within, cancel)` dials the ticket and pairs.
-`Ticket::parse(&str)` performs local validation and returns
-`{v, name: Option<String>, eid: Option<String>, url: Option<String>, token}`.
-`ticket.endpoint_id()` returns the endpoint ID or an error for a URL-only ticket.
-
-`Pairing` variants are `Waiting`, `Approved {token, granted}`, `Denied`, `TimedOut`,
-and `Cancelled`. The convenience enum combines HTTP `pending` and `requested`
-into `Waiting`; use raw `request` when those states must be distinguished for
-initial-submission recovery. `Cancel::new()`, `.cancel()` and `.is_cancelled()`
-provide a clonable cancellation signal. The pairing poll interval is 500 ms.
-
-### Pair, compare, then read
-
-This function receives an installation key the application generated and saved.
-It returns the approved token for the application to persist. The comparison
-code must be shown to the human before approval on the core.
-
-```rust
-use anyhow::{bail, Result};
-use erisdb_client::{Cancel, Client, Pairing, Ticket};
-use std::time::Duration;
-
-async fn enroll(text: &str, identity: [u8; 32]) -> Result<(Client, String)> {
-    let ticket = Ticket::parse(text)?;
-    let pending = Client::dial(
-        ticket.endpoint_id()?, &ticket.token, "Notes native", Some(identity),
-    ).await?;
-    let session = pending.redeem_pairing("Notes native", &["notes:read"]).await?;
-    println!("Compare on the core: {}", session["body"]["fingerprint"]);
-    let cancel = Cancel::new();
-    let Pairing::Approved { token, .. } =
-        pending.await_pairing(Duration::from_secs(300), &cancel).await?
-    else { bail!("pairing did not complete") };
-    drop(pending);
-    let client = Client::dial(
-        ticket.endpoint_id()?, &token, "Notes native", Some(identity),
-    ).await?;
-    let (status, items) = client.request("GET", "/v1/items?facet=notes", None).await?;
-    println!("HTTP {status}: {items}");
-    Ok((client, token))
-}
-```
-
-`request` can renew registered access after an explicit 401 and retry once. It
-retries transport failure only before request bytes were sent or for a method
-it treats as safe (GET/HEAD/OPTIONS). Native connection attempts have a 30-second
-establishment deadline; this is not a deadline for the entire API operation.
-Do not add blanket write retries around it. Persist a token returned by explicit
-refresh; preserving the installation key lets a restarted client recover even
-with an expired saved access token.
-
-### Streaming and error types
-
-```rust
-async fn follow(client: &erisdb_client::Client, cursor: i64) -> anyhow::Result<()> {
-    let mut subscription = client.subscribe_changes(cursor, Some("notes")).await?;
-    while let Some(change) = subscription.next().await? {
-        println!("{} {}", change.seq, change.op);
-        // Apply change, then persist change.seq as the resume cursor.
-    }
-    Ok(())
-}
-```
-
-`Subscription::next()` returns `Result<Option<ChangeEvent>>`; None is EOF.
-`ChangeEvent` has `seq`, `facet`, `op`, optional `item_id`, `body`, `revision`,
-and `raw` (including timestamp/source). Reopen with the last processed cursor;
-the SDK does not persist cursors or automatically reconnect an ended subscription.
-
-`PluginStream` exposes `status`, optional `content_type` and `request_id`.
-`next_chunk()` returns `Result<Option<Vec<u8>>>`. Dropping it closes the stream.
-The streaming plugin call does not perform the ordinary request's automatic
-401 renewal/retry; refresh explicitly when needed. Its bytes are not parsed as
-SSE or JSON by the SDK.
-
-Typed helper refusals use `Refused {status, body}` inside `anyhow::Error`; raw
-`request`/`call_plugin` return HTTP statuses normally. Transport/parse failures
-are errors. Public constants: `ALPN = b"bezel/0"`, `TICKET_SCHEME = "bezel://pair/"`,
-`TICKET_VERSION = 1`, `PAIR_POLL_INTERVAL = 500 ms`.
-
-## Blocking and Android API
-
-`erisdb_client::blocking` owns one process-wide runtime and configured client,
-one pending convenience pairing, and handle-addressed subscriptions. It blocks
-the caller. Serialize reconfiguration/pairing against normal requests so a
-background sync cannot use a temporary pairing credential.
-
-| Blocking Rust function | Contract |
-|---|---|
-| `configure(server, token, client_name, identity: &[u8])` | Identity must be 32 bytes; returns `Result<(), String>` |
-| `request(method, path, body_json: Option<&str>)` | JSON string `{"status":200,"body":…}` or `{"status":0,"error":"…"}`; HTTP failures retain their actual status |
-| `permissions()` | JSON string `{"ok":true,"permissions":…}` or failure envelope |
-| `refresh_capability(ttl_secs: i64)` | JSON string `{"ok":true,"token":"…"}`; swaps in-memory token |
-| `parse_ticket(ticket)` | Local JSON string `{"ok":true,"ticket":…}` or `{"ok":false,"error":"…"}` |
-| `pair_redeem(server, code, client_name, requested_json, identity: &[u8])` | Starts convenience pairing; requested JSON is an array; returns `{"ok":true,"pairing":SESSION}` |
-| `pair_poll(timeout_ms: u64)` | `{"ok":true,"status":"waiting"}`, `approved` with token/granted, `denied`, or `cancelled`; settled results clear the local pending slot |
-| `pair_cancel()` | Cancels/drops pending convenience pairing; no server-side denial request |
-| `subscribe_changes(since: i64, facet: Option<&str>)` | `Result<SubscriptionHandle, String>`, where handle is `u64` |
-| `next_change(handle, timeout_ms: u64)` | JSON `{"ok":true,"change":…}`; timeout `{"ok":true}`; EOF/error `{"ok":false,"error":"…"}` |
-| `close_subscription(handle)` | Closes the handle; unknown handles are a no-op |
-
-Helper failures normally use `{"ok":false,"status":N,"error":"…"}`, with status
-0 for local/transport errors. Subscription and ticket helpers have their specific
-shapes above. A settled convenience pairing returns its token once locally;
-this differs from the server's repeatable collection API. Persist the result.
-
-Public FFI utilities are `decode_identity_hex(&str) -> Option<[u8;32]>`,
-`panic_envelope(String) -> String`, and `guard(f, on_panic) -> T`. They support
-binding implementations; applications normally use the operations above.
-
-### JNI and Kotlin
-
-Native library: `liberisdb_client.so`; JNI class: `dev.erisdb.client.ErisDB`.
-The exports use the blocking operations with Java strings and long integers:
-
-| JNI method | Arguments / result |
-|---|---|
-| `nativeConfigure` | `(server, token, clientName, identityHex) -> String`; empty success, error text otherwise |
-| `nativeRequest` | `(method, path, bodyOrNull) -> String`; request envelope |
-| `nativeRefreshCapability` | `(ttlSecs: long) -> String`; refresh envelope |
-| `nativePermissions` | `() -> String`; permissions envelope |
-| `nativeParseTicket` | `(ticket) -> String`; parse envelope |
-| `nativePairRedeem` | `(server, code, clientName, requestedJson, identityHex) -> String` |
-| `nativePairPoll` | `(timeoutMs: long) -> String` |
-| `nativePairCancel` | `() -> void` |
-| `nativeSubscribeChanges` | `(since: long, facetOrNull) -> long`; zero means failure |
-| `nativeNextChange` | `(handle: long, timeoutMs: long) -> String` |
-| `nativeCloseSubscription` | `(handle: long) -> void` |
-
-`identityHex` is exactly 64 hexadecimal characters representing the persistent
-32-byte private key. JNI clamps negative poll timeouts to zero. Entry points
-contain panics; Java string allocation failure can still return null.
-
-The shipped Kotlin wrapper currently exposes `configure`, `request`, and
-`refreshCapability`; other JNI exports are available to a binding that declares
-them. It converts native JSON strings to `JSONObject`, and maps an empty
-configure result to null. Run these blocking operations on `Dispatchers.IO`:
-
-```kotlin
-withContext(Dispatchers.IO) {
-    val error = ErisDB.configure(endpointId, accessToken, "Notes Android", savedIdentityHex)
-    check(error == null) { error ?: "configuration failed" }
-    val reply = ErisDB.request("GET", "/v1/items?facet=notes")
-    if (reply.getInt("status") == 200) {
-        val items = reply.getJSONObject("body").getJSONArray("items")
-        // Apply items to the application's local cache.
-    }
-}
-```
-
 ## Operator CLI
 
 These commands wrap or host the API; they do not add HTTP routes. All secret
@@ -1331,8 +1054,7 @@ Put parent options before the clients subcommand, for example
 `erisdb clients --url http://127.0.0.1:7700 list`. Administration prints JSON.
 `mint --no-expiry` is for manual/operator authority; it has no individually
 revocable registration. Pairing offers approve-requested, select-subset, or deny;
-it never silently grants beyond the request. The MCP launcher/pair command is
-covered in [MCP tools](#mcp-tools).
+it never silently grants beyond the request.
 
 ## Limits
 
@@ -1351,7 +1073,7 @@ covered in [MCP tools](#mcp-tools).
 | Store pool | 16 connections per core replica |
 | Mint and renewal rate | Shared bucket for `/v1/capabilities`, `/v1/capabilities/refresh`, `/v1/clients/{id}/refresh`: burst 10, replenishes one token per five seconds |
 | Rate identity | Observed TCP **IP**, not source port; authenticated Iroh peer key for native clients; a local proxy's callers share its IP bucket |
-| Rate durability | Per replica, reset by restart; no `Retry-After` contract |
+| Rate durability | Per replica, reset by restart; no `Retry-After` header |
 | Grant count / size | 1–64 grants, each at most 128 bytes |
 | User / client label | At most 128 bytes; client header additionally printable ASCII |
 | Pairing session lifetime | Default 600 seconds, clamped 60–3600 |
@@ -1360,8 +1082,5 @@ covered in [MCP tools](#mcp-tools).
 | Manual/delegated HTTP mint chain | Resulting chain at most 31536000 seconds (365 days) |
 | Plugin timeout | Default 600 seconds, configured 1–3600 |
 | Plugin header / retained stderr | 16 KiB / 64 KiB |
-| Native connection establishment | 30 seconds per connection attempt; safe retry may make more than one attempt |
 
-For deployment, transport setup, backup, migration and compatibility details see
-[operations](operations.md), [registered installations](clients.md), and
-[rename notes](renaming.md).
+For deployment, transport setup and backups, see [operations](operations.md).

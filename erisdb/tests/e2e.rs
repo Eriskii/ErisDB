@@ -1,4 +1,4 @@
-//! End-to-end tests for the erisdb v1 contract.
+//! End-to-end tests for the erisdb v1 interface.
 //!
 //! Zero mocking: every test runs against a real Postgres (Docker via
 //! testcontainers), a real erisdb instance serving real HTTP on a real TCP
@@ -43,10 +43,6 @@ async fn pg() -> &'static Pg {
 
 /// A fresh, migrated database in the shared container.
 async fn fresh_pool() -> PgPool {
-    fresh_pool_with(&erisdb::MIGRATOR).await
-}
-
-async fn fresh_pool_with(migrations: &sqlx::migrate::Migrator) -> PgPool {
     let pg = pg().await;
     let db = format!("erisdb_{}", uuid::Uuid::new_v4().simple());
     let admin = PgPoolOptions::new()
@@ -64,7 +60,7 @@ async fn fresh_pool_with(migrations: &sqlx::migrate::Migrator) -> PgPool {
         .connect(&format!("{}/{db}", pg.base_url))
         .await
         .expect("db connect");
-    migrations.run(&pool).await.expect("migrate");
+    erisdb::MIGRATOR.run(&pool).await.expect("initialize schema");
     pool
 }
 
@@ -94,7 +90,7 @@ struct Client {
     http: reqwest::Client,
     base: String,
     token: String,
-    /// Sent as X-Bezel-Client; the server stamps it into source.client.
+    /// Sent as X-ErisDB-Client; the server stamps it into source.client.
     client_name: Option<String>,
     proof: String,
 }
@@ -116,7 +112,7 @@ impl Client {
         let mut r = self.http.request(method, format!("{}{path}", self.base)).bearer_auth(&self.token)
             .header("X-ErisDB-Client-Proof", &self.proof);
         if let Some(name) = &self.client_name {
-            r = r.header("x-bezel-client", name);
+            r = r.header("x-erisdb-client", name);
         }
         r
     }
@@ -173,7 +169,7 @@ async fn register_tasks_facet(c: &Client) {
     assert_eq!(status, 201, "facet registration failed: {body}");
 }
 
-/// Register the canonical lists facet: the contract apps/lists/index.html
+/// Register the canonical lists facet: the interface apps/lists/index.html
 /// carries a copy of. An entry is `list` + `name`, optional description,
 /// link, and a flat frontmatter-style attributes map. Timestamps live on
 /// the item envelope (created_at / updated_at), never in the body.
@@ -377,7 +373,7 @@ async fn missing_or_garbage_token_is_401() {
     assert_eq!(r.status().as_u16(), 401);
     let r = http
         .get(format!("{url}/v1/items?facet=tasks"))
-        .bearer_auth("bz1.not.real")
+        .bearer_auth("erisdb1.not.real")
         .send()
         .await
         .unwrap();
@@ -432,7 +428,7 @@ async fn facet_schemas_are_enforced() {
 }
 
 #[tokio::test]
-async fn lists_facet_contract_is_pinned() {
+async fn lists_facet_interface_is_pinned() {
     let (url, root, _pool) = setup().await;
     let c = Client::new(&url, &root);
     register_lists_facet(&c).await;
@@ -1389,7 +1385,7 @@ async fn capabilities_scope_every_write_path() {
     assert_eq!(still["body"]["title"], "mine");
 }
 
-/// Delete takes the same optimistic-concurrency contract as update when the
+/// Delete takes the same optimistic-concurrency interface as update when the
 /// caller offers one, instead of silently winning a race.
 #[tokio::test]
 async fn delete_honours_a_revision_when_given_one() {
@@ -1500,7 +1496,7 @@ async fn iroh_enforces_capabilities_too() -> Result<()> {
         &conn,
         hyper::Request::get("/v1/items?facet=tasks")
             .header("host", "erisdb")
-            .header("authorization", "Bearer bz1.not.real")
+            .header("authorization", "Bearer erisdb1.not.real")
             .body(Full::default())?,
     )
     .await?;
@@ -1648,7 +1644,7 @@ async fn a_facet_cannot_name_itself_into_meta() {
 }
 
 /// Grants the core has no meaning for are carried and enclosed like any
-/// other, so a bridge can define its own and enforce them itself.
+/// other, so applications can define their own and enforce them itself.
 #[tokio::test]
 async fn the_core_delegates_permissions_it_does_not_understand() {
     let (url, root, _pool) = setup().await;
@@ -1663,9 +1659,9 @@ async fn the_core_delegates_permissions_it_does_not_understand() {
     assert!(cap.granted("imap:sync"));
     assert!(!cap.granted("imap:delete"));
 
-    // And that token cannot widen its own bridge scope.
-    let bridge = Client::new(&url, minted["token"].as_str().unwrap());
-    let (status, _) = bridge
+    // And that token cannot widen its own scope.
+    let client = Client::new(&url, minted["token"].as_str().unwrap());
+    let (status, _) = client
         .post("/v1/capabilities", json!({"grants": ["imap:*"], "ttl_secs": 60}))
         .await;
     assert_eq!(status, 403);
@@ -1933,7 +1929,7 @@ async fn an_issued_token_never_reaches_the_change_feed() {
     assert_eq!(status, 200, "{feed}");
     let written = serde_json::to_string(&feed).unwrap();
     assert!(!written.contains(&token), "the issued token is in the change feed");
-    assert!(!written.contains("bz1."), "a token of some kind is in the change feed");
+    assert!(!written.contains("erisdb1."), "a token of some kind is in the change feed");
 
     let (_, history) = operator.get(&format!("/v1/items/{id}/history")).await;
     assert!(!serde_json::to_string(&history).unwrap().contains(&token), "the token is in history");
@@ -2202,33 +2198,6 @@ async fn terminal_qr_subset_and_client_management_work_end_to_end() {
     std::fs::remove_file(png_path).unwrap();
 }
 
-/// Upgrade a real pre-registry database, preserving data and recording every
-/// forced pairing transition in the same durable feed as ordinary writes.
-#[tokio::test]
-async fn upgrading_legacy_pairings_preserves_data_and_audits_invalidation() {
-    let legacy = sqlx::migrate::Migrator::with_migrations(
-        erisdb::MIGRATOR.iter().filter(|m| m.version < 6).cloned().collect());
-    let pool = fresh_pool_with(&legacy).await;
-    let id = uuid::Uuid::new_v4();
-    sqlx::query("INSERT INTO items (id, facet, body) VALUES ($1, 'pair', $2)")
-        .bind(id).bind(json!({"status":"approved","requested":["tasks:read"],"granted":["tasks:read"]}))
-        .execute(&pool).await.unwrap();
-    let data_id = uuid::Uuid::new_v4();
-    sqlx::query("INSERT INTO items (id, facet, body) VALUES ($1, 'tasks', $2)")
-        .bind(data_id).bind(json!({"title":"existing data","done":false})).execute(&pool).await.unwrap();
-    erisdb::MIGRATOR.run(&pool).await.unwrap();
-    let base = spawn_core(pool).await;
-    let admin = Client::new(&base, &erisdb::auth::mint(SECRET, &["*"], Some(60), None).unwrap());
-    let pairing = admin.get(&format!("/v1/pairings/{id}")).await.1;
-    assert_eq!(pairing["body"]["status"],"denied");
-    assert_eq!(pairing["revision"],2);
-    let history = admin.get(&format!("/v1/items/{id}/history")).await.1;
-    assert!(history.to_string().contains("0006_registered_clients"));
-    assert!(history.to_string().contains("denied"));
-    assert_eq!(admin.get(&format!("/v1/items/{data_id}")).await.1["body"]["title"],"existing data");
-    assert_eq!(admin.get("/v1/clients").await.1["clients"],json!([]));
-}
-
 async fn approve_reenrollment(operator: &Client, installation: &Client, granted: &[&str]) -> Client {
     let (status, cut) = operator.post("/v1/pairings", json!({})).await;
     assert_eq!(status, 201, "{cut}");
@@ -2274,47 +2243,4 @@ async fn two_approved_pairings_cannot_create_two_active_registrations_for_one_pr
     let mut statuses = [a.0,b.0]; statuses.sort();
     assert_eq!(statuses, [200,409]);
     assert_eq!(admin.get("/v1/clients").await.1["clients"].as_array().unwrap().len(),1);
-}
-
-#[tokio::test]
-async fn upgrading_duplicate_installations_retires_old_tokens_and_audits_every_change() {
-    let previous = sqlx::migrate::Migrator::with_migrations(
-        erisdb::MIGRATOR.iter().filter(|m| m.version < 7).cloned().collect());
-    let pool = fresh_pool_with(&previous).await;
-    let old = uuid::Uuid::new_v4();
-    let newest = uuid::Uuid::new_v4();
-    for (id, age) in [(old, 2i32), (newest, 1i32)] {
-        sqlx::query("INSERT INTO clients (id, name, identity, requested, grants, access_ttl_secs, created_at)
-            VALUES ($1, 'legacy duplicate', $2, ARRAY['tasks:read'], ARRAY['tasks:read'], 60,
-                now() - $3 * interval '1 day')")
-            .bind(id).bind(json!({"kind":"browser","key":"A".repeat(43)})).bind(age)
-            .execute(&pool).await.unwrap();
-    }
-    let pairing = uuid::Uuid::new_v4();
-    sqlx::query("INSERT INTO items (id, facet, body) VALUES ($1, 'pair', $2)")
-        .bind(pairing).bind(json!({"status":"approved","identity":{"kind":"browser","key":"A".repeat(43)}}))
-        .execute(&pool).await.unwrap();
-    erisdb::MIGRATOR.run(&pool).await.unwrap();
-    let retired = erisdb::installation::load(&pool, old).await.unwrap();
-    assert!(retired.revoked_at.is_some());
-    assert_eq!(retired.revision, 2);
-    assert!(erisdb::installation::load(&pool, newest).await.unwrap().revoked_at.is_none());
-    let audits: Vec<Value> = sqlx::query_scalar("SELECT body FROM changes
-        WHERE source->>'migration' = '0007_one_active_registration' AND facet = 'system'")
-        .fetch_all(&pool).await.unwrap();
-    assert_eq!(audits.len(), 1);
-    assert_eq!(audits[0]["client"]["id"], old.to_string());
-    let base = spawn_core(pool).await;
-    let root = erisdb::auth::mint(SECRET, &["*"], Some(60), None).unwrap();
-    let admin = Client::new(&base, &root);
-    let denied = admin.get(&format!("/v1/pairings/{pairing}")).await.1;
-    assert_eq!(denied["body"]["status"], "denied");
-    assert_eq!(denied["revision"], 2);
-    assert!(admin.get(&format!("/v1/items/{pairing}/history")).await.1.to_string().contains("0007_one_active_registration"));
-    for (id, status) in [(old, 401), (newest, 200)] {
-        let mut cap = erisdb::auth::verify(SECRET, &root).unwrap();
-        cap.client = Some(id);
-        let token = erisdb::auth::mint_capability(SECRET, &cap).unwrap();
-        assert_eq!(Client::new(&base, &token).get("/v1/permissions").await.0, status);
-    }
 }

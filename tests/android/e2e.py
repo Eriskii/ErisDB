@@ -78,7 +78,7 @@ def edit(index, value):
 
 
 def run(app):
-    package = f'dev.bezel.{app}'  # Retains installed data across the rename.
+    package = f'dev.erisdb.{app}'  # Retains installed data across the rename.
     component = f'{package}/dev.erisdb.{app}.MainActivity'
     apk = ROOT / f'apps/{app}-android/app/build/outputs/apk/debug/app-debug.apk'
     assert apk.is_file(), f'build {apk} first'
@@ -89,7 +89,7 @@ def run(app):
         api('POST', '/v1/items', {'facet': 'facet', 'body': {'name': app, 'strict': False, 'schema': {'type': 'object'}}})
         session = api('POST', '/v1/pairings', {})
         payload = {'v': 1, 'name': 'Android E2E', 'eid': EID, 'token': session['secret']}
-        ticket = 'bezel://pair/' + base64.urlsafe_b64encode(json.dumps(payload).encode()).decode().rstrip('=')
+        ticket = 'erisdb://pair/' + base64.urlsafe_b64encode(json.dumps(payload).encode()).decode().rstrip('=')
         if app == 'lists':
             # Actual loss of device connectivity, not an intercepted API reply.
             adb('shell', 'svc', 'wifi', 'disable')
@@ -132,7 +132,7 @@ def run(app):
         # sync interval before approval so pairing and sync share a real runtime.
         again = api('POST', '/v1/pairings', {})
         payload['token'] = again['secret']
-        next_ticket = 'bezel://pair/' + base64.urlsafe_b64encode(json.dumps(payload).encode()).decode().rstrip('=')
+        next_ticket = 'erisdb://pair/' + base64.urlsafe_b64encode(json.dumps(payload).encode()).decode().rstrip('=')
         adb('shell', 'am', 'start', '-W', '-a', 'android.intent.action.VIEW', '-d', next_ticket, '-n', component)
         button('Pair again')
         next_path = f"/v1/pairings/{again['id']}"

@@ -1,9 +1,9 @@
-//! The MCP contract, proven end to end: real Postgres (Docker via
+//! The MCP client interface, proven end to end: real Postgres (Docker via
 //! testcontainers), a real erisdb binary serving real HTTP on a real
 //! socket, and the erisdb-mcp binary as a real subprocess speaking
 //! JSON-RPC over its stdio. No mocks.
 //!
-//! The core is driven as a process and built from the sibling crate when
+//! The core is driven as a process and built from the server crate when
 //! needed. Missing prerequisites fail the suite rather than silently skipping.
 
 use std::path::PathBuf;
@@ -20,7 +20,7 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 const SECRET: &str = "mcp-e2e-secret";
 
 /// The erisdb binary to run a core with: `ERISDB_BIN` if the operator named
-/// one, a sibling `../erisdb` checkout built on demand, or `erisdb` on
+/// one, `../../erisdb` built on demand, or `erisdb` on
 /// PATH. `None` means this machine cannot run a core right now.
 fn erisdb_binary() -> Option<PathBuf> {
     if let Ok(path) = std::env::var("ERISDB_BIN") {
@@ -28,7 +28,7 @@ fn erisdb_binary() -> Option<PathBuf> {
         return path.is_file().then_some(path);
     }
 
-    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../erisdb/Cargo.toml");
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../erisdb/Cargo.toml");
     if manifest.is_file() {
         let built = std::process::Command::new(env!("CARGO"))
             .args(["build", "--bin", "erisdb", "--manifest-path"])
@@ -156,7 +156,7 @@ macro_rules! real_core {
         match spawn_core().await {
             Some(core) => core,
             None => {
-                panic!("a real ErisDB binary is required; build ../erisdb or set ERISDB_BIN");
+                panic!("a real ErisDB binary is required; build ../../erisdb or set ERISDB_BIN");
             }
         }
     };
@@ -297,7 +297,7 @@ fn requires(tools: &Value, name: &str, field: &str) -> bool {
 /// required, not optional.
 #[tokio::test]
 async fn the_toolbox_is_advertised_with_its_guards() {
-    let mut mcp = Mcp::spawn("http://127.0.0.1:1", "bz1.not-a-real-token");
+    let mut mcp = Mcp::spawn("http://127.0.0.1:1", "erisdb1.not-a-real-token");
     let tools = mcp.start().await;
 
     let names: Vec<&str> =
@@ -353,7 +353,7 @@ async fn the_toolbox_is_advertised_with_its_guards() {
 /// the schema, where the model can see what it left out.
 #[tokio::test]
 async fn a_write_without_a_revision_is_rejected() {
-    let mut mcp = Mcp::spawn("http://127.0.0.1:1", "bz1.not-a-real-token");
+    let mut mcp = Mcp::spawn("http://127.0.0.1:1", "erisdb1.not-a-real-token");
     mcp.start().await;
 
     let id = "00000000-0000-0000-0000-000000000000";
@@ -369,7 +369,7 @@ async fn a_write_without_a_revision_is_rejected() {
 /// otherwise, and it refuses before it ever asks the core.
 #[tokio::test]
 async fn minting_is_off_until_the_operator_turns_it_on() {
-    let mut mcp = Mcp::spawn("http://127.0.0.1:1", "bz1.not-a-real-token");
+    let mut mcp = Mcp::spawn("http://127.0.0.1:1", "erisdb1.not-a-real-token");
     mcp.start().await;
 
     let err = mcp
@@ -384,7 +384,7 @@ async fn minting_is_off_until_the_operator_turns_it_on() {
 /// before it ever asks the core.
 #[tokio::test]
 async fn approving_a_pairing_is_off_until_the_operator_turns_it_on() {
-    let mut mcp = Mcp::spawn("http://127.0.0.1:1", "bz1.not-a-real-token");
+    let mut mcp = Mcp::spawn("http://127.0.0.1:1", "erisdb1.not-a-real-token");
     mcp.start().await;
 
     let id = "00000000-0000-0000-0000-000000000000";
@@ -399,7 +399,7 @@ async fn approving_a_pairing_is_off_until_the_operator_turns_it_on() {
 /// second pairing code.
 #[tokio::test]
 async fn denying_a_pairing_needs_no_switch() {
-    let mut mcp = Mcp::spawn("http://127.0.0.1:1", "bz1.not-a-real-token");
+    let mut mcp = Mcp::spawn("http://127.0.0.1:1", "erisdb1.not-a-real-token");
     mcp.start().await;
 
     // No core on the other end, so this fails at the transport — which
@@ -612,7 +612,7 @@ async fn minting_when_allowed_is_capped() {
     let minted =
         mcp.tool("mint_capability", json!({"grants": ["notes:read"], "ttl_secs": 30})).await;
     let token = minted["token"].as_str().unwrap().to_string();
-    assert!(token.starts_with("bz1."), "{minted}");
+    assert!(token.starts_with("erisdb1."), "{minted}");
     assert_eq!(minted["ttl_secs"], 30, "{minted}");
 
     // The minted token holds what was asked for and nothing more.
@@ -820,7 +820,7 @@ async fn paired_mcp_renews_after_restart_and_stops_when_revoked() {
     let core = real_core!();
     let admin = core.mint("*", 3600);
     let (id, code) = core.cut_a_pairing(&admin).await;
-    let ticket = format!("bezel://pair/{}", URL_SAFE_NO_PAD.encode(
+    let ticket = format!("erisdb://pair/{}", URL_SAFE_NO_PAD.encode(
         serde_json::to_vec(&json!({"v": 1, "url": core.url, "token": code})).unwrap()));
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("session.json");
@@ -865,7 +865,7 @@ async fn paired_mcp_renews_after_restart_and_stops_when_revoked() {
 async fn request_mcp_pair(core: &Core, admin: &str, config: &str, profile: Option<&str>) -> (String, Child) {
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
     let (id, code) = core.cut_a_pairing(admin).await;
-    let ticket = format!("bezel://pair/{}", URL_SAFE_NO_PAD.encode(
+    let ticket = format!("erisdb://pair/{}", URL_SAFE_NO_PAD.encode(
         serde_json::to_vec(&json!({"v":1, "url":core.url, "token":code})).unwrap()));
     let mut command = Command::new(env!("CARGO_BIN_EXE_erisdb-mcp"));
     command.args(["pair", &ticket, "--grant", "tasks:read,tasks:create"])

@@ -4,7 +4,7 @@ import org.json.JSONObject
 
 // Pairing is the front door. A core cuts one ticket —
 //
-//     bezel://pair/<base64url-nopad(JSON)>
+//     erisdb://pair/<base64url-nopad(JSON)>
 //
 // — and it says where the core is and carries a pairing code to start a
 // conversation with it. No pairing service exists anywhere, so nothing in
@@ -22,7 +22,7 @@ import org.json.JSONObject
  * refused rather than guessed at. */
 const val TICKET_VERSION = 1
 
-private const val TICKET_PREFIX = "bezel://pair/"
+private const val TICKET_PREFIX = "erisdb://pair/"
 
 /** A ticket, once read. `eid` and `url` are the two transports a core can
  * offer; at least one of them is present. `code` is the pairing code, not
@@ -105,7 +105,7 @@ fun quicTicket(text: String): Pairing = when (val read = readTicket(text)) {
 fun paired(server: String, token: String): Boolean =
     server.isNotBlank() && token.isNotBlank()
 
-/** What a `bezel://pair/…` arrival means to an app in a given state. */
+/** What a `erisdb://pair/…` arrival means to an app in a given state. */
 sealed class Arrival {
     /** Nothing is paired, so the ticket applies where it lands. */
     data class Pair(val ticket: Ticket) : Arrival()

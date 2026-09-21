@@ -17,5 +17,5 @@ pub mod ticket;
 pub use api::{app, app_with_plugins};
 pub use plugin::PluginRegistry;
 
-/// Embedded schema migrations; run against a fresh or existing store.
+/// Embedded ErisDB schema; initializes a fresh store and checks it on restart.
 pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!();

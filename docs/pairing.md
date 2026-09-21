@@ -45,10 +45,10 @@ the QR alone cannot collect its approval.
 
 ## Ticket format
 
-The existing URI prefix remains compatible across the rename:
+The ticket URI is:
 
 ```text
-bezel://pair/<base64url-nopad(JSON)>
+erisdb://pair/<base64url-nopad(JSON)>
 ```
 
 ```json
@@ -57,7 +57,7 @@ bezel://pair/<base64url-nopad(JSON)>
   "name": "my-laptop",
   "eid": "e718b50236b0b98637fbf39cb4040e79800094313dc195e221e8e075304a6a06",
   "url": "https://db.example.com",
-  "token": "bz1.…"
+  "token": "erisdb1.…"
 }
 ```
 
@@ -72,5 +72,5 @@ pasting remains available when the browser cannot scan. Android's system camera
 opens the deep link through the app's intent filter. Both Android apps share the
 scheme, so the system may ask which app should receive the ticket.
 
-The API contract is in [api.md](api.md#pairing); installation identity, renewal,
-revocation, transport, and migration are in [clients.md](clients.md).
+The API reference is in [api.md](api.md#pairing); installation identity, renewal,
+revocation, and transport are in [clients.md](clients.md).

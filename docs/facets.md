@@ -1,6 +1,6 @@
 # Facets
 
-A facet is a named contract over the store — `tasks`, `lists`,
+A facet is a named schema over the store — `tasks`, `lists`,
 `exercise`. It is the unit of three things at once: the schema a body must
 satisfy, the namespace a permission lives in, and the filter a change-feed
 cursor runs under. One name does all three jobs, which is why they never
@@ -44,7 +44,7 @@ and nothing else:
 | list or read registrations | `meta:facets:read` |
 | register, change or remove one | `meta:facets:write` |
 
-Two permissions rather than four: reading a contract and changing one are
+Two permissions rather than four: reading a schema and changing one are
 different things, and there is no useful grant between them. `*:read` does
 **not** reach `meta:facets:read` — read-everything is about your data, not
 about the deployment.
@@ -110,7 +110,7 @@ Names are unique, so a second registration of the same name is **409
 they always `POST` first, and treat 409 as "someone already registered it"
 and 403 as "this token cannot register facets" — both fine, neither fatal.
 
-Editing a contract is `PUT /v1/items/{id}` on the definition, with its
+Editing a schema is `PUT /v1/items/{id}` on the definition, with its
 revision. Widening is free. Tightening is not: existing items are not
 re-validated, so a body that no longer conforms sits in the store
 untouched until something tries to write it back and gets a 422. Reverting
@@ -159,7 +159,7 @@ date of `"not a timestamp"` is stored happily and then simply never lapses,
 because `safe_ts` returns NULL on it.
 
 `strict: false` stores the schema and skips the check. It is the escape
-hatch for a facet whose shape is still moving — a bridge's config, a
+hatch for a facet whose shape is still moving — application settings, a
 scratch namespace — and the honest description of it is "documentation
 that does not run". Permissions and the change feed work exactly the same
 either way; only validation is off.
@@ -276,7 +276,7 @@ Lapse is a notification, not a state change. The item's body and
 If you want a lapse to change something, a client has to write that
 change.
 
-## The shipped contracts
+## The shipped schemas
 
 Two facets ship with clients in this tree. Neither is special to the core
 — they are ordinary registrations that several apps happen to agree on,
@@ -384,47 +384,9 @@ times ride the item envelope as `created_at` and `updated_at`, where the
 core maintains them — a body field would be a second copy that a client
 could get wrong.
 
-## Versioning
+## Version field
 
-`version` is a field in the registration, not part of the name, because
-the name is a permission namespace. `tasks:read` should mean "read my
-tasks" for as long as there are tasks; a name carrying the schema version
-would retire that grant every time the schema moved, and every paired
-client would silently lose access until someone re-granted.
-
-So the shape of an upgrade is:
-
-- **Widen in place.** Add an optional property, relax a bound, `PUT` the
-  registration, bump `version`. Existing items still validate, existing
-  grants still work, and nothing has to be told.
-- **Tighten carefully.** Old items are not re-validated, so they sit there
-  until something writes them back and gets a 422. Migrate them first if
-  they matter; the change feed tells you exactly which they are.
-- **A new name is a last resort.** Two contracts that must coexist need two
-  namespaces, and that means every client and every token that touches the
-  new one needs a new grant, approved by a human. Worth it when the shapes
-  genuinely cannot be reconciled, and expensive otherwise.
-
-Nothing in the core reads `version`. It is there so a client can tell which
-shape it is looking at, and so a person reading the registration knows
-which one they wrote.
-
-## Writing a good one
-
-- **Name it for the thing, not the schema.** `tasks`, `sensors.kitchen`,
-  `imap`. It is the word that will appear in every grant and on every
-  approval prompt for the life of the deployment.
-- **Be strict.** The store outlives every client that writes to it, and a
-  schema is the only thing that keeps a body honest when the app that
-  wrote it is three versions gone.
-- **Close the object.** `additionalProperties: false` turns a client's
-  typo into a 422 instead of a field nobody reads.
-- **Keep the envelope out of the body.** No id, no revision, no created or
-  updated timestamp, no facet name. The core maintains all of those and a
-  copy is a copy that can be wrong.
-- **Describe the permissions.** Four sentences in `permissions` are the
-  difference between an approval prompt that reads like English and one
-  that reads like a config file.
-- **Add a lapse rule only if something should happen when time passes.**
-  It costs a scan per facet per tick, and it puts a row on the feed that
-  every client tailing that facet must be prepared to see.
+`version` is optional metadata in a facet definition. The core validates it as
+a positive integer but does not use it to select schemas or convert items.
+Updating a facet changes validation for subsequent writes. It does not rewrite
+or revalidate existing items.

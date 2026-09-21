@@ -1,6 +1,6 @@
 //! Signed capability tokens and bounded delegation.
 //!
-//! A token is `bz1.<b64url(payload)>.<b64url(hmac_sha256(secret, payload))>`.
+//! A token is `erisdb1.<b64url(payload)>.<b64url(hmac_sha256(secret, payload))>`.
 //! The payload carries an upper scope bound. Registered tokens also name an
 //! installation; api/installation.rs checks its live Postgres authority.
 //!
@@ -22,7 +22,7 @@ use subtle::ConstantTimeEq;
 
 use crate::error::{Error, Result};
 
-pub const PREFIX: &str = "bz1";
+pub const PREFIX: &str = "erisdb1";
 
 /// How long a refresh chain runs when nobody names a length. An app token
 /// refreshes itself for this long, then a human mints a new one.
@@ -253,7 +253,7 @@ mod tests {
         let wide = mint(S, &["*"], Some(3600), None).unwrap();
         let wide_payload = wide.split('.').nth(1).unwrap();
         let narrow_sig = narrow.split('.').nth(2).unwrap();
-        assert!(verify(S, &format!("bz1.{wide_payload}.{narrow_sig}")).is_err());
+        assert!(verify(S, &format!("erisdb1.{wide_payload}.{narrow_sig}")).is_err());
     }
 
     #[test]
@@ -263,13 +263,13 @@ mod tests {
         let sig = good.split('.').nth(2).unwrap();
         for bad in [
             String::new(),
-            "bz1".into(),
-            format!("bz1.{payload}"),
-            format!("bz1.{payload}.{sig}.extra"),
-            format!("bz1.{payload}."),
-            format!("bz2.{payload}.{sig}"),
-            format!("bz1.!!not-base64!!.{sig}"),
-            format!("bz1.{payload}.!!not-base64!!"),
+            "erisdb1".into(),
+            format!("erisdb1.{payload}"),
+            format!("erisdb1.{payload}.{sig}.extra"),
+            format!("erisdb1.{payload}."),
+            format!("invalid.{payload}.{sig}"),
+            format!("erisdb1.!!not-base64!!.{sig}"),
+            format!("erisdb1.{payload}.!!not-base64!!"),
             format!("{payload}.{sig}"),
         ] {
             assert!(verify(S, &bad).is_err(), "accepted {bad:?}");
@@ -279,7 +279,7 @@ mod tests {
     #[test]
     fn an_empty_signature_never_passes() {
         let payload = B64.encode(serde_json::to_vec(&cap(&["*"], None, None)).unwrap());
-        assert!(verify(S, &format!("bz1.{payload}.")).is_err());
+        assert!(verify(S, &format!("erisdb1.{payload}.")).is_err());
     }
 
     // ------------------------------------------------------------ expiry

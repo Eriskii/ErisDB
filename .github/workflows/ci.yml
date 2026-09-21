@@ -20,7 +20,7 @@ jobs:
         run: |
           cargo audit --deny yanked --file erisdb/Cargo.lock
           cargo audit --deny yanked --no-fetch --file erisdb-client/Cargo.lock
-          cargo audit --deny yanked --no-fetch --file erisdb-mcp/Cargo.lock
+          cargo audit --deny yanked --no-fetch --file clients/mcp/Cargo.lock
 
   crate:
     name: ${{ matrix.crate }}
@@ -30,7 +30,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        crate: [erisdb, erisdb-client, erisdb-mcp]
+        crate: [erisdb, erisdb-client, clients/mcp]
     defaults:
       run:
         working-directory: ${{ matrix.crate }}

@@ -36,7 +36,7 @@
             <!--
               Pairing arrives as a link. The phone's camera app already
               reads QR codes and opens what it finds, so `erisdb pair`
-              printing a bezel://pair/… code is a scanner this app does not
+              printing a erisdb://pair/… code is a scanner this app does not
               have to embed — no camera permission, no library, and the
               ticket lands in onCreate or onNewIntent.
             -->
@@ -44,7 +44,7 @@
                 <action android:name="android.intent.action.VIEW" />
                 <category android:name="android.intent.category.DEFAULT" />
                 <category android:name="android.intent.category.BROWSABLE" />
-                <data android:scheme="bezel" android:host="pair" />
+                <data android:scheme="erisdb" android:host="pair" />
             </intent-filter>
         </activity>
     </application>

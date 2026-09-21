@@ -23,9 +23,9 @@ apps, and deployment files:
   manifests. One request starts one process and streams its stdout; no call
   touches Postgres and no plugin survives between requests. The shipped
   `erisdb-plugin-openai` forwards Chat Completions, including tools and SSE.
-- **`erisdb-mcp/`** — the core's API as MCP tools over stdio, for wiring
-  ErisDB into Claude and friends: read, search, write, delete, history,
-  revert, the change feed, and token minting. See its [README](erisdb-mcp/README.md).
+- **`clients/mcp/`** — a separate client application. An MCP host launches it
+  over stdio; it makes authenticated HTTP requests to ErisDB. It has its own
+  binary and build. See its [README](clients/mcp/README.md).
 - **`apps/tasks-android/`** — the tasks client as an Android app over
   `erisdb-client`: one-off and recurring tasks with due dates on
   `tasks`; completing a repeating task advances its due date instead
@@ -39,7 +39,7 @@ apps, and deployment files:
 ## Documentation
 
 This file is the tour. [`docs/`](docs/) is the detail:
-[api.md](docs/api.md) is the complete API reference with HTTP, MCP and native-client examples,
+[api.md](docs/api.md) documents the server API with examples,
 [permissions.md](docs/permissions.md) what a grant is and what it covers,
 [capabilities.md](docs/capabilities.md) the token that carries one,
 [facets.md](docs/facets.md) how the store gets structure without a deploy,
@@ -53,13 +53,10 @@ and invoked,
 [`docs/README.md`](docs/README.md) indexes them and names the shortest
 path through for each of those three jobs.
 
-For an existing installation, see [the ErisDB rename notes](docs/renaming.md)
-before updating service paths and environment variables.
-
 ## Wiring it up
 
 The core is one binary against one Postgres database. The poker, apps and MCP
-bridge are clients holding capability tokens. One-shot plugins are the other
+client make authenticated API requests. One-shot plugins are the other
 path: operator-installed executables launched once per authorized call, with
 no database involvement.
 
@@ -158,7 +155,7 @@ just as well as the timer.
 Serve the `apps/` directory statically over HTTPS (HTTP is supported on localhost),
 preserving `shared/` alongside `tasks/` and `lists/`. Open either app and give it
 a ticket: scan the QR `erisdb pair` prints, or
-paste the `bezel://pair/…` string. The app redeems it, asks for the
+paste the `erisdb://pair/…` string. The app redeems it, asks for the
 permissions it needs, and waits while you answer in the terminal. Pasting
 a URL and a token still works for a token you already hold. The Android
 clients take an iroh endpoint id instead of a URL — no IP, no port.
@@ -214,22 +211,22 @@ deployed:
 
 - **Outstanding token signatures become invalid.** Registered installations
   can renew using their installation proof. Manual tokens must be re-minted.
-- **The server's address changes.** Each Android client, each MCP config,
+- **The server's address changes.** Each Android client and
   each `erisdb-client` caller is pinned to the endpoint id derived from the
   old secret, and will dial an address nobody answers. Print the new one
   with `erisdb endpoint-id` and re-pin every one of them.
 
 Revoke one paired installation with `erisdb clients revoke CLIENT_UUID`.
 This immediately blocks subsequent access, renewal and active change feeds.
-Legacy/manual tokens without a registration still require expiry or signing-key
-rotation. [Client administration](docs/clients.md) explains migration and recovery.
+Manual tokens without a registration still require expiry or signing-key
+rotation. [Client administration](docs/clients.md) explains renewal and revocation.
 
 
 ## Transport
 
 Two paths into the same router, with very different properties.
 
-- **Iroh** (ALPN `bezel/0`, HTTP/1.1 per QUIC bi-stream) is authenticated
+- **Iroh** (ALPN `erisdb/0`, HTTP/1.1 per QUIC bi-stream) is authenticated
   and encrypted end to end. Anyone may connect; nobody reads or writes
   without a token.
 - **Plain TCP is neither.** `--listen` defaults to `127.0.0.1:7700` and
@@ -245,13 +242,13 @@ what needs no open port at all.
 
 ## Tests
 
-`erisdb/`, `erisdb-client/`, and `erisdb-mcp/` each carry a suite. They are separate crate
+`erisdb/`, `erisdb-client/`, and `clients/mcp/` each carry a suite. They are separate crate
 trees with no workspace root, so each runs from its own directory:
 
 ```sh
 (cd erisdb && cargo test)
 (cd erisdb-client && cargo test)
-(cd erisdb-mcp && cargo test)
+(cd clients/mcp && cargo test)
 ```
 
 The suites bring up a real Postgres through testcontainers and talk to it over
@@ -259,22 +256,7 @@ real sockets, so **Docker must be running**. `erisdb`'s e2e suite also
 exercises real Iroh QUIC. No mocks.
 
 CI runs all three suites plus `cargo clippy -- -D warnings` and
-`cargo fmt --check` on every push and pull request.
-
-## Versioning
-
-Each subproject versions independently. The core, the Rust client, the MCP
-bridge and each app move at their own pace; nothing binds them together but
-the wire protocol.
-
-- Tags name the subproject and live in this repository:
-  `erisdb-v0.2.0`, `erisdb-client-v0.3.0`, `tasks-android-v0.2.0`.
-- A crate's `Cargo.toml` version, its tag, and — for clients — the string it
-  stamps into `X-Bezel-Client` are the same string, so a `source` on an item
-  names the exact build that wrote it.
-- Android apps carry that same string in `versionName`. `versionCode` is a
-  monotonic integer and means nothing else.
-- A release is a tag. Anything untagged is a working tree.
+an advisory `cargo fmt --check` on every push and pull request.
 
 ## License
 
@@ -288,7 +270,7 @@ The core is copyleft; the clients are not.
   [`LICENSE-MIT`](LICENSE-MIT): `erisdb-client/`, `poker/`, `deploy/`,
   `apps/tasks/` and `apps/lists/`.
 - **The MCP and Android clients** — MIT, carried in their own trees:
-  `erisdb-mcp`, `apps/tasks-android`, `apps/lists-android`.
+  `clients/mcp`, `apps/tasks-android`, `apps/lists-android`.
 
 Copyright (c) 2026 Isolyth.
 

@@ -1,19 +1,9 @@
 # Building a client
 
-Everything that is not the core is a client: the apps, the MCP bridge, the
-poker, the Android builds, whatever you write next. Paired clients hold a registered installation identity and renewable access
-tokens. Manual service/operator tokens also remain supported. See
-[registered installations](clients.md) for identity and renewal.
-
-One-shot plugins are the exception to “everything”: they are
-operator-installed executables invoked through `/v1/call`, not persistent
-clients. An app calling one is still an ordinary client and pairs for the
-operation permission such as `openai:chat`. Plugin calls have no cursor or
-stored server state; ordinary responses are direct and streaming responses
-last only as long as their connection.
-
-This page is the shape a good one takes. [api.md](api.md) is the reference
-it implements.
+The browser apps, Android apps, MCP client, and poker call the server API.
+Paired applications have their own installation identity and renewable access
+token. The poker uses a manually minted token. [api.md](api.md) documents the
+server routes and [clients.md](clients.md) documents installation renewal.
 
 ## 1. Ask for a token, and get an address
 
@@ -69,16 +59,16 @@ re-render the secret.
 
 Where the token lives depends on the platform, and none of the options are
 good in an absolute sense: `localStorage` in a browser, an app-private
-file on Android, a mode-0600 file for a daemon. Pick the one the platform
+Keystore-encrypted preferences on Android, a mode-0600 file for a daemon. Pick the one the platform
 actually enforces, and hold grants narrow enough that the loss is bounded.
 
 ## 2. Seed a cache, then hold a cursor
 
-The shape every app in this tree uses:
+The browser and Android data apps seed a snapshot and then read changes:
 
 ```
-1. GET  /v1/items?facet=X&limit=1000      → bulk-load into a local cache
-2. GET  /v1/changes?since=0&facet=X       → take `next` as the cursor
+1. GET  /v1/changes?since=0&facet=X       → walk pages to the feed head
+2. GET  /v1/items?facet=X&limit=1000      → load the snapshot, walking pages
 3. loop: GET /v1/changes?since=<cursor>&facet=X
          apply each row, cursor = next
 4. alongside: GET /v1/changes/stream?since=<cursor>&facet=X
@@ -130,7 +120,7 @@ what you sent, so a client that renders a partial view and writes it back
 destroys every field it did not echo. Keep the last body you saw, overlay
 your change on it, send the result.
 
-Every write carries a `revision`, and a stale one is a 409. That is the
+Updates and reverts require the current `revision`; a stale one is a 409. That is the
 concurrency model in full: last-writer-wins is not available, and a 409 is
 not an error condition so much as a message that says *read again and
 retry*. Handle it by refetching the item (or waiting for the feed to bring
@@ -148,7 +138,7 @@ mid-write loses nothing and the op replays on next load. The screen shows
 the server snapshot with queued ops replayed on top, so an edit is visible
 instantly and stays visible if the network is not there.
 
-**A patch value of `null` deletes the key.** Both shipped contracts close
+**A patch value of `null` deletes the key.** Both shipped schemas close
 their objects with `additionalProperties: false`, so clearing an optional
 field means removing it, not setting it to null. Doing that in the local
 patch representation keeps the distinction from ever reaching the wire.
@@ -208,13 +198,13 @@ token's `exp` passes, which is a reconnect, not a failure.
 Details of what refresh does and does not carry:
 [capabilities.md](capabilities.md#what-refresh-does-and-does-not-do).
 
-## `X-Bezel-Client`
+## `X-ErisDB-Client`
 
 A header naming what wrote this. The core copies it verbatim into
 `source.client` on the item and on every change row.
 
 ```
-X-Bezel-Client: Tasks (Web) v0.1
+X-ErisDB-Client: Tasks (Web) v0.1
 ```
 
 It is the weakest rung of the trust gradient — the caller says it and
@@ -224,10 +214,8 @@ tells you which identity, but only `client` tells you *which build*, which
 is what you want at two in the morning when one item in a thousand has a
 malformed body.
 
-So: include the version, and make it the same string the release is
-tagged with. Every subproject in this tree does — a crate's `Cargo.toml`
-version, its tag, and the string it stamps into `X-Bezel-Client` are one
-string, so a `source` names the exact build that wrote it.
+The header value is supplied by the caller. The server does not compare it
+with package versions or release tags.
 
 Bounded at 128 characters, printable, no control characters. Over that, or
 outside ASCII, is a 400 — it lands in every row this caller writes, so an
@@ -249,7 +237,7 @@ Four clients, four different shapes, all against the same API.
   ticks, deduped.
 
 - **`erisdb-client/`** — the Rust client, dialing over Iroh: one QUIC
-  connection, one HTTP/1.1 exchange per bi-stream, ALPN `bezel/0`. Read it
+  connection, one HTTP/1.1 exchange per bi-stream, ALPN `erisdb/0`. Read it
   for `subscribe_changes` (the cursor is the caller's, every event carries
   its `seq`), for the retry rule above, and for `identity` — passing the
   same 32 bytes every launch is what makes a device one device across
@@ -257,7 +245,7 @@ Four clients, four different shapes, all against the same API.
   the endpoint id the core observed. It also carries the blocking facade
   and the JNI surface the two Android apps sit on.
 
-- **`erisdb-mcp/`** — the API as MCP tools over stdio. Worth reading for
+- **`clients/mcp/`** — the API as MCP tools over stdio. Worth reading for
   what it *refuses*: `update_item` and `revert_item` make `revision`
   required, because a model that renders a partial view and writes it back
   would otherwise destroy every field it did not echo, and with the
@@ -278,7 +266,7 @@ Four clients, four different shapes, all against the same API.
 - Queue writes before touching the network.
 - Renew paired access using installation proof; stop on a revoked registration.
   Manual tokens refresh at half-life within their bounded chain.
-- Send `X-Bezel-Client` with your version in it.
+- Send `X-ErisDB-Client` with your version in it.
 - Handle 429 (back off) and 503 on the stream route (all slots taken —
   retry, or fall back to polling).
 - Ask for the permissions you use and no more; read `GET /v1/permissions`

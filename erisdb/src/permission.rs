@@ -344,7 +344,7 @@ mod tests {
     }
 
     /// A permission the core has no meaning for still delegates and
-    /// encloses correctly, so a bridge can define its own.
+    /// encloses correctly, so applications can define their own.
     #[test]
     fn permissions_the_core_does_not_understand_still_enclose() {
         assert!(check_grant("imap:sync").is_ok());

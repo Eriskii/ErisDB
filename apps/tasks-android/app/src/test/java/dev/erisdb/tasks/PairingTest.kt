@@ -18,11 +18,11 @@ class PairingTest {
 
     private val eid = "e718b50236b0b98637fbf39cb4040e79800094313dc195e221e8e075304a6a06"
     private val other = "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90"
-    private val tok = "bz1.eyJmYWNldHMiOltdfQ.sig"
+    private val tok = "erisdb1.eyJmYWNldHMiOltdfQ.sig"
 
-    /** `bezel://pair/<base64url-nopad(JSON)>`, the way a core cuts one. */
+    /** `erisdb://pair/<base64url-nopad(JSON)>`, the way a core cuts one. */
     private fun code(json: String): String =
-        "bezel://pair/" + java.util.Base64.getUrlEncoder().withoutPadding()
+        "erisdb://pair/" + java.util.Base64.getUrlEncoder().withoutPadding()
             .encodeToString(json.toByteArray(Charsets.UTF_8))
 
     private fun ticket(
@@ -84,13 +84,13 @@ class PairingTest {
     @Test
     fun somethingThatIsNotATicketIsRefusedByShape() {
         for (text in listOf("", "hello", "https://example.com/pair/abc", "erisdb://paired/abc")) {
-            assertTrue(refusal(text).contains("bezel://pair/"))
+            assertTrue(refusal(text).contains("erisdb://pair/"))
         }
     }
 
     @Test
     fun aCodeThatDoesNotDecodeIsRefused() {
-        assertTrue(refusal("bezel://pair/not base64!").contains("base64url"))
+        assertTrue(refusal("erisdb://pair/not base64!").contains("base64url"))
         // Decodes cleanly, carries something that is not a ticket.
         assertTrue(refusal(code("not json at all")).contains("ticket"))
     }
@@ -156,7 +156,7 @@ class PairingTest {
 
     @Test
     fun reScanningTheCoreAlreadyPairedIsARefreshOfItsToken() {
-        val landed = arrival(ticket(token = "bz1.fresh.sig"), server = eid, token = tok)
+        val landed = arrival(ticket(token = "erisdb1.fresh.sig"), server = eid, token = tok)
         assertTrue((landed as Arrival.Confirm).sameCore)
     }
 
@@ -169,7 +169,7 @@ class PairingTest {
 
     @Test
     fun aTicketThatCannotBeReadIsRefusedRatherThanRouted() {
-        val landed = arrival("bezel://pair/!!!", server = eid, token = tok)
+        val landed = arrival("erisdb://pair/!!!", server = eid, token = tok)
         assertTrue((landed as Arrival.Refused).reason.contains("base64url"))
     }
 

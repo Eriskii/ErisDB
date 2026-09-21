@@ -13,7 +13,7 @@ credentials and renew until revoked.
 ## The token
 
 ```
-bz1.<b64url(payload)>.<b64url(hmac_sha256(secret, payload))>
+erisdb1.<b64url(payload)>.<b64url(hmac_sha256(secret, payload))>
 ```
 
 Three dot-separated parts, base64url without padding. The payload is JSON:
@@ -41,7 +41,7 @@ clients are expected to — that is how an app knows when to refresh.
 `GET /v1/permissions` answers the same question without any base64, for
 a client that would rather ask than parse.
 
-Verification is: three parts, prefix `bz1`, both segments decode, the HMAC
+Verification is: three parts, prefix `erisdb1`, both segments decode, the HMAC
 matches in constant time, the payload parses as a capability, `exp` is in
 the future, and the chain end is in the future. Anything else is a flat 401
 with no hint as to which. A refused token is logged with the path and the
@@ -64,11 +64,9 @@ called `sensors` is registered, and then it matches. So standing up a new
 client requires `meta:facets:write` and nothing else, ever — no deploy, no
 allowlist entry, no core release. The e2e suite pins that path end to end.
 
-**The core carries what it does not understand.** A grant whose namespace
-is not a facet, or whose action is not one the core enforces, is stored,
-delegated and enclosed like any other. A bridge can define `imap:sync` and
-enforce it itself, and the token, the pairing prompt and the enclosure
-rules all handle it correctly without the core knowing what IMAP is.
+**Operation permissions use the same grant syntax.** For example, the shipped
+OpenAI operation requires `openai:chat`. It is delegated and bounded by the same
+rules as facet permissions.
 
 **`meta` is closed.** Core operations live there and only there, facet
 names may not reach into it, and `*:read` — read everything — deliberately
@@ -190,7 +188,7 @@ access, renewal, delegated tokens and active change subscriptions across replica
 Signing-key rotation alone does not revoke a registration: its proof can renew
 against the new signing key. See [clients.md](clients.md#administration).
 
-Legacy and manual tokens without a `client` claim have no individual registry
+Manual tokens without a `client` claim have no individual registry
 entry. Their expiry or signing-key rotation ends them. Keep the Iroh seed separate
 if rotating the signing key must preserve the core's address.
 

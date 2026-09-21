@@ -19,7 +19,7 @@ import dev.erisdb.tasks.theme.ErisDBTasksTheme
 class MainActivity : ComponentActivity() {
 
   /**
-   * The `bezel://pair/…` this activity was opened with, if any.
+   * The `erisdb://pair/…` this activity was opened with, if any.
    *
    * The phone's own camera app reads the QR code `erisdb pair` prints and
    * opens the URI in it, which the manifest's intent filter routes here.
@@ -60,6 +60,6 @@ class MainActivity : ComponentActivity() {
    * scheme here keeps a launcher tap from being mistaken for a pairing. */
   private fun pairingUri(intent: Intent?): String? {
     val data = intent?.data ?: return null
-    return if (data.scheme == "bezel" && data.host == "pair") data.toString() else null
+    return if (data.scheme == "erisdb" && data.host == "pair") data.toString() else null
   }
 }

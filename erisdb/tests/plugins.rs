@@ -1,4 +1,4 @@
-//! One-shot plugin HTTP contract, with a deliberately unreachable database.
+//! One-shot plugin HTTP interface, with a deliberately unreachable database.
 //! A successful call here proves plugin execution does not touch Postgres.
 
 use std::time::Duration;

@@ -9,7 +9,7 @@ just the server's endpoint id and a capability token.
 - **`../../erisdb-client/`** — the Rust core: dials by endpoint id (or a
   full `EndpointAddr` JSON), holds one connection, one bi-stream per
   request. Compiled as `liberisdb_client.so` via `cargo ndk` into
-  `app/src/main/jniLibs/`. Its contract is pinned by host-side tests
+  `app/src/main/jniLibs/`. Its schema is pinned by host-side tests
   against a real core over real QUIC.
 - **Kotlin shell** — `ErisDB.kt` is the JNI surface (configure + request,
   JSON in/out) and `Core.kt` wraps it in the `CoreApi` interface the rest
@@ -24,7 +24,7 @@ just the server's endpoint id and a capability token.
   is the small inline renderer and `LinkPreview.kt` is the opt-in
   og:image lookup.
 
-The application id remains `dev.bezel.lists` to preserve installed app data.
+The application id remains `dev.erisdb.lists` to preserve installed app data.
 The source namespace is `dev.erisdb.lists`. The phone mints a random 32-byte
 iroh identity on first launch and keeps it, so `source.addr` names this
 device stably across sessions. The client string is
@@ -110,14 +110,14 @@ previews are remembered, up to a bounded number of them.
 
 ## Token refresh
 
-Tokens carry their own expiry. The lifetime the admin chose at mint time
-is captured at connect (`exp − now`) and every sync checks the clock:
-under half that lifetime remaining, the app trades the token for a fresh
-one via `POST /v1/capabilities/refresh`, asking for the same lifetime.
-Refresh moves time, not privilege. A token that never expires is never
-refreshed; a dead one says so on the status line. A token whose `exp` has
-already arrived is refused when it is offered rather than saved —
-there is no lifetime left to preserve, and no refresh can invent one.
+Paired installations renew through `POST /v1/clients/{id}/refresh`, proving
+possession of the persistent Iroh key. The app saves the replacement token and
+can renew after access-token expiry. Current permissions and revocation are
+checked by the server. The app reads permissions again during sync.
+
+For a manually configured token, refresh uses `POST /v1/capabilities/refresh`
+and is bounded by the token's expiry and refresh-chain deadline. A token with
+no expiry is not refreshed.
 
 ## Secrets
 
@@ -125,8 +125,7 @@ The capability token and the iroh private key are the two things on the
 phone worth stealing: one is write access to the store, the other is this
 device's identity on the network. Both are sealed with an AES-256-GCM key
 the Android keystore generates and never hands out; what sits on disk is
-ciphertext and the key that opens it cannot leave the device. An install
-that predates this carries its values across on first run.
+ciphertext and the key that opens it cannot leave the device.
 
 `android:allowBackup="false"`. Nothing here belongs in Google's cloud or
 on a device-to-device transfer: the secrets would arrive elsewhere as
@@ -166,13 +165,13 @@ erisdb pair --name my-laptop
 ```
 
 No scope flags: the client says what it wants and you answer. That prints
-a QR code holding `bezel://pair/<base64url-nopad(JSON)>`, which carries
+a QR code holding `erisdb://pair/<base64url-nopad(JSON)>`, which carries
 where the core is and a **pairing code** — a token holding exactly
 `meta:pairing:redeem`, naming one session, good for minutes. It is not a
 capability over any data.
 
 Point the phone's camera at it and tap the link it offers: Android routes
-the `bezel` scheme to this app. There is no scanner in here. The camera
+the `erisdb` scheme to this app. There is no scanner in here. The camera
 app is already one, so this app asks for no camera permission and trusts
 no QR library — and a scan while the app is running lands on the same
 activity rather than a second copy of it.
@@ -202,7 +201,7 @@ screen, the first thing an unpaired phone sees, repeated in Settings for
 re-pairing. Settings names the core it is paired with, from the ticket's
 `name`.
 
-A ticket is read all-or-nothing. No `bezel://pair/` prefix, a payload
+A ticket is read all-or-nothing. No `erisdb://pair/` prefix, a payload
 that is not base64url, a `v` this app does not know, neither `eid` nor
 `url`, an `eid` that is not 64 hex characters, no token: each is refused
 by name rather than stored as half a config. A ticket carrying only `url`
@@ -251,9 +250,7 @@ forever.
 
 Grants are unknown until `/v1/permissions` answers once, and unknown
 draws every button: a phone with no signal at launch is not a phone that
-lost its permissions. An install that already holds a token keeps it —
-the tokens did not change, only how permissions are named — and reads its
-grants back on the next connect.
+lost its permissions. Saved permissions are refreshed on the next connection.
 
 ## Licence
 

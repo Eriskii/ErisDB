@@ -47,46 +47,9 @@ private fun facetBody(): JSONObject = JSONObject()
     .put("lapse", JSONObject(LAPSE))
     .put("permissions", descriptions())
 
-/**
- * Register the facet, or bring an older registration up to this schema —
- * for a token that holds `meta:facets:write`, which only an operator who
- * granted `*` or `meta:*` has handed over. Everyone else skips it, and the
- * facet is the operator's to register.
- */
+/** Register the schema when absent and explicitly authorized. */
 suspend fun ensureFacet(api: CoreApi, grants: Grants) {
     if (!grants.can("meta:facets:write")) return
     val req = JSONObject().put("facet", "facet").put("body", facetBody())
-    val r = api.request("POST", "/v1/items", req.toString())
-    // Reading a registration back is a separate permission from writing
-    // one, so an upgrade needs both.
-    if (r.optInt("status") == 409 && grants.can("meta:facets:read")) upgradeFacet(api)
-}
-
-private suspend fun upgradeFacet(api: CoreApi) {
-    val list = api.request("GET", "/v1/items?facet=facet&limit=$ITEM_PAGE")
-    if (list.optInt("status") != 200) return
-    val registered = jsonObjects(list.getJSONObject("body").getJSONArray("items"))
-        .firstOrNull { it.getJSONObject("body").optString("name") == FACET } ?: return
-    val body = registered.getJSONObject("body")
-    val properties = body.optJSONObject("schema")?.optJSONObject("properties")
-    // Already this schema, and already carrying the version and the
-    // descriptions a pairing prompt reads out.
-    if (properties != null && properties.has("repeat") &&
-        body.optInt("version") == FACET_VERSION && body.has("permissions")
-    ) return
-
-    val id = registered.getString("id")
-    var revision = registered.getLong("revision")
-    for (attempt in 0 until 2) {
-        val req = JSONObject().put("body", facetBody()).put("revision", revision)
-        val r = api.request("PUT", "/v1/items/$id", req.toString())
-        if (r.optInt("status") == 200) return
-        if (r.optInt("status") == 409 && attempt == 0) {
-            val fresh = api.request("GET", "/v1/items/$id")
-            if (fresh.optInt("status") != 200) return
-            revision = fresh.getJSONObject("body").getLong("revision")
-            continue
-        }
-        return
-    }
+    api.request("POST", "/v1/items", req.toString())
 }

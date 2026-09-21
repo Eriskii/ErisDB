@@ -68,7 +68,7 @@ impl Session {
 /// Re-pairing reuses the proof and atomically replaces only this core's credential.
 pub async fn pair(ticket: &str, fallback_url: Option<&str>, path: &Path, name: &str, grants: &[String]) -> Result<()> {
     if grants.is_empty() { bail!("request at least one permission with --grant"); }
-    let payload = ticket.trim().strip_prefix("bezel://pair/").context("expected an ErisDB pairing ticket")?;
+    let payload = ticket.trim().strip_prefix("erisdb://pair/").context("expected an ErisDB pairing ticket")?;
     let ticket: Value = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(payload)?)?;
     if ticket["v"] != 1 { bail!("unsupported ticket version"); }
     let url = base_url(ticket["url"].as_str().or(fallback_url).context("this ticket needs --url for the HTTPS endpoint")?)?;

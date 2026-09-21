@@ -81,7 +81,7 @@ pub extern "system" fn Java_dev_erisdb_client_ErisDB_nativeRequest(
     out(&mut env, &response)
 }
 
-/// Read a `bezel://pair/…` ticket off a QR code: returns
+/// Read a `erisdb://pair/…` ticket off a QR code: returns
 /// `{"ok":true,"ticket":{v, name, eid, url, token}}`, or
 /// `{"ok":false,"error":…}`. Dials nothing.
 #[no_mangle]

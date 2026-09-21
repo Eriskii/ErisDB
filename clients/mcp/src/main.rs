@@ -1,6 +1,6 @@
 //! An ErisDB client speaking MCP over stdio, built on rmcp (the official MCP
 //! Rust SDK). Every tool is a thin wrapper over the core's HTTP API — the
-//! server holds a capability token and a base URL, nothing else. Success
+//! client holds its credential and the core URL. Success
 //! returns the API's JSON as text content; failure returns an `isError`
 //! result carrying the status and body, so a tool error never kills the
 //! session.
@@ -39,7 +39,7 @@ const MAX_FACET_SCAN: usize = 25;
 /// Items read per facet in one search pass — the core's own ceiling.
 const SCAN_PAGE: &str = "1000";
 
-/// The default ceiling on the lifetime of a token this server causes to
+/// The default ceiling on the lifetime of a token this client causes to
 /// exist — minted or approved: a day.
 const DEFAULT_MAX_MINT_TTL: i64 = 86_400;
 
@@ -116,7 +116,7 @@ impl ErisDBMcp {
             .http
             .request(method, format!("{}{path}", self.base))
             .bearer_auth(token)
-            .header("x-bezel-client", "erisdb-mcp");
+            .header("x-erisdb-client", "erisdb-mcp");
         if !query.is_empty() {
             req = req.query(query);
         }
@@ -589,7 +589,7 @@ fn token_from_env() -> anyhow::Result<String> {
 }
 
 #[derive(Parser)]
-#[command(version, about = "ErisDB MCP bridge; pair once, renew until revoked")]
+#[command(version, about = "ErisDB MCP client; pair once, renew until revoked")]
 struct Args {
     /// Advanced override for where this installation remembers its pairing.
     #[arg(long, env = "ERISDB_SESSION_FILE", global = true)]
@@ -623,18 +623,18 @@ async fn main() -> anyhow::Result<()> {
     }
     let manual = args.session_file.is_none() && args.profile.is_none() &&
         (std::env::var_os("ERISDB_TOKEN_FILE").is_some() || std::env::var_os("ERISDB_TOKEN").is_some());
-    let bridge = if !manual {
+    let client = if !manual {
         let path = session::path(args.session_file, profile)?;
         let session = session::Session::read(&path)?;
-        let mut bridge = ErisDBMcp::new(session.url.clone(), session.token.clone(), Policy::from_env());
-        bridge.session = Some(Arc::new(session));
-        bridge
+        let mut client = ErisDBMcp::new(session.url.clone(), session.token.clone(), Policy::from_env());
+        client.session = Some(Arc::new(session));
+        client
     } else {
         let base = session::base_url(&std::env::var("ERISDB_URL")
             .map_err(|_| anyhow::anyhow!("set ERISDB_SESSION_FILE, or ERISDB_URL and ERISDB_TOKEN_FILE"))?)?;
         ErisDBMcp::new(base, token_from_env()?, Policy::from_env())
     };
-    let service = bridge.serve(rmcp::transport::stdio()).await?;
+    let service = client.serve(rmcp::transport::stdio()).await?;
     service.waiting().await?;
     Ok(())
 }

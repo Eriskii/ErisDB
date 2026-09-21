@@ -14,14 +14,12 @@ executables for non-durable calls into external systems.
 - **Core** — this process. Verifies capabilities, validates writes against
   facet schemas, serves the API. Holds nothing a restart would lose; run as
   many replicas as you like.
-- **Facet** — a named contract over the store (`tasks`), and the namespace
+- **Facet** — a named schema over the store (`tasks`), and the namespace
   its permissions live in. Facets are themselves items in the meta-facet
   `facet`: registering one is a `POST /v1/items`, no deploy. Writes to a
   strict facet are validated against its JSON Schema, and the schema
   version lives in the body so a grant survives it moving.
-- **Client** — anything with a capability token. A bridge is a client that
-  represents an external system and keeps its config as items in its own
-  facet.
+- **Client** — a separate application that calls the server with a capability token.
 - **Installation** — a registered app identity, bound to an Iroh key or a
   browser/MCP renewal secret. Human pairing approval establishes its authority;
   Postgres stores its current grants and revocation status.
@@ -49,7 +47,7 @@ executables for non-durable calls into external systems.
   `{addr, user, client, installation}` with a trust gradient. `addr` is observed
   from the connection (peer IP over TCP, `iroh:<endpoint id>` over QUIC),
   `user` is signed into the capability, `client` is whatever the caller
-  claims via the `X-Bezel-Client` header, and `installation` is the authenticated
+  claims via the `X-ErisDB-Client` header, and `installation` is the authenticated
   registration ID when present. Items carry their last writer's
   source; every change row carries the source that produced it.
 - **History** — every change row snapshots the body and revision it
@@ -103,7 +101,7 @@ this blocks subsequent access and renewal, including delegated tokens, and close
 idle change streams across replicas. An installation remains authorized until
 revoked unless the operator explicitly chooses a temporary registration.
 
-Manual tokens have no registry entry and retain their original expiry and
+Manual tokens have no registry entry and carry expiry and
 refresh-chain limits. Two rules apply to token delegation and bounded refresh:
 
 - **Enclosure covers scope and time.** A minted token never grants what its
@@ -132,7 +130,7 @@ unless `ERISDB_IROH_SECRET` is set separately. See [clients.md](../docs/clients.
 The core bounds what a caller can spend: 32 concurrent change streams
 (each holds a Postgres connection of its own), 64 iroh connections with 32
 streams each, a token bucket over both capability endpoints, and a 128-char
-cap on `X-Bezel-Client`. A facet schema may only `$ref` into itself — an
+cap on `X-ErisDB-Client`. A facet schema may only `$ref` into itself — an
 external ref would ask the core to fetch a URL or read a file on every
 write to that facet, so it is refused at registration.
 
@@ -141,7 +139,7 @@ not cover the item's facet. That tells a caller holding the wrong token
 something true about an id it already has; item ids are v4 UUIDs, so it is
 not a way to find one.
 
-The same router is served over plain TCP and over Iroh (ALPN `bezel/0`,
+The same router is served over plain TCP and over Iroh (ALPN `erisdb/0`,
 HTTP/1.1 per QUIC bi-stream), so an ErisDB is dialable from anywhere without
 exposing a port. The iroh identity is derived from `ERISDB_IROH_SECRET`, or
 from `ERISDB_SECRET` when that is unset, so the endpoint id survives

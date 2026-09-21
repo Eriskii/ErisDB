@@ -24,16 +24,9 @@ import java.security.SecureRandom
 
 @SuppressLint("ApplySharedPref")
 class Store(ctx: Context) : OutboxStore {
-    private val prefs = ctx.getSharedPreferences("bezel", Context.MODE_PRIVATE)
+    private val prefs = ctx.getSharedPreferences("erisdb", Context.MODE_PRIVATE)
     private val secrets: SecretStore = KeystoreSecrets(ctx)
     private val cacheFile = File(ctx.filesDir, "items.json")
-
-    init {
-        migrateSecrets(PrefsSecrets(ctx, "bezel"), secrets, listOf("token", "identity"))
-        // The item cache is a file. SharedPreferences must not be carrying
-        // a second copy of it into memory on every read.
-        if (prefs.contains("cache")) prefs.edit().remove("cache").commit()
-    }
 
     // ------------------------------------------------------------ settings
 

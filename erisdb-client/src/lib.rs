@@ -1,4 +1,4 @@
-//! Dials an ErisDB over Iroh: HTTP/1.1 per QUIC bi-stream, ALPN `bezel/0`.
+//! Dials an ErisDB over Iroh: HTTP/1.1 per QUIC bi-stream, ALPN `erisdb/0`.
 //!
 //! The async [`Client`] is the real thing; [`blocking`] wraps it in an
 //! owned runtime for FFI callers (JNI has no executor). The Android
@@ -32,7 +32,7 @@ use serde_json::{json, Value};
 mod android;
 
 /// The erisdb wire protocol; must match the core's `net::ALPN`.
-pub const ALPN: &[u8] = b"bezel/0";
+pub const ALPN: &[u8] = b"erisdb/0";
 
 /// A request the core answered with a refusal. The status is a field, not
 /// prose, so callers — Kotlin across the FFI boundary especially — branch
@@ -302,7 +302,7 @@ impl Client {
             .uri(path)
             .header("host", "erisdb")
             .header("authorization", format!("Bearer {}", self.token.read().await))
-            .header("x-bezel-client", &self.client_name);
+            .header("x-erisdb-client", &self.client_name);
         let payload = match body {
             Some(v) => {
                 req = req.header("content-type", "application/json");
@@ -507,7 +507,7 @@ impl Client {
             .header("host", "erisdb")
             .header("accept", "text/event-stream")
             .header("authorization", format!("Bearer {}", self.token.read().await))
-            .header("x-bezel-client", &self.client_name)
+            .header("x-erisdb-client", &self.client_name)
             .body(Full::new(Bytes::new()))?;
         let resp = sender.send_request(req).await?;
         let status = resp.status().as_u16();
@@ -544,7 +544,7 @@ impl Client {
             .uri("/v1/call")
             .header("host", "erisdb")
             .header("authorization", format!("Bearer {}", self.token.read().await))
-            .header("x-bezel-client", &self.client_name)
+            .header("x-erisdb-client", &self.client_name)
             .header("content-type", "application/json")
             .body(Full::new(Bytes::from(payload)))?;
         let resp = sender.send_request(req).await?;
@@ -609,7 +609,7 @@ impl Drop for PluginStream {
 
 /// The literal prefix of a pairing ticket. Everything after it is the
 /// encoded payload.
-pub const TICKET_SCHEME: &str = "bezel://pair/";
+pub const TICKET_SCHEME: &str = "erisdb://pair/";
 
 /// The only ticket version this client understands. A ticket carrying
 /// another is refused rather than guessed at.
@@ -639,7 +639,7 @@ pub struct Ticket {
 }
 
 impl Ticket {
-    /// Read `bezel://pair/<base64url-nopad(JSON)>`.
+    /// Read `erisdb://pair/<base64url-nopad(JSON)>`.
     ///
     /// Everything the format says to refuse is refused here: a wrong
     /// prefix, a payload that does not decode, an unknown version, no
@@ -1137,7 +1137,7 @@ pub mod blocking {
         PAIRING.get_or_init(|| Mutex::new(None))
     }
 
-    /// Read a `bezel://pair/…` ticket:
+    /// Read a `erisdb://pair/…` ticket:
     /// `{"ok":true,"ticket":{v, name, eid, url, token}}`, or
     /// `{"ok":false,"error":…}` naming what was wrong with it.
     ///

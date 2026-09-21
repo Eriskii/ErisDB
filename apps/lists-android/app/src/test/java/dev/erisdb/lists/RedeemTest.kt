@@ -79,9 +79,9 @@ class RedeemTest {
         requestPairing(core, CLIENT, MANIFEST)
         assertEquals(Approval.Waiting(), collect(core) { fail("nothing to keep yet") })
 
-        core.approve(listOf("lists:read", "lists:create"), "bz1.granted.sig")
+        core.approve(listOf("lists:read", "lists:create"), "erisdb1.granted.sig")
         val out = collect(core) {}
-        assertEquals("bz1.granted.sig", (out as Approval.Approved).token)
+        assertEquals("erisdb1.granted.sig", (out as Approval.Approved).token)
         assertEquals(listOf("lists:read", "lists:create"), out.granted)
     }
 
@@ -90,24 +90,24 @@ class RedeemTest {
         // Persist before allowing app work to proceed.
         val core = core()
         requestPairing(core, CLIENT, MANIFEST)
-        core.approve(listOf("lists:*"), "bz1.only.chance")
+        core.approve(listOf("lists:*"), "erisdb1.only.chance")
 
         var kept: String? = null
         val out = collect(core) { kept = it }
 
-        assertEquals("bz1.only.chance", kept)
-        assertEquals("bz1.only.chance", (out as Approval.Approved).token)
-        assertEquals("bz1.only.chance", core.pairToken)
+        assertEquals("erisdb1.only.chance", kept)
+        assertEquals("erisdb1.only.chance", (out as Approval.Approved).token)
+        assertEquals("erisdb1.only.chance", core.pairToken)
     }
 
     @Test
     fun theSameInstallationCanRecoverALostCollectionResponse() = runTest {
         val core = core()
         requestPairing(core, CLIENT, MANIFEST)
-        core.approve(listOf("lists:read"), "bz1.recoverable")
+        core.approve(listOf("lists:read"), "erisdb1.recoverable")
         collect(core) {}
         val recovered = collect(core) {}
-        assertEquals("bz1.recoverable", (recovered as Approval.Approved).token)
+        assertEquals("erisdb1.recoverable", (recovered as Approval.Approved).token)
     }
 
     @Test
@@ -140,14 +140,14 @@ class RedeemTest {
         assertTrue(pollingOn(Approval.Waiting()))
         assertFalse(pollingOn(Approval.Denied))
         assertFalse(pollingOn(Approval.Over("gone")))
-        assertFalse(pollingOn(Approval.Approved("bz1.x", emptyList())))
+        assertFalse(pollingOn(Approval.Approved("erisdb1.x", emptyList())))
     }
 
     @Test
     fun anApprovalNarrowerThanTheRequestIsCarriedNotComplainedAbout() = runTest {
         val core = core()
         requestPairing(core, CLIENT, MANIFEST)
-        core.approve(listOf("lists:read"), "bz1.narrow")
+        core.approve(listOf("lists:read"), "erisdb1.narrow")
 
         val out = collect(core) {} as Approval.Approved
         val held = Grants(out.granted)

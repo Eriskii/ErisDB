@@ -16,7 +16,7 @@ async function ticket(request, name) {
   const response = await api(request, "POST", "/v1/pairings", {});
   expect(response.status()).toBe(201);
   const session = await response.json();
-  return { ...session, ticket: "bezel://pair/" + Buffer.from(JSON.stringify({ v: 1, name, url: core, token: session.secret })).toString("base64url") };
+  return { ...session, ticket: "erisdb://pair/" + Buffer.from(JSON.stringify({ v: 1, name, url: core, token: session.secret })).toString("base64url") };
 }
 
 for (const app of ["tasks", "lists"]) {
@@ -57,7 +57,7 @@ for (const app of ["tasks", "lists"]) {
       const data = await (await api(request, "GET", `/v1/items?facet=${app}`)).json();
       return data.items.some(item => (item.body.title ?? item.body.name) === label);
     }).toBe(true);
-    const saved = await page.evaluate(app => JSON.parse(localStorage.getItem(`bezel.${app}.config`)), app);
+    const saved = await page.evaluate(app => JSON.parse(localStorage.getItem(`erisdb.${app}.config`)), app);
     expect(saved.refreshSecret).toHaveLength(43);
     // Wait for actual expiry; no simulated clock or intercepted responses.
     await expect.poll(() => Date.now() / 1000, { timeout: 6000 }).toBeGreaterThan(JSON.parse(Buffer.from(saved.token.split(".")[1], "base64url")).exp);
@@ -71,13 +71,13 @@ for (const app of ["tasks", "lists"]) {
     }, saved.token);
     await rejection;
     expect(recovered.status).toBe(200);
-    const recoveredToken = await page.evaluate(app => JSON.parse(localStorage.getItem(`bezel.${app}.config`)).token, app);
+    const recoveredToken = await page.evaluate(app => JSON.parse(localStorage.getItem(`erisdb.${app}.config`)).token, app);
     await expect.poll(() => Date.now() / 1000, { timeout: 6000 }).toBeGreaterThan(JSON.parse(Buffer.from(recoveredToken.split(".")[1], "base64url")).exp);
     const renewal = page.waitForResponse(response => response.url().endsWith(`/v1/clients/${session.id}/refresh`) && response.status() === 200);
     await page.reload();
     await renewal;
     await expect(page.locator(app === "tasks" ? "#list" : "#entries")).toContainText(label);
-    const resumed = await page.evaluate(app => JSON.parse(localStorage.getItem(`bezel.${app}.config`)), app);
+    const resumed = await page.evaluate(app => JSON.parse(localStorage.getItem(`erisdb.${app}.config`)), app);
     expect(resumed.token).not.toBe(saved.token);
 
     // Pair this same browser installation again; its identity stays singular.
@@ -88,7 +88,7 @@ for (const app of ["tasks", "lists"]) {
     await expect(page.locator("#pair-wait-what")).toContainText("Compare");
     expect((await api(request, "POST", `/v1/pairings/${again.id}/approve`, { granted: [`${app}:read`, `${app}:create`], ttl_secs: 3 })).status()).toBe(200);
     await expect(page.locator("#pair-wait")).toBeHidden();
-    const pairedAgain = await page.evaluate(app => JSON.parse(localStorage.getItem(`bezel.${app}.config`)), app);
+    const pairedAgain = await page.evaluate(app => JSON.parse(localStorage.getItem(`erisdb.${app}.config`)), app);
     expect(pairedAgain.refreshSecret).toBe(saved.refreshSecret);
     expect(JSON.parse(Buffer.from(pairedAgain.token.split(".")[1], "base64url")).client).toBe(session.id);
 
@@ -113,8 +113,8 @@ test("denial grants nothing and unsafe remote HTTP tickets are refused", async (
   await expect(page.locator("#pair-wait-what")).toContainText("Compare");
   expect((await api(request, "POST", `/v1/pairings/${session.id}/deny`, {})).status()).toBe(200);
   await expect(page.locator("#pair-msg")).toContainText("refused");
-  expect(await page.evaluate(() => localStorage.getItem("bezel.tasks.config"))).toBeNull();
-  const unsafe = "bezel://pair/" + Buffer.from(JSON.stringify({ v: 1, url: "http://192.168.1.25:7700", token: session.secret })).toString("base64url");
+  expect(await page.evaluate(() => localStorage.getItem("erisdb.tasks.config"))).toBeNull();
+  const unsafe = "erisdb://pair/" + Buffer.from(JSON.stringify({ v: 1, url: "http://192.168.1.25:7700", token: session.secret })).toString("base64url");
   await page.locator("#cfg-ticket").fill(unsafe);
   await page.locator("#cfg-pair").click();
   await expect(page.locator("#pair-msg")).toContainText("HTTPS");

@@ -66,7 +66,6 @@ fun applyChange(cache: MutableMap<String, JSONObject>, ch: JSONObject) {
         cache.remove(id)
         return
     }
-    // Migration rows carry no body; there is nothing to fold in.
     val body = ch.optJSONObject("body") ?: return
     val known = cache[id]
     if (ch.optString("op") == "lapsed" && known != null) {
@@ -119,11 +118,6 @@ data class Seed(val items: Map<String, JSONObject>, val cursor: Long)
  * free: a change row is the state the write produced, so applying one
  * twice lands in the same place.
  *
- * The snapshot is not redundant with the walk to the head. Change rows
- * only started carrying bodies at migration 0003, so a store older than
- * that has rows the feed cannot reconstruct an item from; and a feed the
- * core someday prunes would lose more. `/v1/items` is the complete
- * answer by construction, and the feed is what keeps it complete.
  */
 suspend fun seed(api: CoreApi, facet: String): Read<Seed> {
     val head = when (val h = feedHead(api, facet)) {

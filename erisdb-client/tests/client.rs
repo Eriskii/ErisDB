@@ -1,4 +1,4 @@
-//! The erisdb-client contract, proven against a real core: real Postgres
+//! The erisdb-client interface, proven against a real core: real Postgres
 //! (Docker via testcontainers), a real erisdb serving over real Iroh QUIC,
 //! and this client dialing it. No mocks.
 
@@ -670,7 +670,7 @@ async fn the_blocking_facade_pairs() {
     let v: Value = serde_json::from_str(&approved).unwrap();
     assert_eq!(v["ok"], true, "{approved}");
     assert_eq!(v["status"], "approved", "{approved}");
-    assert!(v["token"].as_str().unwrap().starts_with("bz1."), "{approved}");
+    assert!(v["token"].as_str().unwrap().starts_with("erisdb1."), "{approved}");
     assert_eq!(v["granted"], json!(["tasks:read"]), "{approved}");
 
     // The session is spent; the slot is gone with it.
@@ -722,7 +722,7 @@ fn a_ticket_is_read_or_refused() {
 
     let eid = "e718b50236b0b98637fbf39cb4040e79800094313dc195e221e8e075304a6a06";
     let good = erisdb::ticket::Ticket::new(
-        "bz1.payload.sig".into(),
+        "erisdb1.payload.sig".into(),
         Some(eid.into()),
         Some("http://10.0.0.2:7700".into()),
         Some("my-laptop".into()),
@@ -733,35 +733,35 @@ fn a_ticket_is_read_or_refused() {
 
     let t = erisdb_client::Ticket::parse(&format!("  {good}\n")).expect("whitespace is forgiven");
     assert_eq!(t.v, 1);
-    assert_eq!(t.token, "bz1.payload.sig");
+    assert_eq!(t.token, "erisdb1.payload.sig");
     assert_eq!(t.eid.as_deref(), Some(eid));
     assert_eq!(t.url.as_deref(), Some("http://10.0.0.2:7700"));
     assert_eq!(t.name.as_deref(), Some("my-laptop"));
 
-    let encode = |v: Value| format!("bezel://pair/{}", B64.encode(serde_json::to_vec(&v).unwrap()));
+    let encode = |v: Value| format!("erisdb://pair/{}", B64.encode(serde_json::to_vec(&v).unwrap()));
     for bad in [
         String::new(),
-        good.strip_prefix("bezel://pair/").unwrap().to_string(),
+        good.strip_prefix("erisdb://pair/").unwrap().to_string(),
         format!("https://pair/{good}"),
-        "bezel://pair/!!!not-base64!!!".to_string(),
-        format!("bezel://pair/{}", B64.encode("not json")),
+        "erisdb://pair/!!!not-base64!!!".to_string(),
+        format!("erisdb://pair/{}", B64.encode("not json")),
         // An unknown version is refused rather than guessed at.
-        encode(json!({"v": 2, "token": "bz1.a.b", "eid": eid})),
+        encode(json!({"v": 2, "token": "erisdb1.a.b", "eid": eid})),
         // No address is half a config.
-        encode(json!({"v": 1, "token": "bz1.a.b"})),
+        encode(json!({"v": 1, "token": "erisdb1.a.b"})),
         // No code to redeem.
         encode(json!({"v": 1, "eid": eid})),
         encode(json!({"v": 1, "token": "", "eid": eid})),
         // An endpoint id that is not one.
-        encode(json!({"v": 1, "token": "bz1.a.b", "eid": "too-short"})),
-        encode(json!({"v": 1, "token": "bz1.a.b", "eid": "g".repeat(64)})),
+        encode(json!({"v": 1, "token": "erisdb1.a.b", "eid": "too-short"})),
+        encode(json!({"v": 1, "token": "erisdb1.a.b", "eid": "g".repeat(64)})),
     ] {
         assert!(erisdb_client::Ticket::parse(&bad).is_err(), "accepted {bad:?}");
     }
 
     // A url-only ticket is legal, and this client says plainly that it
     // cannot dial one: it speaks QUIC and nothing else.
-    let browser_only = encode(json!({"v": 1, "token": "bz1.a.b", "url": "http://10.0.0.2:7700"}));
+    let browser_only = encode(json!({"v": 1, "token": "erisdb1.a.b", "url": "http://10.0.0.2:7700"}));
     let t = erisdb_client::Ticket::parse(&browser_only).expect("legal ticket");
     assert_eq!(t.eid, None);
     let refused = t.endpoint_id().unwrap_err().to_string();
