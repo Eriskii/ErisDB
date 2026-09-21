@@ -11,6 +11,14 @@ env:
   RUSTFLAGS: -D warnings
 
 jobs:
+  local-launcher:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check startup, persistent data, CLI, and shutdown against real services
+        run: python3 tests/local/test_launcher.py
+
   security:
     runs-on: ubuntu-latest
     steps:

@@ -7,6 +7,44 @@ install commands; this page is what to know while it is running.
 Postgres. The poker calls the tick endpoint on a timer. In-memory caches,
 rate limits, and active connections belong to each running server process.
 
+## Local launcher
+
+From the checkout, run `./scripts/run-local.py`. It builds ErisDB, starts a dedicated
+Postgres 17 Docker container, starts the server, and opens an `erisdb>` prompt.
+Python 3, Docker access, Cargo, and a C build toolchain are required on Linux.
+
+Type the existing CLI subcommands directly, for example:
+
+```text
+erisdb> endpoint-id
+erisdb> clients list
+erisdb> pair --name "My server" --client-url http://127.0.0.1:7700
+erisdb> exit
+```
+
+The prompt accepts quoted arguments and passes them to the ErisDB binary; it does
+not interpret shell pipes or variable expansion. `help` displays the CLI help.
+Pairing retains its normal interactive approval screen.
+
+The default data directory is `${XDG_DATA_HOME:-~/.local/share}/erisdb/local/`.
+`--data-dir PATH` selects another directory, and `--port PORT` changes the HTTP
+port from 7700. The launcher refuses an occupied port or a data directory already
+in use by another launcher. Both HTTP and Postgres TCP listeners bind to localhost;
+the server also starts its normal encrypted Iroh endpoint.
+
+The directory contains `postgres/` with the database files, `config.json` with the
+server key and database password, `server.log`, `postgres.log`, and a lock file.
+The directory is private to your user and the configuration file has mode 0600.
+Postgres owns its data files inside the bind mount. Data is written continuously;
+shutdown stops Postgres cleanly, then removes the container while retaining those
+files. Keep the configuration and database together so future sessions retain
+their server identity and credentials.
+
+`exit`, EOF/Ctrl-D, Ctrl-C, SIGHUP, and SIGTERM close the session and stop its
+processes. Startup failures also clean up services already started. Logs remain
+in the data directory for diagnosis. To copy the directory as a filesystem backup,
+stop the launcher first; normal live backups use `pg_dump` as described below.
+
 ## Systemd service (Debian)
 
 After building the server and creating the database using the README, install

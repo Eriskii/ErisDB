@@ -10,6 +10,20 @@ pairing, permissions, and CLI commands, with examples.
 
 ## Install
 
+To start the server and Postgres together and enter an interactive CLI, run:
+
+```sh
+./scripts/run-local.py
+```
+
+Requires Python 3, Docker running, and a Rust/C build toolchain. The script builds
+this checkout and downloads the Postgres image if needed. At `erisdb>`, type
+`pair`, `clients list`, `endpoint-id`, or `help` directly. `exit`, Ctrl-D, or Ctrl-C
+stops both services. The database and keys stay in `~/.local/share/erisdb/local/`
+(under `$XDG_DATA_HOME` when set), ready for the next run. Use `--data-dir PATH`
+or `--port 7701` to choose another location or HTTP port.
+
+For a separate server installation, follow the instructions below.
 These instructions build the server from source and set up a local PostgreSQL
 database. Run commands as your normal user unless they use `sudo`.
 
