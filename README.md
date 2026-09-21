@@ -90,8 +90,7 @@ needs to see the secret on disk.
 
 ### Tokens and the address
 
-Both come out of `ERISDB_SECRET`, so run these as root, with the environment
-file sourced:
+Run these commands with the service environment file sourced:
 
 ```sh
 set -a; . /etc/erisdb/erisdb.env; set +a
@@ -162,9 +161,9 @@ clients take an iroh endpoint id instead of a URL — no IP, no port.
 
 ## Backup and restore
 
-Postgres is the only stateful thing. Back it up and you have backed up the
-system: the core holds nothing a restart would lose, and the iroh identity
-is derived from `ERISDB_SECRET` rather than stored anywhere.
+Postgres holds the server's durable data. Back up the database together with
+the deployment configuration and secrets. The Iroh identity is derived from
+`ERISDB_IROH_SECRET`, or `ERISDB_SECRET` when that is unset.
 
 ```sh
 # DATABASE_URL comes from the environment file:
@@ -191,27 +190,25 @@ Three things to keep straight:
   history. A dump therefore contains every version of everything ever
   written, including things since deleted; size and handle it accordingly.
 - **A dump is half the system.** Without the same `ERISDB_SECRET`, every
-  token minted against the old deployment fails and the server comes back
-  at a different address. Back the secret up separately — and not inside
-  the dump.
+  token minted against that secret fails verification. Back up both configured
+  secrets separately from the dump to preserve the signing key and Iroh identity.
 
 ## Secrets
 
 `ERISDB_SECRET` does two jobs at once:
 
 1. It is the HMAC key that signs and verifies every capability token.
-2. It derives the server's iroh endpoint id — its permanent address.
+2. Unless `ERISDB_IROH_SECRET` is set, it also derives the Iroh endpoint ID.
 
 ```sh
 openssl rand -hex 32
 ```
 
-Rotating it therefore does two irreversible things to everything already
-deployed:
+Rotating it has these effects:
 
 - **Outstanding token signatures become invalid.** Registered installations
   can renew using their installation proof. Manual tokens must be re-minted.
-- **The server's address changes.** Each Android client and
+- **The address changes unless `ERISDB_IROH_SECRET` is set.** Each Android client and
   each `erisdb-client` caller is pinned to the endpoint id derived from the
   old secret, and will dial an address nobody answers. Print the new one
   with `erisdb endpoint-id` and re-pin every one of them.

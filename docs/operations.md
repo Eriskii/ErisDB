@@ -3,9 +3,9 @@
 Running an ErisDB. The [root README](../README.md#wiring-it-up) has the
 install commands; this page is what to know while it is running.
 
-The system is two moving parts and one stateful one. `erisdb serve` is a
-process that holds nothing a restart would lose. The poker is a curl in a
-timer. Postgres is everything else.
+`erisdb serve` stores items, history, and installation registrations in
+Postgres. The poker calls the tick endpoint on a timer. In-memory caches,
+rate limits, and active connections belong to each running server process.
 
 ## The process
 
@@ -43,7 +43,7 @@ Both secrets are marked so that `--help` and error output never echo them.
 
 Nothing in the process is durable. Restart it, run three of them behind a
 load balancer, kill one mid-request — the store is the truth and every
-replica reads it. Two things are per-replica and worth knowing:
+replica reads it. The following state is per replica:
 
 - **Compiled schema validators.** Cached per process, keyed by facet name
   and matched on the schema itself. Editing a registration recompiles on
@@ -157,10 +157,9 @@ bite, restated because they are the ones that lose data:
    fails and the server comes back at a different address. Back the
    secrets up separately, and not inside the dump.
 
-Postgres is the only stateful thing. There is no key file, no cache
-directory, no per-replica state: the iroh identity is derived from the
-secret rather than stored, and `deploy/erisdb.service` runs with
-`ProtectSystem=strict` because the core writes nothing to disk at all.
+The server stores its durable data in Postgres. Its Iroh identity is derived
+from the configured secret. Deployment manifests and secrets must be backed up
+separately from the database.
 
 ## Secrets and what rotation costs
 

@@ -12,16 +12,15 @@ executables for non-durable calls into external systems.
   totally-ordered change feed that doubles as the event bus, and `clients`
   holds installation identities, permissions and revocation.
 - **Core** — this process. Verifies capabilities, validates writes against
-  facet schemas, serves the API. Holds nothing a restart would lose; run as
-  many replicas as you like.
+  facet schemas, and serves the API. Durable state is stored in Postgres.
 - **Facet** — a named schema over the store (`tasks`), and the namespace
   its permissions live in. Facets are themselves items in the meta-facet
   `facet`: registering one is a `POST /v1/items`, no deploy. Writes to a
   strict facet are validated against its JSON Schema, and the schema
   version lives in the body so a grant survives it moving.
 - **Client** — a separate application that calls the server with a capability token.
-- **Installation** — a registered app identity, bound to an Iroh key or a
-  browser/MCP renewal secret. Human pairing approval establishes its authority;
+- **Installation** — a registered app identity, bound to an Iroh key or an
+  HTTP renewal secret. Human pairing approval establishes its authority;
   Postgres stores its current grants and revocation status.
 - **Plugin** — an operator-installed executable described by a manifest. One
   call starts one fresh process and streams its stdout; it never listens,

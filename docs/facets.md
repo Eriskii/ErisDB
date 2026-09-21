@@ -30,7 +30,7 @@ That has consequences for what a name may be:
 A registration that breaks the first two is **400 `bad_request`** naming
 the rule; a duplicate is **409 `conflict`**. And a name carries no version
 suffix: `tasks`, not `tasks/v1`. The version lives in the body, so a grant
-survives the schema moving. See [Versioning](#versioning).
+survives the schema moving. See [Versioning](#version-field).
 
 ## The `facet` meta-facet
 
