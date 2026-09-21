@@ -211,31 +211,35 @@ guess.
 
 ## Permission descriptions
 
-A registration may carry human sentences for the approval prompt:
+A registration may carry human sentences for the approval prompt. Add this
+`permissions` member to its body:
 
 ```json
-"permissions": {
-  "read": "read your tasks",
-  "create": "add tasks",
-  "update": "change and complete tasks",
-  "delete": "delete tasks"
+{
+  "permissions": {
+    "read": "read your tasks",
+    "create": "add tasks",
+    "update": "change and complete tasks",
+    "delete": "delete tasks"
+  }
 }
 ```
 
 Keys are actions, values are strings; the meta-facet schema requires
 nothing more, so a facet defining `sync` may describe `sync` too. They are
 presentation only: no grant depends on them, a missing one shows the raw
-permission, and nothing in the core reads them. They exist so that the
+permission, and authorization does not use these descriptions. They exist so that the
 person deciding whether to approve `tasks:delete` reads "delete tasks"
 instead.
 
 ## Lapse rules and the tick sweep
 
 The core has no idea what a task is or what "due" means. What it can do is
-compare a field to the clock, if a facet tells it which field.
+compare a field to the clock, if a facet tells it which field. Add this `lapse`
+member to the facet registration body:
 
 ```json
-"lapse": { "due": "due", "done": "done" }
+{"lapse": { "due": "due", "done": "done" }}
 ```
 
 `due` names a body field holding a timestamp. `done` names an optional
@@ -322,9 +326,9 @@ One-off and recurring tasks with optional due dates.
 }
 ```
 
-`title` and `done` are the whole of a task. `due` is what `lapse` watches;
-without the `lapse` rule there are no due notifications at all, which is
-the one part of this registration that is not merely documentation.
+`title` and `done` are required. `due` is the field the server's `lapse` rule
+watches. Server-emitted `lapsed` events require that rule and calls to `/v1/tick`;
+a client's local due-date checks can notify independently.
 
 `repeat` is a client-side convention the core knows nothing about:
 completing a repeating task advances `due` by `n` units instead of setting

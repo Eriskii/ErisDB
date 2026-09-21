@@ -358,7 +358,9 @@ api GET '/v1/items?facet=facet&limit=1000'
 Rows are ordered by `(updated_at, id)`, ascending. An empty or unknown facet
 returns an empty list if authorized. There is no offset or item-list cursor.
 A timestamp-only continuation can miss ties; use the sequence-based change feed
-for complete synchronization of large facets. URL-encode query values; in
+from `since=0` for complete initialization of application data, as shown in the
+[client guide](client-development.md#2-seed-a-cache-then-hold-a-cursor).
+URL-encode query values; in
 particular encode `+` in timezone offsets or use `Z` timestamps.
 
 ### `GET /v1/items/{id}`
@@ -377,13 +379,14 @@ This replaces the **whole body**; omitted fields disappear. **200** returns the
 updated Item with an incremented revision. A stale revision yields **409**.
 
 ```bash
+CURRENT_ITEM=$(api GET "/v1/items/$ITEM_ID")
 ITEM_JSON=$(api PUT "/v1/items/$ITEM_ID" --data \
-  "$(jq -nc --argjson revision "$ITEM_REV" \
-    '{revision:$revision,body:{title:"Edited note",done:false}}')")
+  "$(jq -c '{revision,body:(.body + {title:"Edited note"})}' <<<"$CURRENT_ITEM")")
 ITEM_REV=$(jq -r '.revision' <<<"$ITEM_JSON")
 ```
 
-The facet stays fixed. Read first, preserve the fields you intend to keep, and
+The facet stays fixed. A matching revision does not preserve omitted fields.
+Read first, preserve the fields you intend to keep, and
 handle 409 by reading the current value and resolving the concurrent edit.
 
 ### `DELETE /v1/items/{id}`

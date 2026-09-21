@@ -24,7 +24,7 @@ just the server's endpoint id and a capability token.
   is the small inline renderer and `LinkPreview.kt` is the opt-in
   og:image lookup.
 
-The application id remains `dev.erisdb.lists` to preserve installed app data.
+The application ID is `dev.erisdb.lists`.
 The source namespace is `dev.erisdb.lists`. The phone mints a random 32-byte
 iroh identity on first launch and keeps it, so `source.addr` names this
 device stably across sessions. The client string is
@@ -42,27 +42,28 @@ rather than `lists:create`.
 Registering a facet needs `meta:facets:write`, which is register, change
 and remove *every* facet on the core — so this app does not ask for it
 (see **Permissions**). An operator who granted `*` gets self-registration
-anyway. Without it, the facet is the operator's to register in one
-`erisdb` command, and a write against a facet nobody registered comes back
+anyway. Without it, the facet is the operator's to register through
+`POST /v1/items`, and a write against a facet nobody registered comes back
 422 and lands on the status line as *the lists facet is not registered on
 this core — ask your operator to register it*.
 
 ## Sync
 
-First contact reads the change feed's head, then every item in the facet.
-In that order: the snapshot is then at least as new as the cursor, and
-anything that landed in between simply replays on the next poll —
-replaying is free, because a change row *is* the state the write
-produced. `GET /v1/items` orders by `updated_at` and answers at most a
-thousand rows at a time, so the snapshot is paged forward with
-`updated_since` until a short page ends it. A store of any size arrives
-whole.
+The app first reads the change feed's head, then fetches an item snapshot. It
+pages the snapshot with `updated_since` and saves the earlier feed cursor so
+changes made during the fetch can be replayed on the next poll.
 
-After that the whole dataset never crosses the network again. Every poll
-asks `GET /v1/changes?since=<cursor>` and folds the rows it gets into the
-cache — created and updated rows carry the body they produced, deleted
-rows name an id. The cursor is held on the device, so a restart resumes
-and a reinstall reseeds.
+This implementation has a pagination limitation: the server caps item pages at
+1000 and filters timestamps with strict `>`. Records sharing a page-boundary
+timestamp can be skipped, and subsequent changes after the saved cursor do not
+recover an unchanged skipped record. It does not guarantee a complete initial
+snapshot for every dataset. The [client guide](../../docs/client-development.md#2-seed-a-cache-then-hold-a-cursor)
+describes complete initialization by replaying the existing change feed from zero.
+
+After initialization, the app polls `GET /v1/changes?since=<cursor>&facet=lists`
+and applies rows to its cache. Created and updated rows carry bodies and
+revisions; deleted rows remove items. The saved cursor resumes across restarts;
+reinstalling or replacing the configuration reseeds the cache.
 
 The cache is one file, written whole and renamed into place. It is not
 SharedPreferences: that reads its entire XML into memory and rewrites all

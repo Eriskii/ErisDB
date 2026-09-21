@@ -111,16 +111,20 @@ the current action list would silently widen on upgrade.
 Pairing is where grants are decided, so an app asks and a human answers.
 
 1. **Cut a code.** `erisdb pair`, or `POST /v1/pairings` with
-   `meta:pairing:create`. This creates a pairing session and a one-time
+   `meta:pairing:create`. This creates a pairing session and a short-lived
    secret. The secret is an ordinary token holding exactly
    `meta:pairing:redeem`, naming its session, expiring in minutes. It is
    what the QR carries — **not** a capability over your data.
 2. **Redeem it.** The client `POST`s `/v1/pair/redeem` with its manifest:
-   who it is, and the grants it wants.
+   who it is, and the grants it wants. Over Iroh, the authenticated persistent
+   key supplies the installation identity:
    ```json
    { "client": "Tasks (Android) v0.3",
      "requested": ["tasks:read", "tasks:create", "tasks:update"] }
    ```
+   HTTP clients must also send an S256 `challenge` derived from their saved
+   installation secret. The [redemption example](api.md#post-v1pairredeem) shows
+   its exact encoding and the required authorization header.
 3. **Approve.** The operator sees the request — in the waiting `erisdb pair`
    terminal, or any app holding `meta:pairing:approve` — and answers. They
    may approve exactly what was asked, select a subset, or deny. Both screens must show the same comparison fingerprint.

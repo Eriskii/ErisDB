@@ -1,5 +1,9 @@
 # Documentation
 
+To build a client, start with [Client development](client-development.md) and
+follow its links to the request and response examples in the [Server API](api.md).
+The implementation examples below show how the included clients use those routes.
+
 | File | Contents |
 |---|---|
 | [Server API](api.md) | HTTP/Iroh routes, request and response examples, authentication, errors, limits, and server CLI commands. |

@@ -69,27 +69,47 @@ a human answers. Compare the request's fingerprint on both screens before
 approving; display names are untrusted. A photographed ticket can race to request
 enrollment, but it cannot collect another installation's approved credential.
 
-```rust
-let ticket = erisdb_client::Ticket::parse(scanned)?;   // erisdb://pair/…
-let cancel = erisdb_client::Cancel::new();             // the back button
+Use the separate redemption and waiting methods so the app can display the
+fingerprint before approval. This example takes an already-persisted installation
+key and returns the pairing result for the caller to save:
 
-match erisdb_client::pair(
-    &ticket,
-    "Tasks (Android) v0.3",
-    &["tasks:read", "tasks:create", "tasks:update"],
-    Some(identity),
-    Duration::from_secs(300),
-    &cancel,
-).await? {
-    Pairing::Approved { token, granted } => store(token, granted),
-    Pairing::Denied    => "the operator said no",
-    Pairing::TimedOut  => "nobody answered",
-    Pairing::Cancelled => "the user closed the screen",
-    // `Waiting` is what one poll of `pairing_status()` says; a wait
-    // that returns has stopped waiting.
-    Pairing::Waiting   => unreachable!(),
+```rust
+use erisdb_client::{Cancel, Client, Pairing, Ticket};
+use std::time::Duration;
+
+async fn pair_ticket(
+    scanned: &str,
+    identity: [u8; 32],
+    cancel: &Cancel,
+) -> anyhow::Result<Pairing> {
+    let ticket = Ticket::parse(scanned)?;
+    let client = Client::dial(
+        ticket.endpoint_id()?,
+        &ticket.token,
+        "Tasks (Rust)",
+        Some(identity),
+    ).await?;
+    let session = client.redeem_pairing(
+        "Tasks (Rust)",
+        &["tasks:read", "tasks:create", "tasks:update"],
+    ).await?;
+    let fingerprint = session["body"]["fingerprint"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("Missing pairing fingerprint"))?;
+    println!("Compare this fingerprint with the operator: {fingerprint}");
+    client.await_pairing(Duration::from_secs(300), cancel).await
 }
 ```
+
+`Pairing::Approved { token, granted }` supplies the access credential. Save it with
+the core address and the same private key before using it. Dial a data client with
+that access token; the client above was configured with the pairing token. Handle
+`Denied`, `TimedOut`, and `Cancelled` in the UI. `Waiting` is an intermediate result
+from `pairing_status()`; `await_pairing()` waits for a settled result.
+
+The convenience functions `erisdb_client::pair` and `Client::pair` also redeem and
+wait, but discard the redemption response and expose no fingerprint callback.
+Use the separate methods above when implementing the comparison screen.
 
 The approved set is not always the requested set: an operator may select
 the requested set or a subset. Read `granted` and render from it — and ask what
@@ -100,30 +120,35 @@ permission and returns the token's grants intersected with current registry gran
 collect another installation's approved token. Preserve the key passed to `dial`:
 a different key cannot use, collect or renew its registered credentials.
 
-- **Waiting is bounded.** A human may never answer, so `pair` takes a
-  deadline and returns `TimedOut` rather than parking forever.
+- **Waiting is bounded.** `await_pairing` takes a waiting duration and returns
+  `TimedOut` if approval has not arrived; network calls also have timeouts.
 - **Waiting is cancellable.** A `Cancel` is clonable and every clone
   names the same signal; `cancel()` wakes the wait between polls.
-- **Redeeming is never repeated.** It is a `POST` that moves a session
-  from pending to requested; a second one is a 409. A lost answer is
-  reported, exactly like any other write.
+- **Redemption is not blindly replayed.** Once the session is requested, another
+  redemption returns 409. After a lost response, inspect the session state before
+  deciding whether to submit again.
 
-`erisdb_client::pair` resolves the ticket's `eid` through discovery, which
-is all a phone holding a QR code has. A caller that already knows the
-address dials it itself and calls `Client::pair`. A ticket may legally
-carry only a `url` — one QR serving a browser on the LAN and a phone
-anywhere — and this client says so plainly rather than half-dialing it:
-it speaks QUIC and nothing else.
+`Client::dial` resolves a bare endpoint ID through Iroh discovery. A caller with a
+known `EndpointAddr` can dial that address directly. An Iroh client needs the
+ticket's `eid`; `Ticket::endpoint_id()` returns an error for a URL-only ticket.
+
+Save pending enrollment and the key before sending redemption. If its response
+is lost, use `GET /v1/pair/status` through `Client::request` to inspect the raw state
+and fingerprint. Only `pending` permits another redemption attempt; `requested`
+means wait with the same identity. Successful collection is repeatable while the
+session remains live. `pairing_status()` maps both pending states to `Waiting`,
+so it cannot by itself distinguish whether resubmission is safe.
 
 ### Retries
 
-A failed call is repeated only when repeating it is provably harmless.
-The protocol carries no idempotency key, so a `POST` whose bytes already
-left the process is never sent again — the core may have created the item
-and lost only the answer, and a retry there is a second item. What does
-get repeated: any failure that happened before the request went out
-(a dead cached connection, a stream that would not open), and reads,
-where asking twice changes nothing.
+The client retries reads and failures it can identify as occurring before request
+transmission. It does not retry a write after an ambiguous transport failure:
+a create may have committed even when its response was lost, and the API has no
+idempotency key.
+
+Registered requests receiving an explicit 401 can renew with the persistent Iroh
+key and retry once. Pairing collection is safe to repeat with the same key while
+the ticket lives, although that GET also writes registration state.
 
 ### Change feed
 
@@ -190,22 +215,26 @@ nativeNextChange(handle, timeoutMs)                     -> {"ok": true, "change"
 nativeCloseSubscription(handle)
 ```
 
-`status` is the core's own answer — 401 for a token too dead to refresh,
-403 for a scope the core will not widen — and 0 when there was no answer
-at all. Branch on the number; the message is for humans.
+`status` carries the HTTP response code, or 0 when no response arrived. For
+example, 401 can mean an invalid credential, revoked registration, or rejected
+installation proof; 403 means insufficient permission. Registered access can renew
+after token expiry. Branch on the number; the message is for humans.
 
 Pairing is a pull, like the change feed, because callbacks across FFI are
-painful: parse the ticket, redeem it once, then loop on `nativePairPoll`
-from a background thread while the status is `waiting`. Every call is
+painful: parse the ticket, call `nativePairRedeem`, and display
+`pairing.body.fingerprint` for comparison. Then loop on `nativePairPoll` from a
+background thread while the status is `waiting`. Every call is
 bounded by its own timeout, so no thread parks forever, and the back
 button calls `nativePairCancel`, which wakes a parked poll with
 `cancelled`. Persist `approved` before proceeding —
 write it to storage before anything else, and read `granted` rather than
 assuming the request was granted whole.
 
-Refreshing moves time, not privilege: the same grants, the same signed
-user, a fresh expiry. Persisting the returned token is the app's job —
-the client holds it only for its own lifetime.
+Registered renewal issues the registration's current grants and signed user
+label; permissions can therefore change. Manual-token refresh keeps its scope
+bounded by the existing token. Persisting an explicitly refreshed token is the
+app's job. Automatic renewal also updates the in-memory token; retaining the
+installation key allows renewal again after a restart with an expired token.
 
 The facade's runtime carries a live subscription plus a handful of
 concurrent calls: four workers minimum, more on a bigger machine, capped

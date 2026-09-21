@@ -151,11 +151,10 @@ lets a dashboard watch a request arrive live: `created` when a code is cut,
 That is the point of holding the conversation in the store rather than in
 the process — it survives a restart and it replicates.
 
-It also means the feed keeps whatever those bodies held, permanently — so
-a session never holds a token. An approval records the *shape* of the token
-it will issue: the grants, the two deadlines, the signed user. The token
-itself is minted at the moment the client collects it, and the same
-revision-checked write spends the session. Nothing readable through
-`?facet=pair` or the global feed is a credential, and nothing has to be
-scrubbed later, because a change row cannot be edited and a token written
-here would outlive every clock it carries.
+Pairing snapshots contain requested and approved grants, the identity commitment,
+fingerprint, access lifetime, optional installation deadline, and user label.
+They never contain the pairing token, issued access token, or raw installation
+secret. Collection creates or updates the installation and records the session
+as collected. While the ticket remains live, the same installation proof can
+repeat collection to recover a lost response; the access token is generated for
+the response and never written into the session or its history.

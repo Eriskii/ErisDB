@@ -23,7 +23,7 @@ just the server's endpoint id and a capability token.
   `Recurrence.kt` is the repeat rule as pure `java.time` and `Task.kt` is
   the thin JSON skin over it.
 
-The application id remains `dev.erisdb.tasks` to preserve installed app data.
+The application ID is `dev.erisdb.tasks`.
 The source namespace is `dev.erisdb.tasks`. The phone mints a random 32-byte
 iroh identity on first launch and keeps it, so `source.addr` names this
 device stably across sessions. The client string is
@@ -81,22 +81,21 @@ the always-advance-once guarantee.
 
 ## Sync
 
-First contact reads the change feed's head, then every item in the facet.
-In that order: the snapshot is then at least as new as the cursor, and
-anything that landed in between simply replays on the next poll —
-replaying is free, because a change row *is* the state the write
-produced. `GET /v1/items` orders by `updated_at` and answers at most a
-thousand rows at a time, so the snapshot is paged forward with
-`updated_since` until a short page ends it. A store of any size arrives
-whole.
+The app first reads the change feed's head, then fetches an item snapshot. It
+pages the snapshot with `updated_since` and saves the earlier feed cursor so
+changes made during the fetch can be replayed on the next poll.
 
-After that the whole dataset never crosses the network again. Every poll
-asks `GET /v1/changes?since=<cursor>` and folds the rows it gets into the
-cache — created and updated rows carry the body they produced, deleted
-rows name an id, and `lapsed` rows are the core noticing a due date has
-passed rather than anyone writing, so they leave the item's timestamps
-alone. The cursor is held on the device, so a restart resumes and a
-reinstall reseeds.
+This implementation has a pagination limitation: the server caps item pages at
+1000 and filters timestamps with strict `>`. Records sharing a page-boundary
+timestamp can be skipped, and subsequent changes after the saved cursor do not
+recover an unchanged skipped record. It does not guarantee a complete initial
+snapshot for every dataset. The [client guide](../../docs/client-development.md#2-seed-a-cache-then-hold-a-cursor)
+describes complete initialization by replaying the existing change feed from zero.
+
+After initialization, the app polls `GET /v1/changes?since=<cursor>&facet=tasks`
+and applies rows to its cache. Created and updated rows carry bodies and
+revisions; deleted rows remove items. The saved cursor resumes across restarts;
+reinstalling or replacing the configuration reseeds the cache.
 
 The cache is one file, written whole and renamed into place. It is not
 SharedPreferences: that reads its entire XML into memory and rewrites all

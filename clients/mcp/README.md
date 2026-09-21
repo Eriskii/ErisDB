@@ -43,8 +43,8 @@ secret in that file. Revocation is checked by the core on each call. Only an exp
 write. A failed/interrupted pairing requires a fresh ticket, with no manual file
 cleanup needed. An existing saved login remains usable with its current permissions.
 
-Existing `ERISDB_URL` plus `ERISDB_TOKEN_FILE`/`ERISDB_TOKEN` configuration still
-works with manual tokens and their original lifetime. For individually revocable,
+`ERISDB_URL` plus `ERISDB_TOKEN_FILE`/`ERISDB_TOKEN` configures a manual token with
+its original lifetime. For individually revocable,
 automatically renewing access, pair instead. See [client administration](../../docs/clients.md).
 
 ## Tools
@@ -74,10 +74,10 @@ Success returns the API's JSON as text content; failures (403, 404, 409,
 422…) are `isError` tool results carrying the status and body — the model
 sees exactly what went wrong and the session keeps going.
 
-`update_item` and `revert_item` take a `revision` and will not proceed
-without one. A model that renders a partial view and writes it back would
-otherwise destroy every field it did not echo; with the revision required,
-the worst case is a 409 telling it to read again.
+`update_item` and `revert_item` require the current revision, as the server does.
+A stale revision returns 409. `update_item` replaces the entire body: callers must
+read it, preserve fields they want to keep, and overlay their intended changes.
+A correct revision does not prevent omitted optional fields from being erased.
 
 `search_items` clamps `limit` to 200 and sweeps at most 25 facets. It
 returns `{items, scanned_facets, truncated}`, so a partial sweep says so
@@ -129,9 +129,9 @@ claude mcp add erisdb -- erisdb-mcp --profile coding
 
 ### Manual-token configuration
 
-Existing integrations can still supply a manually minted token. This keeps the
-manual token's original expiry and refresh limits; pairing above enables renewal
-until the installation is revoked.
+A manually minted token can be supplied through the environment. Its expiry and
+refresh-chain limits apply; the pairing flow above enables renewal until the
+installation is revoked.
 
 The core's default listen address is `127.0.0.1:7700`.
 

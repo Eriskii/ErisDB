@@ -5,28 +5,58 @@ Paired applications have their own installation identity and renewable access
 token. The poker uses a manually minted token. [api.md](api.md) documents the
 server routes and [clients.md](clients.md) documents installation renewal.
 
-## 1. Ask for a token, and get an address
+## 1. Pair an installation
 
-Two strings: where the core is, and what to say. A ticket carries the
-address and a **pairing code** as one QR code, which is the intended path
-for anything with a camera — see [pairing.md](pairing.md) for the format
-and how to read one on every platform. Copy-paste of a URL and a token
-also works for manual tokens. Browser apps support QR scanning and pasted tickets.
+Read the server address and pairing token from the QR, deep link, or pasted
+[ticket](pairing.md#ticket-format). The pairing token authorizes enrollment only.
+A manually supplied address and access token can also be used, with the manual
+token lifetime described below.
 
-The code in a ticket is not a capability over data. Redeeming it is where a
-client says what it is and what it wants:
+For HTTP, generate 32 random bytes once per installation, encode them as unpadded
+base64url, and save that string as the installation secret. Compute
+`challenge = base64url(SHA256(ASCII(secret)))`, also without padding. Use HTTPS
+remotely or HTTP on localhost; a remote deployment needs a TLS reverse proxy on
+the same machine as the core. See the [working shell example](api.md#post-v1pairredeem)
+for the exact encoding and request commands.
 
+An HTTP redemption sends:
+
+```http
+POST /v1/pair/redeem
+Authorization: Bearer PAIRING_TOKEN
+Content-Type: application/json
+
+{"client":"Tasks browser","requested":["tasks:read","tasks:create","tasks:update","tasks:delete"],"challenge":"S256_CHALLENGE"}
 ```
-POST /v1/pair/redeem   { "client": "Tasks (Android) v0.3",
-                         "requested": ["tasks:read", "tasks:create",
-                                       "tasks:update", "tasks:delete"] }
-GET  /v1/pair/status   → poll until status is approved or denied
+
+The capitalized values above are placeholders. Native Iroh clients send the same
+body without `challenge`, using a persistent Iroh private key as their identity.
+Keep that key for collection, data requests, and renewal.
+
+Redemption returns the session with `body.fingerprint`. Display it alongside the
+requested grants so the user can compare it with the operator's terminal before
+approval. The [Rust example](../erisdb-client/README.md#pairing) shows how to obtain
+and display it over Iroh.
+
+Poll with the pairing token and the same installation proof:
+
+```http
+GET /v1/pair/status
+Authorization: Bearer PAIRING_TOKEN
+X-ErisDB-Client-Proof: INSTALLATION_SECRET
 ```
 
-`status` requires installation proof and is repeatable by the same installation
-while the ticket is live. Persist the result together with the core address and
-installation key. HTTP clients send an S256 challenge at redemption and retain
-the secret for collection and renewal; native clients retain their Iroh key.
+Native clients omit the proof header and use the same Iroh key. Wait while status
+is `requested`; handle `denied` and ticket expiry. After approval, the response
+contains `token`, `client_id`, `granted`, and `exp`. Save these with the server
+address and installation secret/key before proceeding. Use the returned access
+token as the bearer for data requests. Collection can be repeated with the same
+proof while the ticket is live if its response was lost.
+
+Persist pending enrollment before sending it so a restart can resume collection.
+After an ambiguous redemption failure, poll first; only `pending` permits another
+redemption attempt. Re-pairing with the same core should reuse the installation
+proof. The [pairing API](api.md#pairing) describes all states and errors.
 
 Two rules for the manifest, both about the human at the other end:
 
@@ -42,13 +72,14 @@ Two rules for the manifest, both about the human at the other end:
 After pairing, `GET /v1/permissions` tells you exactly what you got:
 
 ```json
-{ "grants": ["tasks:read", "tasks:create"], "exp": 1788133838,
-  "max_exp": 1790120945, "user": "phone" }
+{ "grants": ["tasks:read", "tasks:create"], "exp": 1790003600,
+  "max_exp": null, "user": null,
+  "client_id": "ad6caf6b-ece2-442a-a178-a93cc5aa0802" }
 ```
 
-Draw the UI from that answer rather than from what you asked for. An app
-granted three of the four actions should not offer a delete button that
-403s.
+Use these effective grants to control the UI. Re-read them during sync and after
+renewal because the operator can change permissions. The server checks current
+authority on every request; cached permissions only help the UI.
 
 Store the token and the address together and treat them as one credential.
 HTTP access tokens are bearer credentials; native registered tokens additionally
@@ -64,61 +95,75 @@ actually enforces, and hold grants narrow enough that the loss is bounded.
 
 ## 2. Seed a cache, then hold a cursor
 
-The browser and Android data apps seed a snapshot and then read changes:
+For an application facet, reconstruct its data by reading the change feed from
+sequence zero. This uses the existing API and includes records whose timestamps
+are identical:
 
+```text
+1. Start with an empty cache and cursor = 0.
+2. GET /v1/changes?since=<cursor>&facet=X&limit=500
+3. Apply the returned changes in sequence order.
+4. Persist the resulting cache and response.next together.
+5. Repeat from step 2 until the response contains no changes.
+6. Continue polling from the saved cursor, or subscribe from that cursor.
 ```
-1. GET  /v1/changes?since=0&facet=X       → walk pages to the feed head
-2. GET  /v1/items?facet=X&limit=1000      → load the snapshot, walking pages
-3. loop: GET /v1/changes?since=<cursor>&facet=X
-         apply each row, cursor = next
-4. alongside: GET /v1/changes/stream?since=<cursor>&facet=X
-```
 
-Seed once. After that the feed is the only thing you read, because each
-row carries the full body and the revision it produced — enough to keep a
-mirror true with no per-item refetch.
+URL-encode `X`. Each facet needs its own cache and cursor; do not reuse a cursor
+from a different filter. If loading a saved cache, use its saved cursor instead
+of zero. Replaying old history can take time because the feed is not pruned.
 
-Applying a row is four cases:
+Apply each row by `item_id`:
 
-- `created` / `updated` — put `{id, facet, body, revision}` in the cache.
-- `deleted` — remove it.
-- `lapsed` — the item is unchanged; do whatever a lapse means to you
-  (notify, badge, nothing) and update the cache from the body anyway,
-  since it is there.
-- `tick` — only visible on an unfiltered feed. Usually nothing.
+- `created` / `updated`: replace the cached body and revision with the snapshot
+  in the row, retaining the item ID and facet.
+- `deleted`: remove the item, even if it is already absent.
+- `lapsed`: carries the unchanged body and revision; it does not represent an
+  item edit. Suppress historical due notifications during initial replay.
+- Rows without an item ID, including ticks and installation audit events on a
+  global feed, do not update the item cache.
 
-Advance the cursor to the row's `seq` and persist it with the cache, in
-the same write. A cache newer than its cursor replays rows it has already
-applied — harmless if apply is idempotent, and it should be. A cursor
-newer than its cache loses data permanently.
+The feed contains full item bodies and revisions, but does not return the entire
+[Item envelope](api.md#item). For example, a lapse event's `at` is the event time,
+not the item's `updated_at`. Fetch an item by ID when its exact current envelope
+metadata is needed. Built-in facet definitions are inserted during database
+initialization and should be read through `GET /v1/items?facet=facet`.
 
-`updated_since` on `GET /v1/items` is a bulk-load filter, not a sync
-cursor. It is a timestamp with strict `>`, so a group of items sharing one
-`updated_at` cannot be split across pages. Seed with it if you like; sync
-with `seq`.
+Persist the cache and cursor in one transaction or atomic file replacement.
+Advancing a cursor without saving the corresponding changes loses data. If both
+polling and streaming feed the cache, serialize their application, keep sequence
+order, and ignore already-processed rows. Keep unsent local edits separately so
+applying server changes does not discard them.
 
-### Poll and stream, not one or the other
+`GET /v1/items` provides a current snapshot with a maximum of 1000 rows per call.
+Its `updated_since` filter uses strict `>` and has no ID continuation: if a page
+ends inside a group with the same timestamp, advancing to that timestamp skips
+the remaining records. The Android demos currently use this snapshot approach;
+the browser demos load one item page. Neither is a complete initialization
+recipe for arbitrary data sizes. Use the feed replay above when completeness
+is required. See [item listing](api.md#get-v1items) and
+[change pagination](api.md#get-v1changes).
 
-The SSE stream is an optimisation. The poll is the source of correctness.
-Streams end — a token expires, a connection drops, a proxy times out, all
-32 stream slots are taken and you get a 503 — and every one of those ends
-looks the same from the client side: the response simply closes, with no
-final event.
+### Polling and streaming
 
-So run both. Catch up by poll on a timer; hold a stream open for latency;
-on any drop, catch up and reconnect with backoff. Because the cursor is
-client-held and every connection opens at `?since=<cursor>`, a drop costs
-nothing but the delay. `apps/tasks/index.html` polls every ten seconds
-while the stream is down and every minute while it holds, and syncs again
-on `visibilitychange` — a phone that was asleep is exactly the case the
-cursor exists for.
+Polling alone is sufficient for sync. SSE adds lower latency and accepts the
+same `since` cursor; reconnect with the last saved cursor after a disconnect.
+The server sends `event: change` with a JSON change row, plus keepalive comments.
+It does not send SSE event IDs or read `Last-Event-ID`. Browsers use streaming
+`fetch` to set `Authorization`, since native `EventSource` cannot set that header.
+
+A stream closes on token expiry, lost permission, revocation, or a transport or
+backend failure. Renew access if needed, catch up, and reconnect with backoff.
+If no stream slot is available, opening one returns 503; poll while waiting.
+The demos combine periodic polling with SSE in the browser; Android polls.
+See the [stream API](api.md#get-v1changesstream) for the response format.
 
 ## 3. Write with revisions
 
-Every write is whole-body. `PUT /v1/items/{id}` replaces the body with
-what you sent, so a client that renders a partial view and writes it back
-destroys every field it did not echo. Keep the last body you saw, overlay
-your change on it, send the result.
+`PUT /v1/items/{id}` replaces the whole body. Read the item, overlay your intended
+changes on its full body, and send the result with the revision you read.
+A matching revision checks concurrent edits only: omitted optional fields are
+removed even when the revision is correct. Required omissions instead fail schema
+validation. See the [update example](api.md#put-v1itemsid).
 
 Updates and reverts require the current `revision`; a stale one is a 409. That is the
 concurrency model in full: last-writer-wins is not available, and a 409 is
@@ -132,29 +177,55 @@ racing someone else's edit becomes a 409 instead of silently winning.
 
 Two conventions worth stealing from the web apps:
 
-**Write to the outbox before the network.** Every mutation is queued
-locally first, then sent, then dropped from the queue. Closing the tab
-mid-write loses nothing and the op replays on next load. The screen shows
-the server snapshot with queued ops replayed on top, so an edit is visible
-instantly and stays visible if the network is not there.
+**Persist the outbox before sending.** Keep local edits until their outcome is
+known, and show them over the server cache. Check that local persistence succeeded;
+a full browser storage quota can prevent a durable save. The demos queue writes,
+but their outboxes do not resolve ambiguous create outcomes: a lost response can
+lead to a repeated create and a duplicate item. Account for that limitation when
+adapting their code.
 
-**A patch value of `null` deletes the key.** Both shipped schemas close
-their objects with `additionalProperties: false`, so clearing an optional
-field means removing it, not setting it to null. Doing that in the local
-patch representation keeps the distinction from ever reaching the wire.
+**The demos use `null` in local patches to remove a key.** This is client-side
+editing logic, not an HTTP PATCH endpoint. Their optional top-level fields do
+not allow null values, so clearing one removes it before sending the complete
+body. `additionalProperties: false` rejects unknown keys; whether a known field
+allows null depends on that field's schema.
 
 ### Retries
 
-The protocol has no idempotency key, so retrying a `POST` whose bytes
-already left the process risks a second item: the core may have created
-the first and lost only the answer. `erisdb-client`'s rule is the right
-one — repeat only what is provably harmless. Reads, always. Failures that
-happened before the request went out (a dead cached connection, a stream
-that would not open), always. A write whose response was lost, never.
+The protocol has no idempotency key or client-chosen item IDs. If a create request
+may have reached the server but its response was lost, do not blindly resend it:
+it may already have created an item. Retain the uncertain operation for
+reconciliation rather than promising exactly-once delivery.
 
-## 4. Refresh at half-life
+Reads can be retried. The SDK also retries failures it can identify as occurring
+before transmission. An explicit 401 on a registered data request permits renewal
+and one retry because authorization precedes effects. Pairing collection is
+repeatable with the same proof while the ticket remains live, despite being a
+GET that writes registration state. Redemption requires the recovery procedure
+in the pairing section.
 
-For paired installations, use the independent renewal procedure in [clients.md](clients.md#identity-and-renewal), including after access expiry. The bounded-chain procedure below applies to manual tokens.
+## 4. Renew access
+
+### Paired installations
+
+Call `POST /v1/clients/{client_id}/refresh` with JSON `{}`. HTTP clients send their
+installation secret in `X-ErisDB-Client-Proof`; native clients use their persistent
+Iroh key. No bearer token is required. This works after access-token expiry.
+
+A 200 response contains the new `token`, `exp`, `grants`, and `client_id`. Persist
+the new token before using it and refresh the UI's permissions. Renewal uses the
+registration's current grants, so the new token may have different permissions.
+A 401 means the proof or registration is no longer accepted; stop automatic
+renewal and offer pairing. Back off on 429 or temporary failures. Serialize
+renewal requests so an older response cannot replace a newer credential.
+
+The [renewal example](api.md#post-v1clientsidrefresh) shows the exact request.
+Installations renew until revoked unless approval set an explicit deadline.
+
+### Manual tokens: refresh at half-life
+
+Manual tokens use `POST /v1/capabilities/refresh` and remain bounded by their
+expiry and refresh-chain deadline.
 
 Read the token's `exp` yourself. The payload is the middle dot-separated
 segment, unpadded base64url of JSON:
@@ -164,16 +235,18 @@ function tokenExp(token) {
   try {
     const b64 = token.split(".")[1].replace(/-/g, "+").replace(/_/g, "/");
     const exp = JSON.parse(atob(b64)).exp;
-    return typeof exp === "number" ? exp : null;   // null: never expires
-  } catch { return null; }
+    if (exp === null || (Number.isSafeInteger(exp) && exp > 0)) return exp;
+  } catch { /* Invalid token metadata. */ }
+  throw new Error("Token has no valid expiry metadata");
 }
 ```
 
 The signature is the core's business; the client only needs the clock.
 
-Remember the lifetime you started with — the token's remaining life when
-it was first configured is the lifetime the operator chose. Once less than
-half of it remains, `POST /v1/capabilities/refresh` with that same
+Track the token's remaining lifetime when configured, or the lifetime returned
+by a successful refresh. This is a scheduling estimate; tokens contain no issue
+timestamp from which to recover their original lifetime. Once less than half
+of the tracked lifetime remains, `POST /v1/capabilities/refresh` with that same
 `ttl_secs`, and replace the stored token with the one that comes back. One
 refresh in flight at a time; a failure just waits for the next sync.
 
@@ -187,7 +260,7 @@ Two answers to handle:
   cannot resurrect a session. Stop, say so plainly, and ask for a new
   token or a new pairing.
 
-A token with no `exp` never expires and must never be refreshed — the
+A token with `exp: null` never expires and does not need refreshing — the
 trade would swap an unbounded token for a bounded one. `if (exp === null)
 return` is the whole guard.
 
@@ -200,26 +273,20 @@ Details of what refresh does and does not carry:
 
 ## `X-ErisDB-Client`
 
-A header naming what wrote this. The core copies it verbatim into
-`source.client` on the item and on every change row.
+Send an optional display label in this header:
 
-```
+```http
 X-ErisDB-Client: Tasks (Web) v0.1
 ```
 
-It is the weakest rung of the trust gradient — the caller says it and
-nothing checks it — and that is fine, because it answers a question
-nothing else can. `source.addr` tells you which machine and `source.user`
-tells you which identity, but only `client` tells you *which build*, which
-is what you want at two in the morning when one item in a thousand has a
-malformed body.
+The server copies it to `source.client` on writes. The label is supplied by the
+caller and does not authenticate an app or prove its version. It is limited to
+128 printable ASCII characters; invalid values return 400.
 
-The header value is supplied by the caller. The server does not compare it
-with package versions or release tags.
-
-Bounded at 128 characters, printable, no control characters. Over that, or
-outside ASCII, is a 400 — it lands in every row this caller writes, so an
-unbounded one is a way to grow the table.
+`source.addr` records the observed TCP peer or Iroh endpoint ID. Behind a local
+reverse proxy it identifies the proxy, not the browser's machine. `source.user`
+is a signed attribution label, and `source.installation` identifies the
+registered installation when present. See [item source fields](api.md#item).
 
 ## Worked examples
 
@@ -245,25 +312,22 @@ Four clients, four different shapes, all against the same API.
   the endpoint id the core observed. It also carries the blocking facade
   and the JNI surface the two Android apps sit on.
 
-- **`clients/mcp/`** — the API as MCP tools over stdio. Worth reading for
-  what it *refuses*: `update_item` and `revert_item` make `revision`
-  required, because a model that renders a partial view and writes it back
-  would otherwise destroy every field it did not echo, and with the
-  revision required the worst case is a 409 telling it to read again.
-  `mint_capability` is off unless an env switch turns it on, because a
-  minted token would land in the transcript. Both are bounds a capability
-  token cannot express, held on the client side instead.
+- **`clients/mcp/`** — a separate client exposing MCP tools over stdio.
+  `update_item` and `revert_item` require the same revisions as the server API.
+  Updates still replace the whole body; callers must preserve fields they want
+  to keep. `mint_capability` is disabled unless explicitly enabled because its
+  result exposes a credential to the MCP host.
 
 - **`poker/poke.sh`** — the smallest possible client: two lines of curl,
   one URL, one token, no state.
 
 ## A checklist
 
-- Seed with `GET /v1/items`, sync with `seq`, persist the cursor with the
-  cache.
-- Poll on a timer; stream for latency; treat every stream end as ordinary.
+- Initialize application data through the change feed from `since=0`; persist
+  each processed cursor together with its cache.
+- Poll on a timer; optionally stream for latency and reconnect from the cursor.
 - Send whole bodies with the revision you hold; treat 409 as "read again".
-- Queue writes before touching the network.
+- Persist writes before sending; reconcile uncertain outcomes before retrying.
 - Renew paired access using installation proof; stop on a revoked registration.
   Manual tokens refresh at half-life within their bounded chain.
 - Send `X-ErisDB-Client` with your version in it.
@@ -271,7 +335,6 @@ Four clients, four different shapes, all against the same API.
   retry, or fall back to polling).
 - Ask for the permissions you use and no more; read `GET /v1/permissions`
   and draw the UI from what you actually hold.
-- Register your facet on connect *if* you were granted
-  `meta:facets:write`, and treat 409 and 403 alike: someone else
-  registered it, or you were not given that grant. Neither is fatal — say
-  who to ask and carry on.
+- Register your facet only with `meta:facets:write`. On 409, inspect the existing
+  schema if allowed; on 403, ask the operator to register it. Do not assume an
+  existing schema matches the bodies your app writes.
