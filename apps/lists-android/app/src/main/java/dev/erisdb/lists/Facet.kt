@@ -1,5 +1,7 @@
 package dev.erisdb.lists
 
+import dev.erisdb.android.*
+
 import org.json.JSONObject
 
 // A facet's name is also its permission namespace, so the schema version

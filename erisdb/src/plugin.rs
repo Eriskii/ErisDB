@@ -11,16 +11,15 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{bail, Context};
+use anyhow::{bail, ensure, Context};
 use axum::body::{Body, Bytes};
 use axum::http::header::{HeaderName, HeaderValue, CACHE_CONTROL, CONTENT_TYPE};
 use axum::http::{Response, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, Command};
-use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
-use tokio::time::Instant;
+use tokio::process::Command;
+use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::auth::Capability;
@@ -67,7 +66,6 @@ fn default_timeout_secs() -> u64 {
     DEFAULT_TIMEOUT_SECS
 }
 
-#[derive(Clone)]
 struct Plugin {
     name: String,
     description: String,
@@ -78,12 +76,11 @@ struct Plugin {
     operations: BTreeMap<String, Operation>,
 }
 
-#[derive(Clone)]
 struct Operation {
     description: String,
     permission: String,
     request_schema: Value,
-    validator: Arc<jsonschema::Validator>,
+    validator: jsonschema::Validator,
 }
 
 /// The deployment-derived plugin registry. It is immutable after startup and
@@ -115,8 +112,9 @@ impl PluginRegistry {
     pub fn load_dir(dir: &Path) -> anyhow::Result<Self> {
         let mut paths = std::fs::read_dir(dir)
             .with_context(|| format!("reading plugin directory {}", dir.display()))?
-            .filter_map(std::result::Result::ok)
-            .map(|entry| entry.path())
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect::<std::io::Result<Vec<_>>>()?
+            .into_iter()
             .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
             .collect::<Vec<_>>();
         paths.sort();
@@ -188,16 +186,13 @@ impl PluginRegistry {
         let plugin = self
             .plugins
             .get(plugin_name)
-            .ok_or_else(|| Error::PluginNotFound(plugin_name.to_string()))?
-            .clone();
-        let operation = plugin
-            .operations
-            .get(operation_name)
-            .ok_or_else(|| Error::PluginOperationNotFound {
+            .ok_or_else(|| Error::PluginNotFound(plugin_name.to_string()))?;
+        let operation = plugin.operations.get(operation_name).ok_or_else(|| {
+            Error::PluginOperationNotFound {
                 plugin: plugin_name.to_string(),
                 operation: operation_name.to_string(),
-            })?
-            .clone();
+            }
+        })?;
 
         cap.require(&operation.permission)?;
         if let Err(e) = operation.validator.validate(&input) {
@@ -329,22 +324,15 @@ fn compile_manifest(manifest: PluginManifest, path: &Path) -> anyhow::Result<Plu
                 manifest.name
             );
         }
-        guard_schema(&operation.request_schema)
+        let validator = crate::schema::compile(&operation.request_schema)
             .with_context(|| format!("{}: operation {name:?} request_schema", path.display()))?;
-        let validator =
-            jsonschema::validator_for(&operation.request_schema).with_context(|| {
-                format!(
-                    "{}: operation {name:?} request_schema does not compile",
-                    path.display()
-                )
-            })?;
         operations.insert(
             name,
             Operation {
                 description: operation.description,
                 permission: operation.permission,
                 request_schema: operation.request_schema,
-                validator: Arc::new(validator),
+                validator,
             },
         );
     }
@@ -368,31 +356,10 @@ fn check_operation_name(name: &str) -> anyhow::Result<()> {
         .map_err(|_| anyhow::anyhow!("must be [a-z0-9][a-z0-9._-]*"))
 }
 
-/// Match facet-schema safety: plugin schemas are deployment data, but they
-/// still must never make request validation fetch a URL or read a file.
-fn guard_schema(schema: &Value) -> anyhow::Result<()> {
-    match schema {
-        Value::Object(map) => {
-            for (key, value) in map {
-                if matches!(key.as_str(), "$ref" | "$recursiveRef" | "$dynamicRef") {
-                    let target = value
-                        .as_str()
-                        .with_context(|| format!("schema {key} must be a string"))?;
-                    if !target.starts_with('#') {
-                        bail!("schema {key} {target:?} points outside the document");
-                    }
-                }
-                guard_schema(value)?;
-            }
-            Ok(())
-        }
-        Value::Array(items) => items.iter().try_for_each(guard_schema),
-        _ => Ok(()),
-    }
-}
-
+/// A single supervisor owns the child, its pipes and its concurrency permit.
+/// Cancellation and the deadline cover stdin, headers, body, stderr and exit.
 async fn start_process(
-    plugin: Plugin,
+    plugin: &Plugin,
     payload: Vec<u8>,
     permit: OwnedSemaphorePermit,
 ) -> Result<Response<Body>> {
@@ -404,7 +371,6 @@ async fn start_process(
         .stderr(Stdio::piped())
         .kill_on_drop(true)
         .env_clear();
-
     for (name, required) in &plugin.environment {
         match std::env::var_os(name) {
             Some(value) => {
@@ -414,7 +380,7 @@ async fn start_process(
                 return Err(Error::PluginUnavailable(format!(
                     "plugin {:?} requires environment variable {name}",
                     plugin.name
-                )));
+                )))
             }
             None => {}
         }
@@ -423,149 +389,134 @@ async fn start_process(
     let mut child = command
         .spawn()
         .map_err(|e| Error::PluginFailed(format!("starting plugin {:?}: {e}", plugin.name)))?;
-    let mut stdin = child.stdin.take().ok_or_else(|| {
-        Error::PluginFailed(format!("plugin {:?} has no stdin pipe", plugin.name))
-    })?;
-    let stdout = child.stdout.take().ok_or_else(|| {
-        Error::PluginFailed(format!("plugin {:?} has no stdout pipe", plugin.name))
-    })?;
-    let stderr = child.stderr.take().ok_or_else(|| {
-        Error::PluginFailed(format!("plugin {:?} has no stderr pipe", plugin.name))
-    })?;
-
-    let writer = tokio::spawn(async move {
-        stdin.write_all(&payload).await?;
-        stdin.shutdown().await
-    });
-    let stderr_reader = tokio::spawn(drain_stderr(stderr));
-    let deadline = Instant::now() + plugin.timeout;
-    let mut stdout = BufReader::new(stdout);
-    let mut line = String::new();
-    let read = match tokio::time::timeout_at(deadline, stdout.read_line(&mut line)).await {
-        Ok(result) => result.map_err(|e| {
-            Error::PluginFailed(format!(
-                "reading plugin {:?} response header: {e}",
-                plugin.name
-            ))
-        })?,
-        Err(_) => {
-            stop_before_response(&mut child, writer, stderr_reader, &plugin.name, "timed out")
-                .await;
-            return Err(Error::PluginFailed(format!(
-                "plugin {:?} timed out",
-                plugin.name
-            )));
-        }
-    };
-
-    if read == 0 || line.len() > MAX_PLUGIN_HEADER_BYTES {
-        stop_before_response(
-            &mut child,
-            writer,
-            stderr_reader,
-            &plugin.name,
-            "returned no valid response header",
-        )
-        .await;
-        return Err(Error::PluginFailed(format!(
-            "plugin {:?} returned no valid response header",
-            plugin.name
-        )));
-    }
-
-    let head: PluginResponseHead = match serde_json::from_str(line.trim_end()) {
-        Ok(head) => head,
-        Err(e) => {
-            stop_before_response(
-                &mut child,
-                writer,
-                stderr_reader,
-                &plugin.name,
-                "returned an invalid response header",
-            )
-            .await;
-            return Err(Error::PluginFailed(format!(
-                "plugin {:?} returned an invalid response header: {e}",
-                plugin.name
-            )));
-        }
-    };
-    if head.protocol != PLUGIN_PROTOCOL {
-        stop_before_response(
-            &mut child,
-            writer,
-            stderr_reader,
-            &plugin.name,
-            "returned the wrong protocol version",
-        )
-        .await;
-        return Err(Error::PluginFailed(format!(
-            "plugin {:?} returned protocol {}, expected {PLUGIN_PROTOCOL}",
-            plugin.name, head.protocol
-        )));
-    }
-
-    if !(200..=599).contains(&head.status) {
-        return Err(Error::PluginFailed(format!(
-            "plugin {:?} returned non-final status {}",
-            plugin.name, head.status
-        )));
-    }
-    let status = StatusCode::from_u16(head.status).map_err(|e| {
-        Error::PluginFailed(format!(
-            "plugin {:?} returned invalid status {}: {e}",
-            plugin.name, head.status
-        ))
-    })?;
-    let content_type = HeaderValue::from_str(&head.content_type).map_err(|e| {
-        Error::PluginFailed(format!(
-            "plugin {:?} returned invalid content type: {e}",
-            plugin.name
-        ))
-    })?;
-
-    let mut response = Response::builder()
-        .status(status)
-        .header(CONTENT_TYPE, content_type);
-    for (name, value) in head.headers {
-        let name = HeaderName::from_bytes(name.as_bytes()).map_err(|e| {
-            Error::PluginFailed(format!(
-                "plugin {:?} returned invalid header name: {e}",
-                plugin.name
-            ))
-        })?;
-        if forbidden_response_header(&name) {
-            continue;
-        }
-        let value = HeaderValue::from_str(&value).map_err(|e| {
-            Error::PluginFailed(format!(
-                "plugin {:?} returned invalid header value: {e}",
-                plugin.name
-            ))
-        })?;
-        response = response.header(name, value);
-    }
-    response = response.header(CACHE_CONTROL, "no-store");
-
-    let (tx, rx) = mpsc::channel::<std::result::Result<Bytes, std::io::Error>>(8);
+    let mut stdin = child.stdin.take().expect("piped stdin");
+    let mut stdout = BufReader::new(child.stdout.take().expect("piped stdout"));
+    let mut stderr = child.stderr.take().expect("piped stderr");
+    let (head_tx, head_rx) = oneshot::channel();
+    let (tx, rx) = mpsc::channel(8);
     let plugin_name = plugin.name.clone();
+    let timeout = plugin.timeout;
+
     tokio::spawn(async move {
-        pump_body(
-            &plugin_name,
-            &mut child,
-            &mut stdout,
-            writer,
-            stderr_reader,
-            deadline,
-            tx,
-        )
-        .await;
+        let mut head_tx = Some(head_tx);
+        let mut diagnostics = Vec::new();
+        let result = {
+            let write_input = async {
+                if let Err(error) = stdin.write_all(&payload).await {
+                    tracing::warn!(plugin = plugin_name, %error, "plugin stdin failed");
+                }
+                drop(stdin);
+                Ok::<_, anyhow::Error>(())
+            };
+            let read_output = async {
+                let head = read_response_head(&mut stdout).await?;
+                head_tx
+                    .take()
+                    .expect("one response")
+                    .send(Ok(head))
+                    .map_err(|_| anyhow::anyhow!("client disconnected"))?;
+                let mut buffer = [0; 16 * 1024];
+                loop {
+                    let count = stdout.read(&mut buffer).await?;
+                    if count == 0 {
+                        break;
+                    }
+                    tx.send(Ok(Bytes::copy_from_slice(&buffer[..count])))
+                        .await
+                        .map_err(|_| anyhow::anyhow!("client disconnected"))?;
+                }
+                let status = child.wait().await?;
+                ensure!(status.success(), "exited with {status}");
+                Ok::<_, anyhow::Error>(())
+            };
+            let read_stderr = async {
+                let mut buffer = [0; 4096];
+                while let Ok(count @ 1..) = stderr.read(&mut buffer).await {
+                    let room = MAX_PLUGIN_STDERR_BYTES.saturating_sub(diagnostics.len());
+                    diagnostics.extend_from_slice(&buffer[..count.min(room)]);
+                }
+                Ok::<_, anyhow::Error>(())
+            };
+            tokio::select! {
+                _ = tx.closed() => Err(anyhow::anyhow!("client disconnected")),
+                result = tokio::time::timeout(timeout, async {
+                    tokio::try_join!(write_input, read_output, read_stderr).map(|_| ())
+                }) => result.unwrap_or_else(|_| Err(anyhow::anyhow!("timed out"))),
+            }
+        };
+        // Reap before releasing capacity or reporting failure. No pipe task
+        // survives this scope, even if a descendant kept a pipe open.
+        if result.is_err() {
+            let _ = child.kill().await;
+        }
+        let _ = child.wait().await;
         drop(permit);
+        let stderr = String::from_utf8_lossy(&diagnostics);
+        if let Err(error) = result {
+            tracing::error!(plugin = plugin_name, %error, %stderr, "plugin invocation failed");
+            let error = format!("plugin {plugin_name:?}: {error:#}");
+            if let Some(head_tx) = head_tx {
+                let _ = head_tx.send(Err(Error::PluginFailed(error)));
+            } else {
+                // Backpressure may delay delivery, but the process and its
+                // permit have already been released.
+                let _ = tx.send(Err(std::io::Error::other(error))).await;
+            }
+        } else if !stderr.is_empty() {
+            tracing::debug!(plugin = plugin_name, %stderr, "plugin stderr");
+        }
     });
 
-    response
-        .body(Body::from_stream(ReceiverStream::new(rx)))
-        .map_err(|e| Error::Internal(format!("building plugin response: {e}")))
+    let head = head_rx
+        .await
+        .map_err(|e| Error::PluginFailed(format!("plugin response task failed: {e}")))??;
+    Ok(head.map(|()| Body::from_stream(ReceiverStream::new(rx))))
+}
+
+async fn read_response_head(
+    stdout: &mut BufReader<tokio::process::ChildStdout>,
+) -> anyhow::Result<Response<()>> {
+    let mut line = Vec::new();
+    // Limit while reading: checking the size after read_line permits an
+    // unbounded allocation if the plugin never writes a newline.
+    let read = stdout
+        .take((MAX_PLUGIN_HEADER_BYTES + 1) as u64)
+        .read_until(b'\n', &mut line)
+        .await
+        .context("reading response header")?;
+    ensure!(
+        read > 0 && read <= MAX_PLUGIN_HEADER_BYTES,
+        "returned no valid response header"
+    );
+    let head: PluginResponseHead =
+        serde_json::from_slice(&line).context("returned an invalid response header")?;
+    ensure!(
+        head.protocol == PLUGIN_PROTOCOL,
+        "returned protocol {}, expected {PLUGIN_PROTOCOL}",
+        head.protocol
+    );
+    ensure!(
+        (200..=599).contains(&head.status),
+        "returned non-final status {}",
+        head.status
+    );
+    let content_type =
+        HeaderValue::from_str(&head.content_type).context("returned invalid content type")?;
+    let mut response = Response::builder()
+        .status(StatusCode::from_u16(head.status)?)
+        .header(CONTENT_TYPE, content_type)
+        .header(CACHE_CONTROL, "no-store");
+    for (name, value) in head.headers {
+        let name =
+            HeaderName::from_bytes(name.as_bytes()).context("returned invalid header name")?;
+        if !forbidden_response_header(&name) {
+            response = response.header(
+                name,
+                HeaderValue::from_str(&value).context("returned invalid header value")?,
+            );
+        }
+    }
+    Ok(response.body(())?)
 }
 
 fn forbidden_response_header(name: &HeaderName) -> bool {
@@ -586,189 +537,4 @@ fn forbidden_response_header(name: &HeaderName) -> bool {
             | "upgrade"
             | "www-authenticate"
     )
-}
-
-async fn pump_body(
-    plugin_name: &str,
-    child: &mut Child,
-    stdout: &mut BufReader<tokio::process::ChildStdout>,
-    writer: tokio::task::JoinHandle<std::io::Result<()>>,
-    stderr_reader: tokio::task::JoinHandle<String>,
-    deadline: Instant,
-    tx: mpsc::Sender<std::result::Result<Bytes, std::io::Error>>,
-) {
-    let mut buffer = vec![0u8; 16 * 1024];
-    let mut timed_out = false;
-    loop {
-        let read = tokio::select! {
-            _ = tokio::time::sleep_until(deadline) => {
-                timed_out = true;
-                let _ = tx.send(Err(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "plugin invocation timed out",
-                ))).await;
-                break;
-            }
-            result = stdout.read(&mut buffer) => result,
-        };
-        let count = match read {
-            Ok(0) => break,
-            Ok(count) => count,
-            Err(e) => {
-                let _ = tx.send(Err(e)).await;
-                break;
-            }
-        };
-        let chunk = Bytes::copy_from_slice(&buffer[..count]);
-        let sent = tokio::select! {
-            _ = tokio::time::sleep_until(deadline) => {
-                timed_out = true;
-                false
-            }
-            result = tx.send(Ok(chunk)) => result.is_ok(),
-        };
-        if !sent {
-            break;
-        }
-    }
-
-    if timed_out || tx.is_closed() {
-        let _ = child.kill().await;
-    }
-    let status = child.wait().await;
-    let write_result = writer.await;
-    let stderr = stderr_reader
-        .await
-        .unwrap_or_else(|e| format!("stderr task failed: {e}"));
-    match status {
-        Ok(status) if status.success() && !timed_out => {
-            if let Ok(Err(e)) = write_result {
-                tracing::warn!(plugin = plugin_name, error = %e, "plugin stdin failed");
-            }
-            if !stderr.is_empty() {
-                tracing::debug!(plugin = plugin_name, stderr, "plugin stderr");
-            }
-        }
-        Ok(status) => {
-            tracing::error!(plugin = plugin_name, %status, stderr, timed_out, "plugin invocation failed");
-        }
-        Err(e) => {
-            tracing::error!(plugin = plugin_name, error = %e, stderr, timed_out, "waiting for plugin failed");
-        }
-    }
-}
-
-async fn stop_before_response(
-    child: &mut Child,
-    writer: tokio::task::JoinHandle<std::io::Result<()>>,
-    stderr_reader: tokio::task::JoinHandle<String>,
-    plugin_name: &str,
-    reason: &str,
-) {
-    let _ = child.kill().await;
-    let status = child.wait().await;
-    let _ = writer.await;
-    let stderr = stderr_reader
-        .await
-        .unwrap_or_else(|e| format!("stderr task failed: {e}"));
-    tracing::error!(
-        plugin = plugin_name,
-        ?status,
-        stderr,
-        reason,
-        "plugin failed before response"
-    );
-}
-
-async fn drain_stderr(mut stderr: tokio::process::ChildStderr) -> String {
-    let mut kept = Vec::new();
-    let mut buffer = [0u8; 4096];
-    loop {
-        match stderr.read(&mut buffer).await {
-            Ok(0) | Err(_) => break,
-            Ok(count) => {
-                let room = MAX_PLUGIN_STDERR_BYTES.saturating_sub(kept.len());
-                kept.extend_from_slice(&buffer[..count.min(room)]);
-            }
-        }
-    }
-    String::from_utf8_lossy(&kept).trim().to_string()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    fn manifest(executable: &str) -> PluginManifest {
-        PluginManifest {
-            protocol: PLUGIN_PROTOCOL,
-            name: "echo".into(),
-            description: "echo input".into(),
-            executable: executable.into(),
-            args: Vec::new(),
-            environment: BTreeMap::new(),
-            timeout_secs: 30,
-            operations: BTreeMap::from([(
-                "call".into(),
-                OperationManifest {
-                    description: "call echo".into(),
-                    permission: "echo:call".into(),
-                    request_schema: json!({
-                        "type": "object",
-                        "required": ["message"],
-                        "properties": {"message": {"type": "string"}},
-                        "additionalProperties": false
-                    }),
-                },
-            )]),
-        }
-    }
-
-    #[test]
-    fn manifests_compile_their_operation_schemas() {
-        let path = Path::new("test.json");
-        let plugin = compile_manifest(manifest("/bin/echo"), path).expect("valid manifest");
-        let operation = &plugin.operations["call"];
-        assert!(operation.validator.is_valid(&json!({"message": "hello"})));
-        assert!(!operation.validator.is_valid(&json!({"message": 3})));
-    }
-
-    #[test]
-    fn manifests_cannot_claim_another_namespace_or_external_ref() {
-        let path = Path::new("test.json");
-        let mut wrong_permission = manifest("/bin/echo");
-        wrong_permission
-            .operations
-            .get_mut("call")
-            .unwrap()
-            .permission = "imap:read".into();
-        assert!(compile_manifest(wrong_permission, path).is_err());
-
-        let mut external_ref = manifest("/bin/echo");
-        external_ref
-            .operations
-            .get_mut("call")
-            .unwrap()
-            .request_schema = json!({"$ref": "https://example.com/schema.json"});
-        assert!(compile_manifest(external_ref, path).is_err());
-    }
-
-    #[test]
-    fn plugins_cannot_override_host_security_or_framing_headers() {
-        for name in [
-            "authorization",
-            "cache-control",
-            "content-length",
-            "content-type",
-            "set-cookie",
-            "transfer-encoding",
-            "www-authenticate",
-        ] {
-            assert!(forbidden_response_header(&HeaderName::from_static(name)));
-        }
-        assert!(!forbidden_response_header(&HeaderName::from_static(
-            "x-request-id"
-        )));
-    }
 }

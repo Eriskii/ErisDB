@@ -1,135 +1,98 @@
-//! The OpenAI executable against a local upstream: no real key or network.
+//! The real executable and its failure paths, with no simulated provider.
+//! The live contract test is explicit because it consumes provider credits.
 
-use std::convert::Infallible;
+use std::{process::Stdio, time::Duration};
 
-use axum::body::{Body, Bytes};
-use axum::http::{HeaderMap, Response, StatusCode};
-use axum::response::IntoResponse;
-use axum::routing::post;
-use axum::{Json, Router};
-use futures::stream;
 use serde_json::{json, Value};
 use tokio::io::AsyncWriteExt;
 
-async fn chat_completions(headers: HeaderMap, Json(body): Json<Value>) -> Response<Body> {
-    if headers.get("authorization").and_then(|v| v.to_str().ok()) != Some("Bearer test-key") {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({"error": "wrong key"})),
-        )
-            .into_response();
-    }
-    if body["stream"] == true {
-        let chunks = stream::iter([
-            Ok::<_, Infallible>(Bytes::from_static(
-                b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
-            )),
-            Ok::<_, Infallible>(Bytes::from_static(b"data: [DONE]\n\n")),
-        ]);
-        return Response::builder()
-            .status(200)
-            .header("content-type", "text/event-stream")
-            .header("x-request-id", "req_test")
-            .body(Body::from_stream(chunks))
-            .unwrap();
-    }
-    Json(json!({
-        "object": "chat.completion",
-        "received": body,
-        "choices": [{
-            "message": {
-                "role": "assistant",
-                "content": null,
-                "tool_calls": [{"id":"call_1", "type":"function", "function":{"name":"lookup", "arguments":"{}"}}]
-            },
-            "finish_reason": "tool_calls"
-        }]
-    }))
-    .into_response()
+fn invocation(input: Value) -> Value {
+    json!({"protocol": 1, "plugin": "openai", "operation": "chat.completions", "input": input})
 }
 
-async fn upstream() -> String {
-    let app = Router::new().route("/v1/chat/completions", post(chat_completions));
+async fn invoke(request: &[u8], environment: &[(&str, &str)]) -> std::process::Output {
+    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_erisdb-plugin-openai"))
+        .env_clear().envs(environment.iter().copied())
+        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
+        .kill_on_drop(true).spawn().unwrap();
+    child.stdin.take().unwrap().write_all(request).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(60), child.wait_with_output()).await
+        .expect("the executable must finish").unwrap()
+}
+
+fn response(output: std::process::Output) -> (Value, Vec<u8>) {
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let split = output.stdout.iter().position(|byte| *byte == b'\n').expect("protocol response head");
+    (serde_json::from_slice(&output.stdout[..split]).unwrap(), output.stdout[split + 1..].to_vec())
+}
+
+#[tokio::test]
+async fn executable_rejects_invalid_invocations_and_missing_credentials() {
+    let valid = invocation(json!({"model": "unused", "messages": []}));
+    let mut protocol = valid.clone();
+    protocol["protocol"] = json!(2);
+    let mut operation = valid.clone();
+    operation["operation"] = json!("unsupported");
+    for (request, message) in [
+        (b"not json".to_vec(), "parsing invocation"),
+        (serde_json::to_vec(&protocol).unwrap(), "protocol 2 is not supported"),
+        (serde_json::to_vec(&operation).unwrap(), "unsupported operation"),
+        (serde_json::to_vec(&valid).unwrap(), "OPENAI_API_KEY is not set"),
+    ] {
+        let output = invoke(&request, &[]).await;
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty(), "invalid invocations must not produce success headers");
+        assert!(String::from_utf8_lossy(&output.stderr).contains(message));
+    }
+}
+
+#[tokio::test]
+async fn unavailable_upstream_returns_a_complete_protocol_error() {
+    // Reserve an actual local port, then close it. No service implements or
+    // fabricates provider behavior; the executable must handle connection loss.
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    format!("http://{address}/v1")
-}
-
-async fn invoke(base_url: &str, input: Value) -> (Value, Vec<u8>) {
-    let executable = env!("CARGO_BIN_EXE_erisdb-plugin-openai");
-    let mut child = tokio::process::Command::new(executable)
-        .env_clear()
-        .env("OPENAI_API_KEY", "test-key")
-        .env("OPENAI_BASE_URL", base_url)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
-    let invocation = json!({
-        "protocol": 1,
-        "plugin": "openai",
-        "operation": "chat.completions",
-        "input": input,
-        "context": {"user": "alice"}
-    });
-    let mut stdin = child.stdin.take().unwrap();
-    stdin
-        .write_all(&serde_json::to_vec(&invocation).unwrap())
-        .await
-        .unwrap();
-    stdin.shutdown().await.unwrap();
-    drop(stdin);
-    let output = child.wait_with_output().await.unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let split = output
-        .stdout
-        .iter()
-        .position(|byte| *byte == b'\n')
-        .unwrap();
-    let head = serde_json::from_slice(&output.stdout[..split]).unwrap();
-    (head, output.stdout[split + 1..].to_vec())
-}
-
-#[tokio::test]
-async fn chat_completion_bodies_and_tool_calls_pass_through() {
-    let base = upstream().await;
-    let input = json!({
-        "model": "test-model",
-        "messages": [{"role":"user", "content":"use a tool"}],
-        "tools": [{"type":"function", "function":{"name":"lookup", "parameters":{"type":"object"}}}],
-        "tool_choice": "auto"
-    });
-    let (head, body) = invoke(&base, input.clone()).await;
-    assert_eq!(head["status"], 200);
+    let base = format!("http://{}/v1", listener.local_addr().unwrap());
+    drop(listener);
+    let request = serde_json::to_vec(&invocation(json!({"model": "unused", "messages": []}))).unwrap();
+    let (head, bytes) = response(invoke(&request, &[
+        ("OPENAI_API_KEY", "failure-path-only"), ("OPENAI_BASE_URL", &base),
+    ]).await);
+    assert_eq!(head["protocol"], 1);
+    assert_eq!(head["status"], 502);
     assert_eq!(head["content_type"], "application/json");
-    let body: Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(body["received"], input);
-    assert_eq!(
-        body["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
-        "lookup"
-    );
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["error"], "upstream_unavailable");
+    assert!(body["detail"].as_str().unwrap().contains("error sending request"));
 }
 
 #[tokio::test]
-async fn chat_completion_sse_is_streamed_without_rewriting() {
-    let base = upstream().await;
+#[ignore = "calls the real provider; set OPENAI_API_KEY and ERISDB_TEST_OPENAI_MODEL and run --ignored"]
+async fn live_provider_tool_calls_and_sse_pass_through_the_executable() {
+    let key = std::env::var("OPENAI_API_KEY").expect("OPENAI_API_KEY");
+    let model = std::env::var("ERISDB_TEST_OPENAI_MODEL").expect("ERISDB_TEST_OPENAI_MODEL");
+    let mut environment = vec![("OPENAI_API_KEY".to_owned(), key)];
+    for name in ["OPENAI_BASE_URL", "OPENAI_ORGANIZATION", "OPENAI_PROJECT"] {
+        if let Ok(value) = std::env::var(name) { environment.push((name.to_owned(), value)); }
+    }
+    let environment: Vec<_> = environment.iter().map(|(name, value)| (name.as_str(), value.as_str())).collect();
     let input = json!({
-        "model": "test-model",
-        "messages": [{"role":"user", "content":"hello"}],
-        "stream": true
+        "model": model,
+        "messages": [{"role": "user", "content": "Call lookup with no arguments."}],
+        "tools": [{"type": "function", "function": {"name": "lookup", "parameters": {
+            "type": "object", "properties": {}, "additionalProperties": false
+        }}}],
+        "tool_choice": {"type": "function", "function": {"name": "lookup"}}
     });
-    let (head, body) = invoke(&base, input).await;
-    assert_eq!(head["status"], 200);
+    let (head, bytes) = response(invoke(&serde_json::to_vec(&invocation(input.clone())).unwrap(), &environment).await);
+    assert_eq!(head["status"], 200, "{}", String::from_utf8_lossy(&bytes));
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["choices"][0]["message"]["tool_calls"][0]["function"]["name"], "lookup");
+    let mut streaming = input;
+    streaming["stream"] = json!(true);
+    let (head, bytes) = response(invoke(&serde_json::to_vec(&invocation(streaming)).unwrap(), &environment).await);
+    assert_eq!(head["status"], 200, "{}", String::from_utf8_lossy(&bytes));
     assert_eq!(head["content_type"], "text/event-stream");
-    assert_eq!(head["headers"]["x-request-id"], "req_test");
-    assert_eq!(
-        body,
-        b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n"
-    );
+    let events = String::from_utf8(bytes).unwrap();
+    assert!(events.contains("\"tool_calls\""));
+    assert!(events.contains("data: [DONE]"));
 }

@@ -136,8 +136,11 @@ content-type headers in `headers` are discarded; `content_type` is the one
 authoritative spelling. The core adds `Cache-Control: no-store`.
 
 If the client drops the response, the core kills the process. It also kills
-it when `timeout_secs` passes. At most 32 plugin processes run per core
-replica, and a call body is limited to 16 MiB.
+it when `timeout_secs` passes, including when stdout has closed but the process
+has not exited. A nonzero exit fails the response stream. The core reaps the
+process before making its slot available again. At most 32 plugin processes
+run per core replica, a call body is limited to 16 MiB, and the response-header
+line is limited to 16 KiB while being read.
 
 Installed plugin code is trusted deployment code. A separate process gives
 crash and lifetime isolation, not a hostile-code sandbox: it runs as the

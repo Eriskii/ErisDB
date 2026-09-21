@@ -112,6 +112,11 @@ fn parse_body(bytes: &[u8]) -> Value {
         .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(bytes).into_owned()))
 }
 
+fn strings(value: &Value) -> Vec<String> {
+    value.as_array().into_iter().flatten()
+        .filter_map(|value| value.as_str().map(str::to_string)).collect()
+}
+
 /// This unverified claim selects a renewal endpoint, never an authority.
 /// The server authenticates the installation using the actual QUIC peer.
 fn installation_id(token: &str) -> Option<String> {
@@ -254,7 +259,9 @@ impl Client {
         input: Value,
     ) -> Result<PluginStream> {
         let conn = self.connection(false).await?;
-        self.open_plugin_stream(&conn, plugin, operation, input).await
+        self.open_response(&conn, "POST", "/v1/call",
+            &Some(json!({ "plugin": plugin, "operation": operation, "input": input })))
+            .await.map_err(|failed| failed.error)
     }
 
     async fn connection(&self, force_redial: bool) -> Result<Connection> {
@@ -287,6 +294,18 @@ impl Client {
         path: &str,
         body: &Option<Value>,
     ) -> std::result::Result<(u16, Value), Failed> {
+        let mut response = self.open_response(conn, method, path, body).await?;
+        let bytes = (&mut response.body).collect().await.map_err(Failed::after_send)?.to_bytes();
+        Ok((response.status, parse_body(&bytes)))
+    }
+
+    async fn open_response(
+        &self,
+        conn: &Connection,
+        method: &str,
+        path: &str,
+        body: &Option<Value>,
+    ) -> std::result::Result<PluginStream, Failed> {
         // Everything up to `send_request` is local: opening a QUIC stream
         // reserves an id without a round trip, and hyper's HTTP/1
         // handshake writes nothing. A failure in here never reached the
@@ -295,12 +314,13 @@ impl Client {
         let io = TokioIo::new(tokio::io::join(recv, send));
         let (mut sender, driver) =
             hyper::client::conn::http1::handshake(io).await.map_err(Failed::before_send)?;
-        tokio::spawn(driver);
+        let driver = tokio::spawn(driver);
 
         let mut req = hyper::Request::builder()
             .method(hyper::Method::from_bytes(method.as_bytes()).map_err(Failed::before_send)?)
             .uri(path)
             .header("host", "erisdb")
+            .header("accept", "application/json, text/event-stream")
             .header("authorization", format!("Bearer {}", self.token.read().await))
             .header("x-erisdb-client", &self.client_name);
         let payload = match body {
@@ -314,9 +334,15 @@ impl Client {
 
         // From here on the request is on the wire.
         let resp = sender.send_request(req).await.map_err(Failed::after_send)?;
-        let status = resp.status().as_u16();
-        let bytes = resp.into_body().collect().await.map_err(Failed::after_send)?.to_bytes();
-        Ok((status, parse_body(&bytes)))
+        let header = |name| resp.headers().get(name).and_then(|value| value.to_str().ok()).map(str::to_string);
+        Ok(PluginStream {
+            status: resp.status().as_u16(),
+            content_type: header("content-type"),
+            request_id: header("x-request-id"),
+            body: resp.into_body(),
+            driver,
+            _sender: sender,
+        })
     }
 
     /// Trade the current token for one with the same scope and a fresh
@@ -363,12 +389,7 @@ impl Client {
             return Err(refused("permissions", status, body));
         }
         Ok(Permissions {
-            grants: body["grants"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(|g| g.as_str().map(str::to_string))
-                .collect(),
+            grants: strings(&body["grants"]),
             exp: body["exp"].as_i64(),
             max_exp: body["max_exp"].as_i64(),
             user: body["user"].as_str().map(str::to_string),
@@ -400,32 +421,15 @@ impl Client {
         if status != 200 {
             return Err(refused("pairing status", status, body));
         }
-        fn already_collected() -> anyhow::Error {
-            anyhow!(
-                "this pairing was already collected: the token is handed over once, \
-                 so pair again to get another"
-            )
-        }
-        let granted = || -> Vec<String> {
-            body["granted"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(|g| g.as_str().map(str::to_string))
-                .collect()
-        };
         match body["status"].as_str() {
             Some("pending") | Some("requested") => Ok(Pairing::Waiting),
             Some("denied") => Ok(Pairing::Denied),
-            Some("approved") => match body["token"].as_str() {
-                Some(token) => Ok(Pairing::Approved { token: token.to_string(), granted: granted() }),
-                None => Err(already_collected()),
-            },
-            // The core mints the token at the moment it is collected and
-            // spends the session doing it, so there is nothing left to
-            // collect and nothing to be done but pair again. Say that,
-            // rather than returning an approval with no token in it.
-            Some("collected") => Err(already_collected()),
+            Some("approved") if body["token"].is_string() => Ok(Pairing::Approved {
+                token: body["token"].as_str().unwrap().to_owned(), granted: strings(&body["granted"]),
+            }),
+            Some("approved" | "collected") => Err(anyhow!(
+                "this pairing was already collected: the token is handed over once, so pair again to get another"
+            )),
             other => Err(anyhow!("pairing session is in an unknown state: {other:?}")),
         }
     }
@@ -496,76 +500,15 @@ impl Client {
     }
 
     async fn open_stream(&self, conn: &Connection, path: &str) -> Result<Subscription> {
-        let (send, recv) = conn.open_bi().await?;
-        let io = TokioIo::new(tokio::io::join(recv, send));
-        let (mut sender, driver) = hyper::client::conn::http1::handshake(io).await?;
-        let driver = tokio::spawn(driver);
-
-        let req = hyper::Request::builder()
-            .method(hyper::Method::GET)
-            .uri(path)
-            .header("host", "erisdb")
-            .header("accept", "text/event-stream")
-            .header("authorization", format!("Bearer {}", self.token.read().await))
-            .header("x-erisdb-client", &self.client_name)
-            .body(Full::new(Bytes::new()))?;
-        let resp = sender.send_request(req).await?;
-        let status = resp.status().as_u16();
-        if status != 200 {
-            let bytes = resp.into_body().collect().await?.to_bytes();
-            driver.abort();
-            return Err(refused("change stream", status, parse_body(&bytes)));
+        let mut stream = self.open_response(conn, "GET", path, &None).await.map_err(|failed| failed.error)?;
+        if stream.status != 200 {
+            let bytes = (&mut stream.body).collect().await?.to_bytes();
+            return Err(refused("change stream", stream.status, parse_body(&bytes)));
         }
         Ok(Subscription {
-            body: resp.into_body(),
-            driver,
-            _sender: sender,
+            stream,
             buf: Vec::new(),
             done: false,
-        })
-    }
-
-    async fn open_plugin_stream(
-        &self,
-        conn: &Connection,
-        plugin: &str,
-        operation: &str,
-        input: Value,
-    ) -> Result<PluginStream> {
-        let (send, recv) = conn.open_bi().await?;
-        let io = TokioIo::new(tokio::io::join(recv, send));
-        let (mut sender, driver) = hyper::client::conn::http1::handshake(io).await?;
-        let driver = tokio::spawn(driver);
-        let payload = serde_json::to_vec(
-            &json!({ "plugin": plugin, "operation": operation, "input": input }),
-        )?;
-        let req = hyper::Request::builder()
-            .method(hyper::Method::POST)
-            .uri("/v1/call")
-            .header("host", "erisdb")
-            .header("authorization", format!("Bearer {}", self.token.read().await))
-            .header("x-erisdb-client", &self.client_name)
-            .header("content-type", "application/json")
-            .body(Full::new(Bytes::from(payload)))?;
-        let resp = sender.send_request(req).await?;
-        let status = resp.status().as_u16();
-        let content_type = resp
-            .headers()
-            .get("content-type")
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_string);
-        let request_id = resp
-            .headers()
-            .get("x-request-id")
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_string);
-        Ok(PluginStream {
-            status,
-            content_type,
-            request_id,
-            body: resp.into_body(),
-            driver,
-            _sender: sender,
         })
     }
 }
@@ -847,11 +790,7 @@ impl ChangeEvent {
 /// and yields the `change` events; keep-alive comments and any other
 /// event name are skipped. Dropping it closes the stream.
 pub struct Subscription {
-    body: hyper::body::Incoming,
-    driver: tokio::task::JoinHandle<std::result::Result<(), hyper::Error>>,
-    // Holding the request sender keeps hyper's connection from shutting
-    // the stream down under us.
-    _sender: hyper::client::conn::http1::SendRequest<Full<Bytes>>,
+    stream: PluginStream,
     buf: Vec<u8>,
     done: bool,
 }
@@ -869,7 +808,7 @@ impl Subscription {
             if self.done {
                 return Ok(None);
             }
-            match self.body.frame().await {
+            match self.stream.body.frame().await {
                 Some(frame) => {
                     if let Ok(data) = frame?.into_data() {
                         self.buf.extend_from_slice(&data);
@@ -913,12 +852,6 @@ impl Subscription {
             }
         }
         Ok(None)
-    }
-}
-
-impl Drop for Subscription {
-    fn drop(&mut self) {
-        self.driver.abort();
     }
 }
 

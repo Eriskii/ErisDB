@@ -55,7 +55,7 @@ A definition is a body with six fields:
 | `name` | yes | — | The facet name, and its permission namespace. Rules above. |
 | `schema` | yes | — | A JSON Schema object. `{}` accepts anything. |
 | `version` | no | — | An integer ≥ 1. Documentation: the core stores it and never reads it. |
-| `strict` | no | `true` | When false, `schema` is stored but never run. |
+| `strict` | no | `true` | When false, item bodies are not checked against the schema. The schema itself must still be valid. |
 | `lapse` | no | — | `{"due": field, "done": field}`. Makes the tick sweep watch this facet. |
 | `permissions` | no | — | Human sentences for the pairing prompt, keyed by action. Presentation only. |
 
@@ -63,6 +63,10 @@ A definition is a body with six fields:
 422. So is one missing `name` or `schema`. The schema runs before the name
 is checked, so a registration with no name at all is a schema violation
 rather than a naming complaint.
+
+The supplied schema is compiled before the definition is saved. Invalid JSON
+Schema and references outside the document return **400 `bad_request`**;
+rejected edits leave the existing definition and revision unchanged.
 
 Registering:
 
@@ -244,9 +248,8 @@ member to the facet registration body:
 body field holding a boolean. Both are field *names*, not values — this is
 the entire extent of the core's knowledge of a facet's semantics.
 
-On `POST /v1/tick`, after appending the tick itself, the core finds every
-facet definition carrying a `lapse` key and, for each, appends a `lapsed`
-change row for every item where:
+On `POST /v1/tick`, after appending the tick itself, one SQL sweep joins items
+with their facet definitions and appends a `lapsed` change row for every item where:
 
 - `safe_ts(body ->> due) <= now()` — the due field parses as a timestamp
   and that timestamp has passed. `safe_ts` returns NULL rather than
@@ -254,12 +257,14 @@ change row for every item where:
   an unparseable or missing due date simply never lapses.
 - the done field is not the text `true`. A missing `done` field, a missing
   `done` *name* in the rule, `false`, or null all count as not done.
-- no `lapsed` row already exists for this item with `at >= updated_at`.
+- no `lapsed` row already exists for this item at its current `revision`.
 
 That last clause is the whole re-arm rule: **an item lapses at most once
 per edit.** Complete an overdue task and the sweep goes quiet. Edit it
-back to undone and `updated_at` moves past the old lapse row, so the next
+back to undone and its revision advances past the old lapse row, so the next
 tick fires again. Nothing is remembered outside the feed itself.
+This uses revisions because a transaction waiting on a lock can have an older
+timestamp than the last tick while still producing a new edit.
 
 Overlapping pokes are the normal case — a timer fires while the last one
 is still running — and they are safe by construction rather than by luck.
@@ -331,7 +336,7 @@ a client's local due-date checks can notify independently.
 `repeat` is a client-side convention the core knows nothing about:
 completing a repeating task advances `due` by `n` units instead of setting
 `done`. The core sees an ordinary update with a later due date, and — since
-`updated_at` moved — re-arms the lapse for the next occurrence. The
+revision advanced — re-arms the lapse for the next occurrence. The
 recurrence rule needs no server support because the lapse rule already
 does the only server-side work involved.
 

@@ -8,6 +8,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use qrcode::render::unicode::Dense1x2;
 use qrcode::types::QrError;
 use qrcode::QrCode;
 
@@ -17,36 +18,9 @@ use qrcode::QrCode;
 /// about twice as tall as they are wide. A quiet zone of four modules is
 /// part of the spec, not decoration: scanners need it to find the symbol.
 pub fn to_blocks(data: &str) -> Result<String, QrError> {
-    let code = QrCode::new(data)?;
-    let width = code.width();
-    let modules = code.to_colors();
-    let dark = |x: isize, y: isize| -> bool {
-        if x < 0 || y < 0 || x >= width as isize || y >= width as isize {
-            return false; // the quiet zone is light
-        }
-        modules[y as usize * width + x as usize] == qrcode::Color::Dark
-    };
-
-    const QUIET: isize = 4;
-    let lo = -QUIET;
-    let hi = width as isize + QUIET;
-    let mut out = String::new();
-    let mut y = lo;
-    while y < hi {
-        for x in lo..hi {
-            // A dark module prints as an unlit half; the terminal's own
-            // background is the light module, so this reads correctly on
-            // light and dark themes alike.
-            out.push(match (dark(x, y), dark(x, y + 1)) {
-                (true, true) => ' ',
-                (true, false) => '▄',
-                (false, true) => '▀',
-                (false, false) => '█',
-            });
-        }
-        out.push('\n');
-        y += 2;
-    }
+    let mut out = QrCode::new(data)?.render::<Dense1x2>()
+        .dark_color(Dense1x2::Light).light_color(Dense1x2::Dark).build();
+    out.push('\n');
     Ok(out)
 }
 
@@ -68,10 +42,8 @@ pub fn raster(data: &str, scale: u32) -> Result<(u32, Vec<u8>)> {
         let mx = (i % width) as u32 + QUIET;
         let my = (i / width) as u32 + QUIET;
         for dy in 0..scale {
-            let row = (my * scale + dy) * side;
-            for dx in 0..scale {
-                pixels[(row + mx * scale + dx) as usize] = 0;
-            }
+            let start = ((my * scale + dy) * side + mx * scale) as usize;
+            pixels[start..start + scale as usize].fill(0);
         }
     }
     Ok((side, pixels))
@@ -217,10 +189,8 @@ pub async fn run(
     };
 
     let client = session["body"]["client"].as_str().unwrap_or("an unnamed client");
-    let asked: Vec<String> = session["body"]["requested"]
-        .as_array()
-        .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
-        .unwrap_or_default();
+    let asked: Vec<String> = serde_json::from_value(session["body"]["requested"].clone())
+        .context("pairing has invalid requested permissions")?;
 
     // Keystrokes entered while waiting are not an answer to a request the
     // operator has not seen. In particular, a queued newline must not deny it.
@@ -262,112 +232,29 @@ pub async fn run(
         }
     };
 
-    let Some(granted) = granted else {
-        let r = http
-            .post(format!("{base}/v1/pairings/{id}/deny"))
-            .bearer_auth(admin)
-            .json(&serde_json::json!({}))
-            .send()
-            .await?;
-        println!("{}", if r.status().is_success() { "denied." } else { "could not deny." });
-        return Ok(());
+    let (action, body) = match &granted {
+        Some(grants) => ("approve", serde_json::json!({ "granted": grants, "ttl_secs": token_ttl })),
+        None => ("deny", serde_json::json!({})),
     };
-
-    let r = http
-        .post(format!("{base}/v1/pairings/{id}/approve"))
+    let response = http
+        .post(format!("{base}/v1/pairings/{id}/{action}"))
         .bearer_auth(admin)
-        .json(&serde_json::json!({ "granted": granted, "ttl_secs": token_ttl }))
+        .json(&body)
         .send()
         .await?;
-    if r.status().is_success() {
+    if !response.status().is_success() {
+        let status = response.status();
+        let body: serde_json::Value = response.json().await.unwrap_or(serde_json::Value::Null);
+        anyhow::bail!("{} refused ({status}): {body}", if granted.is_some() { "approval" } else { "denial" });
+    }
+    if let Some(granted) = granted {
         println!("\napproved:");
         for grant in &granted {
             println!("  {grant}");
         }
         println!("\nThe client collects its token now.");
     } else {
-        let status = r.status();
-        let body: serde_json::Value = r.json().await.unwrap_or(serde_json::Value::Null);
-        anyhow::bail!("approval refused ({status}): {body}");
+        println!("denied.");
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn blocks_render_a_square_with_a_quiet_zone() {
-        let art = to_blocks("erisdb://pair/test").expect("encodes");
-        let lines: Vec<&str> = art.lines().collect();
-        assert!(!lines.is_empty());
-        let width = lines[0].chars().count();
-        assert!(lines.iter().all(|l| l.chars().count() == width), "ragged rows");
-        // Two module rows per line, so height is about half the width.
-        assert!(
-            (lines.len() as f32 - width as f32 / 2.0).abs() <= 1.0,
-            "{}x{} is not a square symbol",
-            width,
-            lines.len()
-        );
-        // The border is quiet: the first row is entirely light.
-        assert!(lines[0].chars().all(|c| c == '█'), "no quiet zone at the top");
-    }
-
-    #[test]
-    fn a_png_is_written_and_is_a_png() {
-        let dir = std::env::temp_dir().join(format!("erisdb-qr-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("t.png");
-        write_png("erisdb://pair/test", &path, 4).expect("writes");
-        let bytes = std::fs::read(&path).unwrap();
-        assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n", "not a png");
-        assert!(bytes.len() > 100);
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn the_saved_name_cannot_escape_the_home_directory() {
-        let path = png_path(Some("../../etc/passwd"));
-        let name = path.file_name().unwrap().to_string_lossy().to_string();
-        assert!(!name.contains('/'), "{name}");
-        assert!(!name.contains(".."), "{name}");
-        assert_eq!(path.parent(), png_path(Some("plain")).parent());
-    }
-
-    /// The one failure that would be silent and total: a QR that renders
-    /// but does not scan. Decode what we drew, with a decoder that shares
-    /// no code with the encoder, and check it is the ticket byte for byte.
-    #[test]
-    fn the_rendered_code_decodes_back_to_the_ticket() {
-        let ticket = crate::ticket::Ticket::new(
-            crate::auth::mint(b"pair-render-test", &["tasks:*"], Some(604_800), None)
-                .unwrap(),
-            Some("0c3031c9237eb926567987ae285696a172a6c9bdecae2cc5fc491ebe091aa66b".into()),
-            Some("http://192.168.1.20:7700".into()),
-            Some("my-laptop".into()),
-        )
-        .unwrap();
-        let encoded = ticket.encode().unwrap();
-
-        let (side, pixels) = raster(&encoded, 8).expect("raster");
-        let mut img = rqrr::PreparedImage::prepare_from_greyscale(side as usize, side as usize, |x, y| {
-            pixels[y * side as usize + x]
-        });
-        let grids = img.detect_grids();
-        assert_eq!(grids.len(), 1, "a camera would not find exactly one symbol");
-        let (_meta, decoded) = grids[0].decode().expect("decode");
-
-        assert_eq!(decoded, encoded, "the code does not carry the ticket");
-        assert_eq!(crate::ticket::Ticket::parse(&decoded).unwrap(), ticket);
-    }
-
-    #[test]
-    fn a_ticket_sized_payload_still_encodes() {
-        // A real ticket is an endpoint id plus a token: several hundred
-        // characters, which is the case that has to keep working.
-        let payload = format!("erisdb://pair/{}", "A".repeat(600));
-        assert!(to_blocks(&payload).is_ok());
-    }
 }

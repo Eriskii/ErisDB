@@ -1159,6 +1159,7 @@ name = "erisdb"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-stream",
  "axum",
  "base64 0.22.1",
  "chrono",

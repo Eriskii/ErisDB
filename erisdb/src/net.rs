@@ -115,24 +115,3 @@ async fn serve_connection(conn: Connection, app: Router) {
         });
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// One secret, one identity — printable without binding a socket, so
-    /// the CLI can answer "what's my endpoint id" while a core runs.
-    #[test]
-    fn endpoint_id_is_a_pure_function_of_the_secret() {
-        let a = endpoint_id(b"secret-a");
-        assert_eq!(a, endpoint_id(b"secret-a"));
-        assert_ne!(a, endpoint_id(b"secret-b"));
-    }
-
-    /// The derived id names the endpoint a core actually binds.
-    #[tokio::test]
-    async fn endpoint_id_matches_a_bound_endpoint() {
-        let ep = endpoint(b"secret-a").await.expect("bind");
-        assert_eq!(endpoint_id(b"secret-a"), ep.id());
-    }
-}

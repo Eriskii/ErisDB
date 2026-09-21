@@ -1,4 +1,4 @@
-package dev.erisdb.lists
+package dev.erisdb.android
 
 import android.util.Base64
 import org.json.JSONObject

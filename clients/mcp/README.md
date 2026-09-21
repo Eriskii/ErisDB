@@ -79,9 +79,10 @@ A stale revision returns 409. `update_item` replaces the entire body: callers mu
 read it, preserve fields they want to keep, and overlay their intended changes.
 A correct revision does not prevent omitted optional fields from being erased.
 
-`search_items` clamps `limit` to 200 and sweeps at most 25 facets. It
-returns `{items, scanned_facets, truncated}`, so a partial sweep says so
-rather than passing itself off as a complete one.
+`search_items` clamps `limit` to 200 and scans at most 1,000 items in each of
+25 facets. It returns `{items, scanned_facets, truncated}` and marks the result
+truncated whenever a scan or result limit is reached. Facets outside the token's
+permissions are skipped; authentication and server failures are returned as errors.
 
 ## Permissions
 

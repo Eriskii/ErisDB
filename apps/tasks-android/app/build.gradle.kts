@@ -7,6 +7,7 @@ plugins {
 
 android {
     namespace = "dev.erisdb.tasks"
+    sourceSets.getByName("main").kotlin.directories += "../../android-shared/src/main/java"
     compileSdk = 37
     defaultConfig {
         applicationId = "dev.erisdb.tasks"
@@ -80,7 +81,6 @@ dependencies {
 
   // Local tests: jUnit, coroutines, Android runner
   testImplementation(libs.junit)
-  testImplementation(libs.kotlinx.coroutines.test)
   // The real org.json, so the JSON skin over the recurrence rule runs on
   // the JVM instead of hitting android.jar's throwing stubs.
   testImplementation("org.json:json:20240303")

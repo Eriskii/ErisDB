@@ -818,6 +818,42 @@ async fn two_stateless_replicas_share_one_store() {
 }
 
 #[tokio::test]
+async fn listeners_do_not_exhaust_the_request_connection_pool() {
+    use futures::StreamExt;
+    use std::time::Duration;
+    let (url, root, _) = setup().await;
+    let admin = Client::new(&url, &root);
+    register_tasks_facet(&admin).await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let mut listeners = Vec::new();
+        // setup() has eight request connections. Each stream holds LISTEN
+        // open while normal requests and every subscriber still need queries.
+        for _ in 0..10 {
+            let response = admin.req(reqwest::Method::GET, "/v1/changes/stream?facet=tasks")
+                .send().await.unwrap();
+            assert_eq!(response.status(), 200);
+            listeners.push(response.bytes_stream());
+        }
+        let (status, item) = admin.post("/v1/items", json!({
+            "facet":"tasks", "body":{"title":"all listeners see this", "done":false}
+        })).await;
+        assert_eq!(status, 201, "{item}");
+        assert_eq!(admin.get(&format!("/v1/items/{}", item["id"].as_str().unwrap())).await.0, 200);
+        for stream in &mut listeners {
+            let mut text = String::new();
+            while !text.contains("\n\n") {
+                let chunk = stream.next().await.expect("stream stays open").unwrap();
+                text.push_str(std::str::from_utf8(&chunk).unwrap());
+            }
+            let event = text.lines().find_map(|line| line.strip_prefix("data: ")).unwrap();
+            let change: Value = serde_json::from_str(event).unwrap();
+            assert_eq!(change["item_id"], item["id"]);
+            assert_eq!(change["body"], item["body"]);
+        }
+    }).await.expect("listeners must leave request connections available");
+}
+
+#[tokio::test]
 async fn sse_stream_delivers_live_changes() {
     use futures::StreamExt;
     let (url, root, _pool) = setup().await;
@@ -1188,11 +1224,8 @@ async fn a_facet_schema_cannot_point_out_of_the_document() {
 
 /// Items sharing an `updated_at` come back in one fixed order.
 ///
-/// `updated_since` paging is a timestamp cursor, so a tie group is only
-/// safe to split across pages if the order within it never moves. Ties are
-/// near-impossible in practice — each write is its own transaction with its
-/// own `now()` — but "near-impossible" and "ordered" are different claims,
-/// and a client paging a store it did not write cannot tell them apart.
+/// Tied rows use their UUID as a tiebreaker, including when a limit is applied.
+/// The change feed, rather than timestamp-only filtering, provides pagination.
 #[tokio::test]
 async fn items_sharing_a_timestamp_have_a_stable_order() {
     let (url, root, pool) = setup().await;
@@ -1228,15 +1261,12 @@ async fn items_sharing_a_timestamp_have_a_stable_order() {
     }
     assert!(orders.windows(2).all(|w| w[0] == w[1]), "tied items came back in a shifting order");
 
-    // And paging through the tie group reaches every one of them.
-    let mut seen = std::collections::HashSet::new();
-    for page_start in (0..12).step_by(5) {
-        let (_, page) = admin.get("/v1/items?facet=tasks&limit=1000").await;
-        for item in page["items"].as_array().unwrap().iter().skip(page_start).take(5) {
-            seen.insert(item["id"].as_str().unwrap().to_string());
-        }
-    }
-    assert_eq!(seen.len(), 12);
+    assert!(orders[0].windows(2).all(|pair| pair[0] < pair[1]), "ties must sort by UUID");
+    let (status, page) = admin.get("/v1/items?facet=tasks&limit=5").await;
+    assert_eq!(status, 200);
+    let ids: Vec<_> = page["items"].as_array().unwrap().iter()
+        .map(|item| item["id"].as_str().unwrap()).collect();
+    assert_eq!(ids, orders[0][..5]);
 }
 
 /// A cursor walking the feed while writers commit sees every write.
@@ -2221,6 +2251,16 @@ async fn terminal_qr_subset_and_client_management_work_end_to_end() {
         |x,y| bytes[y * image.width as usize + x]);
     let decoded = qr.detect_grids()[0].decode().unwrap().1;
     assert!(printed.contains(&decoded));
+    let blocks: Vec<Vec<char>> = printed.lines()
+        .filter(|line| !line.is_empty() && line.chars().all(|c| matches!(c, ' ' | '▀' | '▄' | '█')))
+        .map(|line| line.chars().collect()).collect();
+    let width = blocks[0].len();
+    assert!(blocks.iter().all(|line| line.len() == width));
+    let mut terminal_qr = rqrr::PreparedImage::prepare_from_greyscale(width * 4, blocks.len() * 8, |x, y| {
+        let pixel = blocks[y / 8][x / 4];
+        if pixel == '█' || (pixel == '▀' && y % 8 < 4) || (pixel == '▄' && y % 8 >= 4) { 255 } else { 0 }
+    });
+    assert_eq!(terminal_qr.detect_grids()[0].decode().unwrap().1, decoded);
     let ticket = erisdb::ticket::Ticket::parse(&decoded).unwrap();
     assert_eq!(ticket.url.as_deref(), Some(base.as_str()));
     let app = Client::new(&base, &ticket.token);
@@ -2300,4 +2340,190 @@ async fn two_approved_pairings_cannot_create_two_active_registrations_for_one_pr
     let mut statuses = [a.0,b.0]; statuses.sort();
     assert_eq!(statuses, [200,409]);
     assert_eq!(admin.get("/v1/clients").await.1["clients"].as_array().unwrap().len(),1);
+}
+
+#[tokio::test]
+async fn tampered_tokens_and_malformed_capability_requests_are_refused_over_http() {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    let (url, root, _) = setup().await;
+    let admin = Client::new(&url, &root);
+    assert_eq!(admin.get("/v1/permissions").await.0, 200);
+    let parts: Vec<_> = root.split('.').collect();
+    let mut payload: Value = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(parts[1]).unwrap()).unwrap();
+    payload["user"] = json!("forged");
+    let altered = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).unwrap());
+    let mut tokens = vec![
+        erisdb::auth::mint(b"wrong-secret", &["*"], Some(60), None).unwrap(),
+        format!("{}.{}.{}", parts[0], altered, parts[2]),
+    ];
+    for signature in ["".to_owned(), URL_SAFE_NO_PAD.encode([0u8; 31]), URL_SAFE_NO_PAD.encode([0u8; 33])] {
+        tokens.push(format!("{}.{}.{}", parts[0], parts[1], signature));
+    }
+    for token in tokens {
+        assert_eq!(Client::new(&url, &token).get("/v1/permissions").await.0, 401);
+    }
+    for grants in [json!([]), json!(["Tasks:read"]), json!(["tasks:"]), json!(["tasks:rea*d"]),
+        json!(vec!["tasks:read"; 65]), json!([format!("{}:read", "x".repeat(129))])] {
+        let (status, error) = admin.post("/v1/capabilities", json!({"grants": grants, "ttl_secs": 60})).await;
+        assert_eq!(status, 400, "{error}");
+    }
+    assert_eq!(admin.post("/v1/capabilities", json!({"grants": ["tasks:read"], "ttl_secs": 60, "user": "x".repeat(129)})).await.0, 400);
+}
+
+#[tokio::test]
+async fn crossed_wildcards_remain_intersected_when_an_installation_is_narrowed() {
+    let (url, root, _) = setup().await;
+    let admin = Client::new(&url, &root);
+    register_tasks_facet(&admin).await;
+    let (app, id) = register_browser(&admin, &["tasks:*", "*:read"], 600).await;
+    let (status, item) = app.post("/v1/items", json!({"facet": "tasks", "body": {"title": "before", "done": false}})).await;
+    assert_eq!(status, 201, "{item}");
+    let (_, installation) = admin.get(&format!("/v1/clients/{id}")).await;
+    assert_eq!(admin.put(&format!("/v1/clients/{id}"), json!({"revision": installation["revision"], "grants": ["*:read"]})).await.0, 200);
+    assert_eq!(app.get(&format!("/v1/items/{}", item["id"].as_str().unwrap())).await.0, 200);
+    assert_eq!(app.post("/v1/items", json!({"facet": "tasks", "body": {"title": "after", "done": false}})).await.0, 403);
+}
+
+#[tokio::test]
+async fn a_lapse_during_a_blocked_edit_does_not_consume_the_next_revision() {
+    use std::time::Duration;
+    let (url, root, pool) = setup().await;
+    let admin = Client::new(&url, &root);
+    assert_eq!(admin.post("/v1/items", json!({"facet": "facet", "body": {
+        "name": "tasks", "schema": {"type": "object"}, "lapse": {"due": "due", "done": "done"}
+    }})).await.0, 201);
+    let body = json!({"due": "2020-01-01T00:00:00Z", "done": false});
+    let (status, item) = admin.post("/v1/items", json!({"facet": "tasks", "body": body})).await;
+    assert_eq!(status, 201);
+    let id: uuid::Uuid = item["id"].as_str().unwrap().parse().unwrap();
+    let mut blocker = pool.begin().await.unwrap();
+    sqlx::query("SELECT id FROM items WHERE id = $1 FOR UPDATE").bind(id)
+        .fetch_one(&mut *blocker).await.unwrap();
+    let blocked = Client::new(&url, &root);
+    let edit = tokio::spawn(async move {
+        blocked.put(&format!("/v1/items/{id}"), json!({"revision": 1, "body": body})).await
+    });
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let waiting: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock' AND query LIKE '%items%')")
+                .fetch_one(&pool).await.unwrap();
+            if waiting { break; }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.expect("the HTTP edit must begin its transaction before the tick");
+    let (status, first) = admin.post("/v1/tick", json!({})).await;
+    assert_eq!(status, 200);
+    assert_eq!(first["lapsed"], 1);
+    blocker.commit().await.unwrap();
+    let (status, edited) = edit.await.unwrap();
+    assert_eq!(status, 200, "{edited}");
+    assert_eq!(edited["revision"], 2);
+    assert_eq!(admin.post("/v1/tick", json!({})).await.1["lapsed"], 1);
+    assert_eq!(admin.post("/v1/tick", json!({})).await.1["lapsed"], 0);
+    let (_, feed) = admin.get("/v1/changes?facet=tasks").await;
+    let revisions: Vec<_> = feed["changes"].as_array().unwrap().iter()
+        .filter(|change| change["op"] == "lapsed").map(|change| change["revision"].clone()).collect();
+    assert_eq!(revisions, vec![json!(1), json!(2)]);
+}
+
+#[tokio::test]
+async fn the_pairing_cli_reports_a_denial_conflict_as_failure() {
+    use std::{process::Stdio, time::Duration};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let (url, root, _) = setup().await;
+    let admin = Client::new(&url, &root);
+    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_erisdb"))
+        .args(["pair", "--url", &url, "--client-url", &url, "--no-iroh", "--secret", std::str::from_utf8(SECRET).unwrap()])
+        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
+        .kill_on_drop(true).spawn().unwrap();
+    let mut input = child.stdin.take().unwrap();
+    let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+    let ticket = tokio::time::timeout(Duration::from_secs(10), async {
+        while let Some(line) = lines.next_line().await.unwrap() {
+            if let Some(start) = line.find("erisdb://pair/") { return erisdb::ticket::Ticket::parse(&line[start..]).unwrap(); }
+        }
+        panic!("CLI closed before emitting a ticket");
+    }).await.unwrap();
+    let mut browser = Client::new(&url, &ticket.token);
+    let (status, request) = browser.post("/v1/pair/redeem", json!({"client": "conflict", "requested": ["tasks:read"]})).await;
+    assert_eq!(status, 200);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while let Some(line) = lines.next_line().await.unwrap() {
+            if line.contains("Compare this code") { return; }
+        }
+        panic!("CLI closed before asking for approval");
+    }).await.unwrap();
+    assert_eq!(admin.post(&format!("/v1/pairings/{}/approve", request["id"].as_str().unwrap()), json!({})).await.0, 200);
+    let (status, collected) = browser.get("/v1/pair/status").await;
+    assert_eq!(status, 200);
+    browser.token = collected["token"].as_str().unwrap().to_owned();
+    input.write_all(b"d\n").await.unwrap();
+    drop(input);
+    let output = tokio::time::timeout(Duration::from_secs(10), child.wait_with_output()).await.unwrap().unwrap();
+    assert!(!output.status.success(), "the CLI claimed denial succeeded after credentials were collected");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("409"));
+    assert_eq!(browser.get("/v1/permissions").await.0, 200);
+}
+
+#[tokio::test]
+async fn invalid_facet_schemas_are_rejected_before_create_or_update_commits() {
+    let (url, root, _pool) = setup().await;
+    let admin = Client::new(&url, &root);
+    let invalid_schemas = [
+        json!({"type": "not-a-jsonschema-type"}),
+        json!({"type": "object", "properties": {"title": {"type": 17}}}),
+    ];
+    for schema in &invalid_schemas {
+        let (status, error) = admin.post("/v1/items", json!({
+            "facet": "facet", "body": {"name": "drafts", "schema": schema}
+        })).await;
+        assert_eq!(status, 400, "{error}");
+        assert_eq!(error["error"], "bad_request");
+    }
+    let (status, facets) = admin.get("/v1/items?facet=facet").await;
+    assert_eq!(status, 200);
+    assert!(facets["items"].as_array().unwrap().iter()
+        .all(|facet| facet["body"]["name"] != "drafts"));
+
+    // The rejected name remains available for a usable definition.
+    let (status, facet) = admin.post("/v1/items", json!({
+        "facet": "facet", "body": {"name": "drafts", "schema": {
+            "type": "object", "required": ["title"],
+            "properties": {"title": {"type": "string"}}, "additionalProperties": false
+        }}
+    })).await;
+    assert_eq!(status, 201, "{facet}");
+    let path = format!("/v1/items/{}", facet["id"].as_str().unwrap());
+    let (status, item) = admin.post("/v1/items", json!({
+        "facet": "drafts", "body": {"title": "before rejected update"}
+    })).await;
+    assert_eq!(status, 201, "{item}");
+
+    for schema in &invalid_schemas {
+        let mut body = facet["body"].clone();
+        body["schema"] = schema.clone();
+        let (status, error) = admin.put(&path, json!({
+            "body": body, "revision": facet["revision"]
+        })).await;
+        assert_eq!(status, 400, "{error}");
+        assert_eq!(error["error"], "bad_request");
+        let (status, unchanged) = admin.get(&path).await;
+        assert_eq!(status, 200);
+        assert_eq!(unchanged, facet, "rejected schema edits must not change the stored revision or body");
+    }
+
+    let (status, written) = admin.post("/v1/items", json!({
+        "facet": "drafts", "body": {"title": "after rejected update"}
+    })).await;
+    assert_eq!(status, 201, "{written}");
+    let (status, error) = admin.post("/v1/items", json!({
+        "facet": "drafts", "body": {"title": 42}
+    })).await;
+    assert_eq!(status, 422, "{error}");
+    assert_eq!(error["error"], "schema_violation");
+    let (status, feed) = admin.get("/v1/changes?facet=facet").await;
+    assert_eq!(status, 200);
+    assert_eq!(feed["changes"].as_array().unwrap().len(), 1,
+        "only the valid schema creation belongs in the change feed");
 }

@@ -5,6 +5,7 @@ Start tests/browser/server.cjs with ERISDB_TEST_IROH=1, then run this script.
 No intercepted requests, fake clients, simulated time, or in-memory database.
 """
 import base64
+from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 from pathlib import Path
@@ -34,17 +35,18 @@ def api(method, path, body=None):
         headers={'Authorization': 'Bearer ' + ADMIN, 'Content-Type': 'application/json'},
         data=None if body is None else json.dumps(body).encode())
     with urllib.request.urlopen(req, timeout=30) as response:
-        return json.load(response)
+        return None if response.status == 204 else json.load(response)
 
 
-def eventually(check, seconds=120):
+def eventually(check, seconds=120, description='the real app/core state', diagnostics=None):
     until = time.monotonic() + seconds
     while time.monotonic() < until:
         result = check()
         if result:
             return result
         time.sleep(1)
-    raise AssertionError('timed out waiting for the real app/core state')
+    detail = f': {diagnostics()}' if diagnostics else ''
+    raise AssertionError(f'timed out waiting for {description}{detail}')
 
 
 def screen():
@@ -63,7 +65,7 @@ def tap(node):
 
 def find_button(label):
     return next((n for n in screen().iter('node')
-                 if n.get('content-desc') == label or n.get('text') == label), None)
+                 if n.get('content-desc') == label or n.get('text') in (label, label + '  ⋯')), None)
 
 
 def button(label):
@@ -73,12 +75,24 @@ def button(label):
 
 
 def edit(index, value, replace=False):
-    fields = [n for n in screen().iter('node') if n.get('class') == 'android.widget.EditText']
-    tap(fields[index])
-    if replace:
-        adb('shell', 'input', 'keyevent', 'KEYCODE_MOVE_END')
-        adb('shell', 'input', 'keyevent', *(['KEYCODE_DEL'] * (len(fields[index].get('text', '')) + 1)))
-    adb('shell', 'input', 'text', value)
+    def fields():
+        return [n for n in screen().iter('node') if n.get('class') == 'android.widget.EditText']
+
+    # Compose/IME focus must settle before ADB injects text. Verify the editor
+    # itself before submitting; retrying a keystroke must never submit twice.
+    for attempt in range(2):
+        tap(fields()[index])
+        eventually(lambda: fields()[index].get('focused') == 'true', seconds=15,
+                   description=f'editor field {index} focus')
+        if replace or attempt:
+            length = len(fields()[index].get('text', ''))
+            adb('shell', 'input', 'keyevent', 'KEYCODE_MOVE_END')
+            adb('shell', 'input', 'keyevent', *(['KEYCODE_DEL'] * (length + 1)))
+        adb('shell', 'input', 'text', value)
+        actual = fields()[index].get('text', '')
+        if actual == value:
+            break
+    assert actual == value, f'editor field {index}: expected {value!r}, got {actual!r}'
     adb('shell', 'input', 'keyevent', 'KEYCODE_BACK')
 
 
@@ -89,10 +103,73 @@ def run(app):
     assert apk.is_file(), f'build {apk} first'
     installed = adb('shell', 'pm', 'list', 'packages', package).splitlines()
     assert f'package:{package}' not in installed, 'use an isolated emulator; existing app data must be preserved'
+
+    def create_entry(label):
+        button('add task' if app == 'tasks' else 'add entry')
+        if app == 'tasks':
+            edit(0, label)
+        else:
+            edit(0, 'E2E')
+            edit(1, label)
+        button('Save')
+        eventually(lambda: has_text(label))
+
+    def delete_entry(label):
+        if app == 'tasks':
+            button(label)
+            for _ in range(4):
+                if find_button('Delete task') is not None:
+                    break
+                adb('shell', 'input', 'swipe', '500', '1400', '500', '500', '400')
+            button('Delete task')
+        else:
+            node = find_button(label)
+            assert node is not None
+            x1, y1, x2, y2 = map(int, re.findall(r'\d+', node.get('bounds')))
+            x, y = str((x1+x2)//2), str((y1+y2)//2)
+            adb('shell', 'input', 'swipe', x, y, x, y, '1000')
+            button('Delete')
+        button('Delete')
+
+    def saved_items():
+        try:
+            return json.loads(adb('shell', 'run-as', package, 'cat', 'files/items.json'))['items']
+        except subprocess.CalledProcessError:
+            return []  # A cache intentionally removed by this test is still being rebuilt.
+
+    def queued():
+        preferences = ET.fromstring(adb('shell', 'run-as', package, 'cat', 'shared_prefs/erisdb.xml'))
+        return json.loads(next(n.text for n in preferences if n.get('name') == 'outbox'))
+
     print(f'{app}: install and pair on a core without its schema', flush=True)
     adb('install', '-g', str(apk))
     try:
         assert not any(item['body']['name'] == app for item in api('GET', '/v1/items?facet=facet')['items'])
+        for outcome in ('denied', 'expired'):
+            print(f'{app}: pairing {outcome}' + (' after rescan/restart' if outcome == 'denied' else ' while awaiting approval'), flush=True)
+            refused = api('POST', '/v1/pairings', {'ttl_secs': 300 if outcome == 'denied' else 60})
+            payload = {'v': 1, 'name': 'Unapproved', 'eid': EID, 'token': refused['secret']}
+            code = 'erisdb://pair/' + base64.urlsafe_b64encode(json.dumps(payload).encode()).decode().rstrip('=')
+            adb('shell', 'am', 'start', '-W', '-a', 'android.intent.action.VIEW', '-d', code, '-n', component)
+            refused_path = f"/v1/pairings/{refused['id']}"
+            def pairing_details():
+                return {'session': api('GET', refused_path), 'screen': [n.get('text') for n in screen().iter('node') if n.get('text')]}
+            requested = eventually(lambda: (v if (v := api('GET', refused_path))['body']['status'] == 'requested' else None),
+                                   description=f'{app} {outcome} pairing request', diagnostics=pairing_details)
+            eventually(lambda: has_text(requested['body']['fingerprint']))
+            if outcome == 'denied':
+                adb('shell', 'am', 'force-stop', package)
+                adb('shell', 'am', 'start', '-W', '-a', 'android.intent.action.VIEW', '-d', code, '-n', component)
+                eventually(lambda: has_text(requested['body']['fingerprint']),
+                           description=f'{app} pairing fingerprint after rescan/restart', diagnostics=pairing_details)
+                api('POST', refused_path + '/deny', {})
+                eventually(lambda: has_text('said no'))
+            else:
+                eventually(lambda: has_text('That pairing code is done'), seconds=75,
+                           description=f'{app} pending pairing expiry', diagnostics=pairing_details)
+                assert time.time() >= refused['expires']
+            assert not any(client['id'] == refused['id'] for client in api('GET', '/v1/clients')['clients'])
+            button('Back to pairing')
         session = api('POST', '/v1/pairings', {})
         payload = {'v': 1, 'name': 'Android E2E', 'eid': EID, 'token': session['secret']}
         ticket = 'erisdb://pair/' + base64.urlsafe_b64encode(json.dumps(payload).encode()).decode().rstrip('=')
@@ -227,36 +304,113 @@ def run(app):
         assert current['identity'] == client['identity']
         client = current
         eventually(lambda: has_text(changed))
+        print(f'{app}: offline creates retain order and pending deletes follow their server IDs', flush=True)
+        pending = label + 'Queued'
+        discarded = label + 'Discarded'
+        adb('shell', 'svc', 'wifi', 'disable')
+        adb('shell', 'svc', 'data', 'disable')
+        try:
+            create_entry(pending)
+            button(pending)
+            assert any(node.get('enabled') == 'false' and any(child.get('text') == 'Save' for child in node.iter('node'))
+                       for node in screen().iter('node')), 'pending edits must keep Save disabled'
+            assert has_text('still syncing')
+            adb('shell', 'input', 'keyevent', 'KEYCODE_BACK')
+            create_entry(discarded)
+            delete_entry(discarded)
+            eventually(lambda: has_text(pending) and not has_text(discarded))
+            adb('shell', 'am', 'force-stop', package)
+            adb('shell', 'am', 'start', '-W', '-n', component)
+            eventually(lambda: has_text(pending) and not has_text(discarded))
+        finally:
+            adb('shell', 'svc', 'wifi', 'enable')
+            adb('shell', 'svc', 'data', 'enable')
+        eventually(lambda: queued() == [])
+        final_items = api('GET', f'/v1/items?facet={app}')['items']
+        assert len(final_items) == 3, final_items
+        assert sum(v['body'].get('title', v['body'].get('name')) == pending for v in final_items) == 1
+        assert not any(v['body'].get('title', v['body'].get('name')) == discarded for v in final_items)
+        changes = api('GET', f'/v1/changes?facet={app}')['changes']
+        queued_creates = [v['body'].get('title', v['body'].get('name')) for v in changes
+                          if v['op'] == 'created' and v.get('body') and v['body'].get('title', v['body'].get('name')) in (pending, discarded)]
+        assert queued_creates == [pending, discarded], 'each queued create must be sent once, in order'
+        delete_entry(pending)
+        eventually(lambda: len(api('GET', f'/v1/items?facet={app}')['items']) == 2)
         print(f'{app}: re-paired; edit and delete through the UI', flush=True)
         button(changed)
         edited = changed + 'Edited'
         edit(0 if app == 'tasks' else 1, edited, replace=True)
-        button('Save')
+        adb('shell', 'svc', 'wifi', 'disable')
+        adb('shell', 'svc', 'data', 'disable')
+        try:
+            latest = api('GET', f"/v1/items/{item['id']}")
+            api('PUT', f"/v1/items/{item['id']}", {'revision': latest['revision'],
+                'body': latest['body'] | {('title' if app == 'tasks' else 'name'): changed + 'Remote'}})
+            button('Save')
+            eventually(lambda: has_text(edited))
+        finally:
+            adb('shell', 'svc', 'wifi', 'enable')
+            adb('shell', 'svc', 'data', 'enable')
         updated = eventually(lambda: (v if (v := api('GET', f"/v1/items/{item['id']}"))['body'].get('title', v['body'].get('name')) == edited else None))
         assert updated['source']['installation'] == session['id']
         eventually(lambda: has_text(edited))
-        if app == 'tasks':
-            button(edited)
-            # The delete control is below the optional task fields.
-            for _ in range(4):
-                if find_button('Delete task') is not None:
-                    break
-                adb('shell', 'input', 'swipe', '500', '1400', '500', '500', '400')
-            button('Delete task')
-        else:
-            node = find_button(edited)
-            assert node is not None
-            x1, y1, x2, y2 = map(int, re.findall(r'\d+', node.get('bounds')))
-            x, y = str((x1+x2)//2), str((y1+y2)//2)
-            adb('shell', 'input', 'swipe', x, y, x, y, '1000')
-            button('Delete')
-        button('Delete')
+        assert updated['revision'] == latest['revision'] + 2, 'the queued edit must retry its real revision conflict'
+        delete_entry(edited)
         eventually(lambda: all(v['id'] != item['id'] for v in api('GET', f'/v1/items?facet={app}')['items']))
+
+        print(f'{app}: queued writes rejected by narrowed authority leave the queue', flush=True)
+        denied_label = label + 'NotAllowed'
+        remaining = api('GET', f'/v1/items?facet={app}')['items'][0]
+        adb('shell', 'svc', 'wifi', 'disable')
+        adb('shell', 'svc', 'data', 'disable')
+        try:
+            create_entry(denied_label)
+            delete_entry(denied_label)
+            button(second_label)
+            edit(0 if app == 'tasks' else 1, second_label + 'NotAllowed', replace=True)
+            button('Save')
+            delete_entry(second_label + 'NotAllowed')
+            client = api('PUT', f"/v1/clients/{session['id']}", {'grants': [f'{app}:read'], 'revision': client['revision']})
+        finally:
+            adb('shell', 'svc', 'wifi', 'enable')
+            adb('shell', 'svc', 'data', 'enable')
+        eventually(lambda: queued() == [])
+        assert api('GET', f'/v1/items?facet={app}')['items'] == [remaining]
+        eventually(lambda: has_text(second_label))
+        client = api('PUT', f"/v1/clients/{session['id']}", {'grants': [f'{app}:{action}' for action in ('read', 'create', 'update', 'delete')], 'revision': client['revision']})
+
+        print(f'{app}: snapshot pagination and multi-page change replay preserve every item', flush=True)
+        adb('shell', 'am', 'force-stop', package)
+        def seed_entry(index):
+            body = ({'title': f'Page{index:04}', 'done': False} if app == 'tasks'
+                    else {'list': 'Pagination', 'name': f'Page{index:04}'})
+            return api('POST', '/v1/items', {'facet': app, 'body': body})
+        with ThreadPoolExecutor(max_workers=8) as writers:
+            paged = list(writers.map(seed_entry, range(1001)))
+        expected = {entry['id'] for entry in paged} | {entry['id'] for entry in baseline if entry['id'] != item['id']}
+        adb('shell', 'run-as', package, 'rm', 'files/items.json')
+        adb('shell', 'am', 'start', '-W', '-n', component)
+        eventually(lambda: {entry['id'] for entry in saved_items()} == expected)
+        adb('shell', 'am', 'force-stop', package)
+        with ThreadPoolExecutor(max_workers=8) as writers:
+            list(writers.map(lambda entry: api('DELETE', f"/v1/items/{entry['id']}"), paged[:501]))
+        adb('shell', 'am', 'start', '-W', '-n', component)
+        expected -= {entry['id'] for entry in paged[:501]}
+        eventually(lambda: {entry['id'] for entry in saved_items()} == expected)
+        if app == 'tasks':
+            overdue = api('POST', '/v1/items', {'facet': app,
+                'body': {'title': 'LapseEvent', 'done': False, 'due': '2020-01-01T00:00:00Z'}})
+            cached = eventually(lambda: next((v for v in saved_items() if v['id'] == overdue['id']), None))
+            tick = api('POST', '/v1/tick', {})
+            assert tick['lapsed'] == 1
+            eventually(lambda: json.loads(adb('shell', 'run-as', package, 'cat', 'files/items.json'))['cursor'] >= tick['seq'])
+            assert next(v for v in saved_items() if v['id'] == overdue['id']) == cached, 'a lapse event must not change item timestamps or revision'
+            api('DELETE', f"/v1/items/{overdue['id']}")
         api('PUT', f"/v1/clients/{session['id']}", {'grants': [f'{app}:read'], 'revision': client['revision']})
         eventually(lambda: find_button('add task' if app == 'tasks' else 'add entry') is None)
         api('POST', f"/v1/clients/{session['id']}/revoke", {})
         eventually(lambda: has_text('revoked'))
-        print(f'{app}: fresh-schema setup, real deep-link pairing, fingerprint, offline queue/restart, unchanged saved items, missing/unreadable cache recovery, UI create/edit/delete, restart renewal, re-pairing, permissions, revocation passed', flush=True)
+        print(f'{app}: pairing restart/denial/expiry, offline queue order/deletion/rejections, revision conflict, snapshot/feed pagination, cache recovery, renewal, CRUD and revocation passed', flush=True)
     except Exception:
         Path('/tmp/erisdb-android-logcat.txt').write_text(adb('logcat', '-d'))
         try:

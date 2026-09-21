@@ -16,6 +16,7 @@ The implementation examples below show how the included clients use those routes
 | [Client development](client-development.md) | Calling the server and keeping a local cache. |
 | [Operations](operations.md) | Configuration, database initialization, backups, transport, and deployment. |
 | [Plugins](plugins.md) | Implemented executable operations and their process protocol. |
+| [Architecture](architecture.md) | Persistent concepts, transaction ownership, stream isolation, process supervision, and production CLOC measurement. |
 
 Client-specific interfaces are documented with their implementations:
 [MCP client](../clients/mcp/README.md),

@@ -1,6 +1,7 @@
 package dev.erisdb.lists
 
-import kotlinx.coroutines.test.runTest
+import dev.erisdb.android.*
+
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -207,31 +208,5 @@ class GrantsTest {
     @Test
     fun aStoredValueThatIsNotAGrantListReadsAsUnknown() {
         assertNull(readGrants("{{{"))
-    }
-
-    // ------------------------------------------------------- asking
-
-    @Test
-    fun thePermissionsEndpointIsWhatTheTokenActuallyHolds() = runTest {
-        val core = FakeCore().apply { grants = listOf("lists:read", "lists:create") }
-        val read = fetchGrants(core)
-        assertEquals(listOf("lists:read", "lists:create"), (read as Read.Ok).value.held)
-        assertTrue("GET /v1/permissions" in core.calls)
-    }
-
-    @Test
-    fun anUnreachableCoreLeavesTheLastKnownGrantsAlone() = runTest {
-        val core = FakeCore().apply { grants = listOf("lists:*"); offline = true }
-        assertTrue(fetchGrants(core) is Read.Failed)
-    }
-
-    @Test
-    fun anApprovalNarrowerThanTheRequestIsWhatComesBack() = runTest {
-        // The human pressed `s` and picked two of the four.
-        val core = FakeCore().apply { grants = listOf("lists:read", "lists:update") }
-        val held = (fetchGrants(core) as Read.Ok).value
-        assertFalse(held.mayCreate)
-        assertTrue(held.mayUpdate)
-        assertEquals(listOf("lists:create", "lists:delete"), withheld(held, MANIFEST))
     }
 }

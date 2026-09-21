@@ -1,5 +1,7 @@
 package dev.erisdb.tasks
 
+import dev.erisdb.android.*
+
 import org.json.JSONObject
 
 // The tasks facet is shared with the web client. A facet's name is also

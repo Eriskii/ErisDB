@@ -13,6 +13,8 @@ pub mod pair;
 pub mod permission;
 pub mod plugin;
 pub mod ticket;
+mod store;
+mod schema;
 
 pub use api::{app, app_with_plugins};
 pub use plugin::PluginRegistry;

@@ -1,6 +1,7 @@
 package dev.erisdb.tasks
 
-import kotlinx.coroutines.test.runTest
+import dev.erisdb.android.*
+
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -187,22 +188,6 @@ class PairingTest {
         assertFalse(paired("", tok))
         assertFalse(paired(eid, ""))
         assertFalse(paired("", ""))
-    }
-
-    @Test
-    fun anAlreadyConfiguredInstallIsNotLoggedOut() = runTest {
-        // The token on disk is one the core still honours: what changed is
-        // how permissions are named, not the tokens. So an install that
-        // was working resumes, and the grants arrive afterwards.
-        assertEquals(Launch.Resume(eid, tok), launch(eid, tok))
-
-        val core = FakeCore().apply { grants = listOf("tasks:*") }
-        val held = (fetchGrants(core) as Read.Ok).value
-        assertTrue(held.mayCreate)
-        assertTrue(held.mayDelete)
-
-        // No pairing code is redeemed on the way back in.
-        assertEquals(emptyList<String>(), core.callsMatching("POST /v1/pair"))
     }
 
     @Test

@@ -37,7 +37,7 @@ const MAX_HITS: usize = 200;
 const MAX_FACET_SCAN: usize = 25;
 
 /// Items read per facet in one search pass — the core's own ceiling.
-const SCAN_PAGE: &str = "1000";
+const SCAN_PAGE: usize = 1000;
 
 /// The default ceiling on the lifetime of a token this client causes to
 /// exist — minted or approved: a day.
@@ -156,6 +156,15 @@ impl ErisDBMcp {
     /// never reached the network.
     fn refuse(message: impl Into<String>) -> Result<CallToolResult, McpError> {
         Ok(CallToolResult::error(vec![ContentBlock::text(message.into())]))
+    }
+
+    /// Credential responses report the effective lifetime after the local cap.
+    async fn issue(&self, path: &str, body: Value) -> Result<CallToolResult, McpError> {
+        let outcome = self.call(reqwest::Method::POST, path, &[], Some(&body)).await;
+        Self::result(outcome.map(|(status, mut reply)| {
+            if (200..300).contains(&status) { reply["ttl_secs"] = body["ttl_secs"].clone(); }
+            (status, reply)
+        }))
     }
 }
 
@@ -321,7 +330,7 @@ impl ErisDBMcp {
         let mut facets: Vec<String> = match p.facet {
             Some(f) => vec![f],
             None => {
-                let q = [("facet", FACET_FACET.to_string()), ("limit", SCAN_PAGE.into())];
+                let q = [("facet", FACET_FACET.to_string()), ("limit", SCAN_PAGE.to_string())];
                 match self.call(reqwest::Method::GET, "/v1/items", &q, None).await {
                     Err(e) => return Self::result(Err(e)),
                     Ok((status, body)) if status != 200 => {
@@ -348,16 +357,18 @@ impl ErisDBMcp {
         let mut hits: Vec<Value> = Vec::new();
         let mut scanned = 0usize;
         'facets: for facet in facets {
-            let q = [("facet", facet), ("limit", SCAN_PAGE.into())];
+            let q = [("facet", facet), ("limit", SCAN_PAGE.to_string())];
             let (status, body) = match self.call(reqwest::Method::GET, "/v1/items", &q, None).await {
                 Ok(r) => r,
                 Err(e) => return Self::result(Err(e)),
             };
-            if status != 200 {
+            if status == 403 {
                 // A token narrower than the scan set skips facets it can't read.
                 continue;
             }
+            if status != 200 { return Self::result(Ok((status, body))); }
             scanned += 1;
+            truncated |= body["items"].as_array().is_some_and(|items| items.len() == SCAN_PAGE);
             for item in body["items"].as_array().into_iter().flatten() {
                 // Both halves of the match ignore case: an id typed in
                 // lowercase is the same id as the one the store printed.
@@ -451,19 +462,7 @@ impl ErisDBMcp {
         }
         let ttl = p.ttl_secs.min(self.policy.max_mint_ttl);
 
-        let mut body = json!({ "grants": p.grants, "ttl_secs": ttl });
-        if let Some(u) = p.user {
-            body["user"] = json!(u);
-        }
-        match self.call(reqwest::Method::POST, "/v1/capabilities", &[], Some(&body)).await {
-            Ok((status, mut minted)) if (200..300).contains(&status) => {
-                // Say what was granted, not what was asked for: a request
-                // over the ceiling gets the ceiling.
-                minted["ttl_secs"] = json!(ttl);
-                Self::result(Ok((status, minted)))
-            }
-            other => Self::result(other),
-        }
+        self.issue("/v1/capabilities", json!({ "grants": p.grants, "ttl_secs": ttl, "user": p.user })).await
     }
 
     // ------------------------------------------------------------ dashboard
@@ -524,18 +523,8 @@ impl ErisDBMcp {
         }
         let ttl = ttl.min(self.policy.max_mint_ttl);
 
-        let mut body = json!({ "granted": p.granted, "ttl_secs": ttl });
-        if let Some(u) = p.user {
-            body["user"] = json!(u);
-        }
         let path = format!("/v1/pairings/{}/approve", p.id);
-        match self.call(reqwest::Method::POST, &path, &[], Some(&body)).await {
-            Ok((status, mut approved)) if (200..300).contains(&status) => {
-                approved["ttl_secs"] = json!(ttl);
-                Self::result(Ok((status, approved)))
-            }
-            other => Self::result(other),
-        }
+        self.issue(&path, json!({ "granted": p.granted, "ttl_secs": ttl, "user": p.user })).await
     }
 
     #[tool(description = "Deny a pairing request: the client gets nothing and the session is spent. Needs no switch — denying only ever takes authority away. When a request is unexpected or asks for more than it should, this is the answer.")]

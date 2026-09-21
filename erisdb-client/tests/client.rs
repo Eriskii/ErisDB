@@ -778,208 +778,165 @@ fn a_ticket_is_read_or_refused() {
 // the other end and have it fail in specific, chosen ways.
 // ---------------------------------------------------------------------
 
-/// How the peer fails.
+/// The proxy only changes delivery; every response comes from the real core.
 #[derive(Clone, Copy, PartialEq)]
 enum Misbehaviour {
-    /// Read the request, then kill the connection without answering —
-    /// exactly the shape where the server may already have applied a
-    /// write that the client never hears about.
     DieHoldingTheRequest,
-    /// Die that way on the first connection only; answer on every later
-    /// one, so a retry can be seen to succeed.
     DieOnceThenAnswer,
-    /// Answer one request, then hang up, leaving the client holding a
-    /// connection that is provably dead before its next call.
     AnswerThenClose,
-    /// Answer with a body that is not JSON.
-    AnswerWithText,
+    PassThrough,
 }
 
-/// A peer, its address, and everything that reached it.
 struct Peer {
+    _pg: testcontainers_modules::testcontainers::ContainerAsync<Postgres>,
+    core: Client,
     addr: iroh::EndpointAddr,
     requests: Arc<Mutex<Vec<String>>>,
     connections: Arc<AtomicUsize>,
 }
 
 impl Peer {
-    fn requests(&self) -> usize {
-        self.requests.lock().unwrap_or_else(|e| e.into_inner()).len()
-    }
-
-    fn first_request(&self) -> String {
-        self.requests.lock().unwrap_or_else(|e| e.into_inner())[0].clone()
-    }
-
-    fn connections(&self) -> usize {
-        self.connections.load(Ordering::SeqCst)
-    }
+    fn requests(&self) -> usize { self.requests.lock().unwrap().len() }
+    fn first_request(&self) -> String { self.requests.lock().unwrap()[0].clone() }
+    fn connections(&self) -> usize { self.connections.load(Ordering::SeqCst) }
 }
 
-const JSON_ANSWER: &str = "HTTP/1.1 201 Created\r\n\
-     content-type: application/json\r\n\
-     content-length: 11\r\n\
-     \r\n\
-     {\"ok\":true}";
-
-const TEXT_ANSWER: &str = "HTTP/1.1 500 Internal Server Error\r\n\
-     content-type: text/plain\r\n\
-     content-length: 4\r\n\
-     \r\n\
-     boom";
-
+/// A QUIC edge forwards complete HTTP exchanges to the actual ErisDB server.
+/// It can discard the answer only AFTER the server completed the transaction,
+/// reproducing an ambiguous write without inventing any service responses.
 async fn misbehaving_peer(how: Misbehaviour) -> Peer {
+    use http_body_util::{BodyExt, Full};
+    use hyper::body::{Bytes, Incoming};
+    use hyper_util::rt::TokioIo;
+    let (pg, core_addr, core) = a_core_to_pair_with().await;
     let ep = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
-        .alpns(vec![erisdb_client::ALPN.to_vec()])
-        .bind()
-        .await
-        .expect("bind peer");
+        .alpns(vec![erisdb_client::ALPN.to_vec()]).bind().await.unwrap();
+    let upstream = ep.connect(core_addr, erisdb_client::ALPN).await.unwrap();
     let addr = ep.addr();
     let requests = Arc::new(Mutex::new(Vec::new()));
     let connections = Arc::new(AtomicUsize::new(0));
-
     let (seen, count) = (requests.clone(), connections.clone());
     tokio::spawn(async move {
         while let Some(incoming) = ep.accept().await {
             let Ok(conn) = incoming.await else { continue };
             let nth = count.fetch_add(1, Ordering::SeqCst);
-            let seen = seen.clone();
+            let (seen, upstream) = (seen.clone(), upstream.clone());
             tokio::spawn(async move {
-                while let Ok((mut send, mut recv)) = conn.accept_bi().await {
-                    let mut buf = vec![0u8; 8192];
-                    let Ok(Some(n)) = recv.read(&mut buf).await else { break };
-                    seen.lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .push(String::from_utf8_lossy(&buf[..n]).into_owned());
-
-                    let answer = match how {
-                        Misbehaviour::DieHoldingTheRequest => None,
-                        Misbehaviour::DieOnceThenAnswer if nth == 0 => None,
-                        Misbehaviour::AnswerWithText => Some(TEXT_ANSWER),
-                        _ => Some(JSON_ANSWER),
-                    };
-                    let Some(answer) = answer else {
-                        conn.close(1u32.into(), b"died holding the request");
-                        return;
-                    };
-                    let _ = send.write_all(answer.as_bytes()).await;
-                    let _ = send.finish();
-
-                    if how == Misbehaviour::AnswerThenClose {
-                        // Let the answer drain before the close frame can
-                        // overtake it; the client then holds a connection
-                        // whose close reason is already known.
-                        tokio::time::sleep(Duration::from_millis(300)).await;
-                        conn.close(0u32.into(), b"one request per connection");
-                        return;
-                    }
+                while let Ok((send, recv)) = conn.accept_bi().await {
+                    let (seen, upstream, conn) = (seen.clone(), upstream.clone(), conn.clone());
+                    tokio::spawn(async move {
+                        let service = hyper::service::service_fn(move |request: hyper::Request<Incoming>| {
+                            let (seen, upstream, conn) = (seen.clone(), upstream.clone(), conn.clone());
+                            async move {
+                                seen.lock().unwrap().push(format!("{} {}", request.method(), request.uri()));
+                                let (parts, body) = request.into_parts();
+                                let request = hyper::Request::from_parts(parts, Full::new(body.collect().await?.to_bytes()));
+                                let (send, recv) = upstream.open_bi().await?;
+                                let (mut sender, driver) = hyper::client::conn::http1::handshake(
+                                    TokioIo::new(tokio::io::join(recv, send))).await?;
+                                tokio::spawn(driver);
+                                let response = sender.send_request(request).await?;
+                                let (parts, body) = response.into_parts();
+                                let body = body.collect().await?.to_bytes();
+                                if how == Misbehaviour::DieHoldingTheRequest ||
+                                    how == Misbehaviour::DieOnceThenAnswer && nth == 0 {
+                                    conn.close(1u32.into(), b"lost response after real core completed");
+                                } else if how == Misbehaviour::AnswerThenClose {
+                                    tokio::spawn(async move {
+                                        tokio::time::sleep(Duration::from_millis(300)).await;
+                                        conn.close(0u32.into(), b"one request per connection");
+                                    });
+                                }
+                                Ok::<hyper::Response<Full<Bytes>>, anyhow::Error>(hyper::Response::from_parts(parts, Full::new(body)))
+                            }
+                        });
+                        let _ = hyper::server::conn::http1::Builder::new()
+                            .serve_connection(TokioIo::new(tokio::io::join(recv, send)), service).await;
+                    });
                 }
             });
         }
     });
-
-    Peer { addr, requests, connections }
+    Peer { _pg: pg, core, addr, requests, connections }
 }
 
 async fn client_for(peer: &Peer, identity: [u8; 32]) -> Client {
-    Client::dial_addr(peer.addr.clone(), "token", "Retry v0", Some(identity))
-        .await
-        .expect("dial peer")
+    let token = erisdb::auth::mint(SECRET, &["*"], Some(3600), None).unwrap();
+    Client::dial_addr(peer.addr.clone(), &token, "Retry v0", Some(identity)).await.unwrap()
 }
 
-/// A write whose bytes went out is never repeated. The server may have
-/// applied it and lost only the answer, and the protocol carries no
-/// idempotency key, so a second attempt would create a second item. The
-/// failure is reported instead.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_write_is_never_sent_twice() {
     let peer = misbehaving_peer(Misbehaviour::DieHoldingTheRequest).await;
     let client = client_for(&peer, [20u8; 32]).await;
-
-    let outcome = client
-        .request("POST", "/v1/items", Some(json!({"facet": "notes", "body": {"text": "once"}})))
-        .await;
-
+    let outcome = client.request("POST", "/v1/items",
+        Some(json!({"facet": "tasks", "body": {"text": "once"}}))).await;
     assert!(outcome.is_err(), "a lost answer is an error, not a silent retry");
-    assert_eq!(peer.requests(), 1, "the write reached the server exactly once");
+    assert_eq!(peer.requests(), 1);
+    let (status, stored) = peer.core.request("GET", "/v1/items?facet=tasks", None).await.unwrap();
+    assert_eq!(status, 200);
+    assert_eq!(stored["items"].as_array().unwrap().len(), 1, "the real write committed exactly once");
+    assert_eq!(stored["items"][0]["body"]["text"], "once");
 }
 
-/// Redeeming is a write like any other: it moves a session from pending
-/// to requested, and a second one against the same session is a 409. A
-/// lost answer is reported rather than resent.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_redeem_is_never_sent_twice() {
     let peer = misbehaving_peer(Misbehaviour::DieHoldingTheRequest).await;
-    let client = client_for(&peer, [24u8; 32]).await;
-
-    let outcome = client.redeem_pairing("Tasks (Android) v0.3", &["tasks:read"]).await;
-
-    assert!(outcome.is_err(), "a lost answer is an error, not a silent retry");
-    assert_eq!(peer.requests(), 1, "the redeem reached the server exactly once");
-    assert!(peer.first_request().starts_with("POST /v1/pair/redeem"), "{}", peer.first_request());
+    let (id, code) = cut_a_pairing(&peer.core).await;
+    let client = Client::dial_addr(peer.addr.clone(), &code, "Retry v0", Some([24u8; 32])).await.unwrap();
+    assert!(client.redeem_pairing("Tasks (Android) v0.3", &["tasks:read"]).await.is_err());
+    assert_eq!(peer.requests(), 1);
+    assert!(peer.first_request().starts_with("POST /v1/pair/redeem"));
+    let (_, pairing) = peer.core.request("GET", &format!("/v1/pairings/{id}"), None).await.unwrap();
+    assert_eq!(pairing["body"]["status"], "requested");
+    assert_eq!(pairing["revision"], 2, "redeeming committed one state transition");
 }
 
-/// Polling for an answer is a read, so it is safe to repeat — and does,
-/// which is what keeps a pairing screen alive across a flaky first hop.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_pairing_poll_is_retried_on_a_broken_connection() {
     let peer = misbehaving_peer(Misbehaviour::DieOnceThenAnswer).await;
-    let client = client_for(&peer, [25u8; 32]).await;
-
-    // The peer answers `{"ok":true}` with no status field, which is not a
-    // session — but it answered, which is the point: the read was
-    // repeated instead of failing at the transport.
-    let _ = client.pairing_status().await;
-    assert_eq!(peer.requests(), 2, "the poll was asked twice, on two connections");
-    assert!(peer.first_request().starts_with("GET /v1/pair/status"), "{}", peer.first_request());
+    let (_, code) = cut_a_pairing(&peer.core).await;
+    let client = Client::dial_addr(peer.addr.clone(), &code, "Retry v0", Some([25u8; 32])).await.unwrap();
+    assert_eq!(client.pairing_status().await.unwrap(), Pairing::Waiting);
+    assert_eq!(peer.requests(), 2);
+    assert_eq!(peer.connections(), 2);
+    assert!(peer.first_request().starts_with("GET /v1/pair/status"));
 }
 
-/// A read whose bytes went out IS repeated: asking again cannot change
-/// anything, so the caller gets its answer rather than a transport error.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_read_is_retried_on_a_broken_connection() {
     let peer = misbehaving_peer(Misbehaviour::DieOnceThenAnswer).await;
     let client = client_for(&peer, [21u8; 32]).await;
-
-    let (status, body) = client.request("GET", "/v1/health", None).await.expect("retried");
-
-    assert_eq!(status, 201);
+    let (status, body) = client.request("GET", "/v1/health", None).await.unwrap();
+    assert_eq!(status, 200);
     assert_eq!(body["ok"], true);
-    assert_eq!(peer.requests(), 2, "the read was asked twice, on two connections");
+    assert_eq!(peer.requests(), 2);
+    assert_eq!(peer.connections(), 2);
 }
 
-/// A connection that is already dead when the call starts carries
-/// nothing, so even a write redials: the rule is about bytes on the wire,
-/// not about the method.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_dead_cached_connection_is_redialled_for_a_write() {
     let peer = misbehaving_peer(Misbehaviour::AnswerThenClose).await;
     let client = client_for(&peer, [22u8; 32]).await;
-
-    client.request("GET", "/v1/health", None).await.expect("first call");
+    client.request("GET", "/v1/health", None).await.unwrap();
     tokio::time::sleep(Duration::from_millis(700)).await;
-
-    let (status, _) = client
-        .request("POST", "/v1/items", Some(json!({"facet": "notes", "body": {}})))
-        .await
-        .expect("second call redials");
-
+    let (status, item) = client.request("POST", "/v1/items",
+        Some(json!({"facet": "tasks", "body": {"text": "redialled"}}))).await.unwrap();
     assert_eq!(status, 201);
-    assert_eq!(peer.requests(), 2, "each call reached the server once");
-    assert_eq!(peer.connections(), 2, "on a connection each");
+    assert_eq!(item["body"]["text"], "redialled");
+    assert_eq!(peer.requests(), 2);
+    assert_eq!(peer.connections(), 2);
+    let (_, stored) = peer.core.request("GET", "/v1/items?facet=tasks", None).await.unwrap();
+    assert_eq!(stored["items"].as_array().unwrap().len(), 1);
 }
 
-/// A body that is not JSON arrives as text, so the caller sees what the
-/// server actually said instead of a bare status with an empty body.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_body_that_is_not_json_arrives_as_text() {
-    let peer = misbehaving_peer(Misbehaviour::AnswerWithText).await;
+    let peer = misbehaving_peer(Misbehaviour::PassThrough).await;
     let client = client_for(&peer, [23u8; 32]).await;
-
-    let (status, body) = client.request("GET", "/v1/health", None).await.expect("exchange");
-
-    assert_eq!(status, 500);
-    assert_eq!(body, json!("boom"));
+    let (status, body) = client.request("GET", "/v1/items/not-a-uuid", None).await.unwrap();
+    assert_eq!(status, 400);
+    assert!(body.as_str().is_some_and(|text| text.contains("UUID")), "{body}");
 }
 
 // ---------------------------------------------------------------------

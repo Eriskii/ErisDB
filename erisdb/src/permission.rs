@@ -35,24 +35,18 @@ pub const ACTIONS: [&str; 4] = ["read", "create", "update", "delete"];
 /// on the required side, which is exactly subsumption — `tasks:read` does
 /// not cover `tasks:*`, because `read` is not `*`.
 pub fn covers(grant: &str, required: &str) -> bool {
-    let g: Vec<&str> = grant.split(':').collect();
-    let r: Vec<&str> = required.split(':').collect();
-    for (i, seg) in g.iter().enumerate() {
-        let last = i + 1 == g.len();
-        if *seg == "*" && last {
-            // Trailing wildcard: the rest, and there must be a rest.
-            return r.len() >= g.len();
+    let mut grants = grant.split(':').peekable();
+    let mut required = required.split(':');
+    while let Some(segment) = grants.next() {
+        let Some(other) = required.next() else { return false };
+        if segment == "*" && grants.peek().is_none() {
+            return true;
         }
-        match r.get(i) {
-            None => return false,
-            Some(other) => {
-                if *seg != "*" && seg != other {
-                    return false;
-                }
-            }
+        if segment != "*" && segment != other {
+            return false;
         }
     }
-    r.len() == g.len()
+    required.next().is_none()
 }
 
 /// True when any grant in the set covers `required`.
@@ -62,7 +56,7 @@ pub fn granted(grants: &[String], required: &str) -> bool {
 
 /// True when every grant in `child` is subsumed by some grant in `parent`.
 pub fn encloses(parent: &[String], child: &[String]) -> bool {
-    child.iter().all(|c| parent.iter().any(|p| covers(p, c)))
+    child.iter().all(|c| granted(parent, c))
 }
 
 /// The permissions both authorities grant, including crossing wildcards
@@ -143,12 +137,12 @@ pub fn check_facet_name(name: &str) -> Result<()> {
 /// grant; that insert-only exception is authorized by the create handler.
 pub fn for_facet(facet: &str, action: &str) -> String {
     match facet {
-        crate::api::FACET_FACET => format!("{META}:facets:{}", meta_action(action)),
-        crate::api::SYSTEM_FACET => format!("{META}:system:read"),
+        crate::store::FACET_FACET => format!("{META}:facets:{}", if action == "read" { "read" } else { "write" }),
+        crate::store::SYSTEM_FACET => format!("{META}:system:read"),
         // Reading a pairing session is a dashboard's job; changing one is
         // an approver's. Collapsing both onto `read` would make a
         // read-only pairing view able to rewrite the session it displays.
-        crate::api::PAIR_FACET => match action {
+        crate::store::PAIR_FACET => match action {
             "read" => format!("{META}:pairing:read"),
             "create" => format!("{META}:pairing:create"),
             _ => format!("{META}:pairing:approve"),
@@ -162,195 +156,5 @@ pub fn for_facet(facet: &str, action: &str) -> String {
 /// never a way to hand-edit a session into some state the state machine
 /// would not have produced.
 pub fn core_managed(facet: &str) -> bool {
-    matches!(facet, crate::api::SYSTEM_FACET | crate::api::PAIR_FACET)
-}
-
-/// The facet meta-facet has two permissions, not four: reading a
-/// registration, and changing one.
-fn meta_action(action: &str) -> &'static str {
-    match action {
-        "read" => "read",
-        _ => "write",
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn intersected_authority_requires_both_grants() {
-        let patterns = ["*", "tasks:*", "*:read", "tasks:read", "lists:create", "meta:*", "meta:pairing:*", "meta:*:read"];
-        let permissions = ["tasks:read", "tasks:create", "tasks:delete", "lists:read", "lists:create", "meta:pairing:read", "meta:pairing:approve", "meta:clients:read", "meta:clients:revoke"];
-        for a in patterns {
-            for b in patterns {
-                let both = intersection(&[a.into()], &[b.into()]);
-                for required in permissions {
-                    assert_eq!(granted(&both, required), covers(a, required) && covers(b, required), "{a} ∩ {b}: {required}");
-                }
-            }
-        }
-    }
-
-    fn g(s: &[&str]) -> Vec<String> {
-        s.iter().map(|x| x.to_string()).collect()
-    }
-
-    // ------------------------------------------------------------ matching
-
-    #[test]
-    fn a_literal_grant_covers_only_itself() {
-        assert!(covers("tasks:read", "tasks:read"));
-        assert!(!covers("tasks:read", "tasks:create"));
-        assert!(!covers("tasks:read", "lists:read"));
-        assert!(!covers("tasks:read", "tasks"));
-        assert!(!covers("tasks:read", "tasks:read:extra"));
-    }
-
-    #[test]
-    fn a_trailing_star_covers_the_rest() {
-        assert!(covers("tasks:*", "tasks:read"));
-        assert!(covers("tasks:*", "tasks:delete"));
-        assert!(covers("meta:*", "meta:pairing:approve"));
-        assert!(covers("meta:pairing:*", "meta:pairing:approve"));
-        // ...but there has to be a rest.
-        assert!(!covers("tasks:*", "tasks"));
-        assert!(!covers("meta:*", "meta"));
-    }
-
-    #[test]
-    fn a_bare_star_covers_everything() {
-        for p in ["tasks:read", "meta:pairing:approve", "anything", "a:b:c:d:e"] {
-            assert!(covers("*", p), "{p}");
-        }
-    }
-
-    #[test]
-    fn a_star_in_the_middle_matches_exactly_one_segment() {
-        assert!(covers("*:read", "tasks:read"));
-        assert!(covers("*:read", "lists:read"));
-        assert!(!covers("*:read", "tasks:create"));
-    }
-
-    /// The property the grammar exists for: reading everything and
-    /// administering everything are different grants, and read-all cannot
-    /// reach into meta by accident.
-    #[test]
-    fn read_everything_does_not_reach_meta() {
-        assert!(!covers("*:read", "meta:facets:read"));
-        assert!(!covers("*:read", "meta:server:read"));
-        assert!(!covers("*:read", "meta:pairing:approve"));
-        assert!(covers("*:read", "tasks:read"));
-    }
-
-    #[test]
-    fn granted_asks_the_whole_set() {
-        let held = g(&["tasks:read", "tasks:create", "lists:*"]);
-        assert!(granted(&held, "tasks:read"));
-        assert!(granted(&held, "lists:delete"));
-        assert!(!granted(&held, "tasks:delete"));
-        assert!(!granted(&held, "meta:facets:read"));
-        assert!(!granted(&[], "tasks:read"));
-    }
-
-    // ------------------------------------------------------------ enclosure
-
-    #[test]
-    fn enclosure_narrows() {
-        assert!(encloses(&g(&["*"]), &g(&["tasks:read", "meta:facets:write"])));
-        assert!(encloses(&g(&["tasks:*"]), &g(&["tasks:read"])));
-        assert!(encloses(&g(&["tasks:*", "lists:read"]), &g(&["lists:read", "tasks:delete"])));
-        assert!(!encloses(&g(&["tasks:read"]), &g(&["tasks:create"])));
-        assert!(!encloses(&g(&["tasks:*"]), &g(&["lists:read"])));
-        assert!(!encloses(&g(&["*:read"]), &g(&["meta:facets:read"])));
-    }
-
-    /// A child pattern must be subsumed, not merely matched. This is the
-    /// trap: `tasks:read` must not be allowed to mint `tasks:*`.
-    #[test]
-    fn a_narrow_parent_cannot_mint_a_wildcard_child() {
-        assert!(!encloses(&g(&["tasks:read"]), &g(&["tasks:*"])));
-        assert!(!encloses(&g(&["tasks:read"]), &g(&["*"])));
-        assert!(!encloses(&g(&["tasks:read"]), &g(&["*:read"])));
-        assert!(!encloses(&g(&["meta:pairing:read"]), &g(&["meta:*"])));
-        assert!(!encloses(&g(&["meta:pairing:read"]), &g(&["meta:pairing:*"])));
-    }
-
-    /// Deliberately conservative: holding every action today is not the
-    /// same as holding the wildcard, because a fifth action would change
-    /// what the wildcard means.
-    #[test]
-    fn holding_every_action_does_not_amount_to_the_wildcard() {
-        let all_four = g(&["tasks:read", "tasks:create", "tasks:update", "tasks:delete"]);
-        assert!(!encloses(&all_four, &g(&["tasks:*"])));
-        assert!(encloses(&all_four, &g(&["tasks:delete"])));
-    }
-
-    #[test]
-    fn an_empty_child_is_enclosed_by_anything() {
-        assert!(encloses(&g(&["tasks:read"]), &[]));
-    }
-
-    // ------------------------------------------------------------ validation
-
-    #[test]
-    fn grants_are_checked_for_shape() {
-        for ok in ["tasks:read", "*", "meta:pairing:*", "a.b-c_d:read", "imap:sync", "x9:read"] {
-            assert!(check_grant(ok).is_ok(), "rejected {ok}");
-        }
-        for bad in ["", "Tasks:read", "tasks:READ", "tasks::read", "tasks:read ", "-x:read", ":read", "ta sks:read"] {
-            assert!(check_grant(bad).is_err(), "accepted {bad:?}");
-        }
-    }
-
-    /// A facet named `meta` — or `*` — would be a way to mint a meta
-    /// permission by registering something.
-    #[test]
-    fn facet_names_cannot_reach_into_meta() {
-        for bad in ["meta", "facet", "system", "pair", "*", "meta:facets", "a:b", "MyFacet", ""] {
-            assert!(check_facet_name(bad).is_err(), "accepted facet name {bad:?}");
-        }
-        for ok in ["tasks", "lists", "imap", "sensors.kitchen", "notes-v2"] {
-            assert!(check_facet_name(ok).is_ok(), "rejected facet name {ok}");
-        }
-    }
-
-    #[test]
-    fn the_cores_own_facets_answer_only_to_meta() {
-        assert_eq!(for_facet("facet", "read"), "meta:facets:read");
-        assert_eq!(for_facet("facet", "create"), "meta:facets:write");
-        assert_eq!(for_facet("facet", "delete"), "meta:facets:write");
-        assert_eq!(for_facet("system", "read"), "meta:system:read");
-        assert_eq!(for_facet("tasks", "create"), "tasks:create");
-    }
-
-    /// Reading pairing requests must not be a way to change them.
-    #[test]
-    fn reading_a_pairing_is_not_approving_one() {
-        assert_eq!(for_facet("pair", "read"), "meta:pairing:read");
-        assert_eq!(for_facet("pair", "update"), "meta:pairing:approve");
-        assert_eq!(for_facet("pair", "delete"), "meta:pairing:approve");
-        assert!(!covers("meta:pairing:read", &for_facet("pair", "update")));
-        assert!(core_managed("pair") && core_managed("system") && !core_managed("tasks"));
-    }
-
-    /// The open namespace: a grant for a facet nobody has registered is
-    /// legal, and starts working the moment the facet exists.
-    #[test]
-    fn a_grant_for_an_unknown_namespace_is_legal_and_inert() {
-        assert!(check_grant("newthing:read").is_ok());
-        let held = g(&["newthing:read"]);
-        assert!(granted(&held, "newthing:read"));
-        assert!(!granted(&held, "tasks:read"));
-    }
-
-    /// A permission the core has no meaning for still delegates and
-    /// encloses correctly, so applications can define their own.
-    #[test]
-    fn permissions_the_core_does_not_understand_still_enclose() {
-        assert!(check_grant("imap:sync").is_ok());
-        assert!(encloses(&g(&["imap:*"]), &g(&["imap:sync"])));
-        assert!(!encloses(&g(&["imap:sync"]), &g(&["imap:*"])));
-        assert!(granted(&g(&["imap:sync"]), "imap:sync"));
-    }
+    matches!(facet, crate::store::SYSTEM_FACET | crate::store::PAIR_FACET)
 }

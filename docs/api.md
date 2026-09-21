@@ -328,7 +328,8 @@ The built-in meta-facet accepts these registration body fields and rejects other
 | `permissions` | Optional object | Action → human-readable description, for example `{"create":"Add notes"}` |
 | `lapse` | Optional object | Required `due` field name, optional `done` field name; the tick sweep uses them |
 
-Local `$ref` values are supported; external references are refused. Changing a
+Schemas must compile before a definition is saved; invalid schemas return 400
+`bad_request`. Local `$ref` values are supported; external references are refused. Changing a
 schema affects subsequent writes, not a retroactive rewrite of existing items.
 See [facet schemas](facets.md) for schema and lapse examples.
 If `notes` already exists, registration returns 409 and leaves its schema intact.

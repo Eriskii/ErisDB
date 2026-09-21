@@ -191,16 +191,30 @@ async fn main() -> Result<()> {
         }
         Command::Pair { url, name, ttl, token_ttl, qr_output, client_url, no_iroh, secret, iroh_secret } => {
             let base = url.trim_end_matches('/').to_string();
+            let eid = (!no_iroh).then(|| {
+                let seed = iroh_secret.as_deref().unwrap_or(&secret);
+                erisdb::net::endpoint_id(seed.as_bytes()).to_string()
+            });
+            // Inspect the actual host: substring checks miss IPv6 and
+            // 127/8 addresses, and misclassify names such as localhost.example.
+            let endpoint = reqwest::Url::parse(&base).context("invalid core URL")?;
+            let loopback = endpoint.host_str().is_some_and(|host| {
+                host.eq_ignore_ascii_case("localhost") || host.trim_matches(['[', ']'])
+                    .parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
+            });
+            let ticket_url = client_url.or_else(|| (!loopback).then(|| base.clone()));
+            if eid.is_none() && ticket_url.is_none() {
+                anyhow::bail!("--no-iroh against a loopback core leaves the ticket with no address a client could dial; pass --client-url");
+            }
             // The CLI holds the secret, so it signs itself the short-lived
             // token it needs to drive pairing over the ordinary API — the
             // same one a dashboard would use.
             let admin = erisdb::auth::mint(
                 secret.as_bytes(),
-                &["meta:pairing:create", "meta:pairing:read", "meta:pairing:approve", "*"],
-                Some(ttl.max(60) + 300),
+                &["*"],
+                Some(ttl.clamp(60, 3600) + 300),
                 None,
-            )
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+            )?;
 
             let http = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build()?;
             let cut: serde_json::Value = http
@@ -217,19 +231,7 @@ async fn main() -> Result<()> {
             let id = cut["id"].as_str().context("the core returned no pairing id")?.to_string();
             let code = cut["secret"].as_str().context("the core returned no code")?.to_string();
 
-            let eid = (!no_iroh).then(|| {
-                let seed = iroh_secret.as_deref().unwrap_or(&secret);
-                erisdb::net::endpoint_id(seed.as_bytes()).to_string()
-            });
-            // A loopback url is useless to the device doing the scanning.
-            let ticket_url = client_url.or_else(|| {
-                (!base.contains("127.0.0.1") && !base.contains("localhost")).then(|| base.clone())
-            });
-            if eid.is_none() && ticket_url.is_none() {
-                anyhow::bail!("--no-iroh against a loopback core leaves the ticket with no address a client could dial; pass --client-url");
-            }
-            let ticket = erisdb::ticket::Ticket::new(code, eid, ticket_url, name)
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let ticket = erisdb::ticket::Ticket::new(code, eid, ticket_url, name)?;
             if let Err(error) = erisdb::pair::run(&http, &base, &admin, &id, &ticket, token_ttl, qr_output.as_deref()).await {
                 let _ = http.post(format!("{base}/v1/pairings/{id}/deny")).bearer_auth(&admin).send().await;
                 return Err(error);
@@ -266,8 +268,7 @@ async fn main() -> Result<()> {
             }
             let ttl = if no_expiry { None } else { ttl };
             let token =
-                erisdb::auth::mint_chain(secret.as_bytes(), &grants, ttl, max_ttl, user.as_deref())
-                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                erisdb::auth::mint_chain(secret.as_bytes(), &grants, ttl, max_ttl, user.as_deref())?;
             println!("{token}");
         }
     }

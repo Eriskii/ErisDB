@@ -3,7 +3,7 @@
 //! Every handler is a pure function over (store, request). The process holds
 //! no state a restart would lose; replicas are interchangeable.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -18,24 +18,18 @@ use chrono::{DateTime, Utc};
 use futures::Stream;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use sqlx::postgres::PgListener;
-use sqlx::{PgPool, Postgres, Transaction};
+use sqlx::postgres::{PgListener, PgPoolOptions};
+use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
 
 use crate::auth::{self, Capability};
 use crate::error::{Error, Result};
 use crate::permission;
+use crate::store::{Change, Item, Write};
 use crate::installation::{self, Identity, Installation};
 use crate::plugin::{PluginRegistry, MAX_PLUGIN_REQUEST_BYTES};
 
-/// Facet reserved for core-emitted events (tick).
-pub const SYSTEM_FACET: &str = "system";
-/// The meta-facet holding facet definitions.
-pub const FACET_FACET: &str = "facet";
-/// The facet holding pairing sessions.
-pub const PAIR_FACET: &str = "pair";
-/// Postgres NOTIFY channel fanned out to change-stream subscribers.
-pub const NOTIFY_CHANNEL: &str = "erisdb_changes";
+pub use crate::store::{FACET_FACET, NOTIFY_CHANNEL, PAIR_FACET, SYSTEM_FACET};
 
 /// Live change streams allowed at once. Each one holds a Postgres connection
 /// of its own, outside the pool, so this is a bound on the store as much as
@@ -45,15 +39,6 @@ pub const MAX_STREAMS: usize = 32;
 /// The longest `X-ErisDB-Client` the core will stamp. It lands in every change
 /// row this caller writes, so an unbounded one is a way to grow the table.
 pub const MAX_CLIENT_LEN: usize = 128;
-
-/// Serializes `seq` assignment across writers. `seq` comes from a sequence at
-/// INSERT time, but rows only become visible at COMMIT — so without this two
-/// writers can commit out of order, and a reader that sees the later `seq`
-/// steps over the earlier one and never gets it. Holding one
-/// transaction-scoped lock from the append through the commit makes seq order
-/// and commit order the same thing, which is what lets a cursor be a single
-/// number.
-const CHANGES_LOCK: i64 = 0x0065_7269_7364_6201;
 
 /// Facet name to the schema it was compiled from and the validator for it.
 type ValidatorCache = Arc<Mutex<HashMap<String, (Value, Arc<jsonschema::Validator>)>>>;
@@ -68,6 +53,8 @@ pub struct AppState {
     validators: ValidatorCache,
     /// Bounds concurrent change streams.
     streams: Arc<tokio::sync::Semaphore>,
+    /// LISTEN holds a connection for the stream's lifetime, outside the request pool.
+    listeners: PgPool,
     /// Token buckets over the capability endpoints, keyed by caller.
     minting: Arc<Mutex<RateLimiter>>,
     /// Deployment-derived one-shot executable plugins.
@@ -80,11 +67,15 @@ impl AppState {
     }
 
     pub fn with_plugins(pool: PgPool, secret: Vec<u8>, plugins: PluginRegistry) -> Self {
+        let listeners = PgPoolOptions::new().max_connections(MAX_STREAMS as u32)
+            .idle_timeout(None).max_lifetime(None)
+            .connect_lazy_with((*pool.connect_options()).clone());
         Self {
             pool,
             secret: Arc::new(secret),
             validators: Arc::new(Mutex::new(HashMap::new())),
             streams: Arc::new(tokio::sync::Semaphore::new(MAX_STREAMS)),
+            listeners,
             // Minting and refreshing are rare for an honest client and
             // attractive to grind on: a handful of bursts, then a trickle.
             minting: Arc::new(Mutex::new(RateLimiter::new(10.0, 0.2))),
@@ -295,55 +286,7 @@ impl SourceParts {
     }
 }
 
-// ---------------------------------------------------------------- rows
-
-#[derive(serde::Serialize, sqlx::FromRow)]
-struct Item {
-    id: Uuid,
-    facet: String,
-    body: Value,
-    revision: i64,
-    created_at: DateTime<Utc>,
-    updated_at: DateTime<Utc>,
-    /// The last writer's source; null for initialized facet definitions.
-    source: Option<Value>,
-}
-
-#[derive(serde::Serialize, sqlx::FromRow)]
-struct Change {
-    seq: i64,
-    item_id: Option<Uuid>,
-    facet: String,
-    op: String,
-    at: DateTime<Utc>,
-    /// The body this change produced; null for deletes and ticks.
-    body: Option<Value>,
-    /// The revision this change produced; null wherever body is.
-    revision: Option<i64>,
-    /// Who produced it; null when no request source is recorded.
-    source: Option<Value>,
-}
-
 // ---------------------------------------------------------------- facets
-
-struct FacetDef {
-    strict: bool,
-    schema: Value,
-}
-
-async fn load_facet(tx: &mut Transaction<'_, Postgres>, name: &str) -> Result<Option<FacetDef>> {
-    let body: Option<Value> = sqlx::query_scalar(
-        "SELECT body FROM items WHERE facet = $1 AND body ->> 'name' = $2",
-    )
-    .bind(FACET_FACET)
-    .bind(name)
-    .fetch_optional(&mut **tx)
-    .await?;
-    Ok(body.map(|b| FacetDef {
-        strict: b.get("strict").and_then(Value::as_bool).unwrap_or(true),
-        schema: b.get("schema").cloned().unwrap_or_else(|| json!({})),
-    }))
-}
 
 /// The core's own stateful facets are driven by their own endpoints, so the
 /// item routes refuse to write them. Without this, `meta:pairing:approve`
@@ -359,38 +302,10 @@ fn guard_core_facet(facet: &str, action: &str) -> Result<()> {
     Ok(())
 }
 
-/// A facet schema is caller-supplied data that the validator later walks, so
-/// a `$ref` in it is a request for the core to go and resolve something. Only
-/// refs into the document itself are allowed; anything else is refused here,
-/// at registration, where there is a human to tell.
-fn guard_schema(schema: &Value) -> Result<()> {
-    match schema {
-        Value::Object(map) => {
-            for (key, value) in map {
-                if matches!(key.as_str(), "$ref" | "$recursiveRef" | "$dynamicRef") {
-                    let target = value.as_str().ok_or_else(|| {
-                        Error::BadRequest(format!("schema {key} must be a string"))
-                    })?;
-                    if !target.starts_with('#') {
-                        return Err(Error::BadRequest(format!(
-                            "schema {key} {target:?} points outside the document; \
-                             only local refs such as \"#/$defs/name\" resolve"
-                        )));
-                    }
-                }
-                guard_schema(value)?;
-            }
-            Ok(())
-        }
-        Value::Array(items) => items.iter().try_for_each(guard_schema),
-        _ => Ok(()),
-    }
-}
-
 /// Look up the facet an incoming body claims and check the body against it.
 async fn check_against_facet(
     st: &AppState,
-    tx: &mut Transaction<'_, Postgres>,
+    db: &mut PgConnection,
     facet: &str,
     body: &Value,
 ) -> Result<()> {
@@ -398,14 +313,16 @@ async fn check_against_facet(
     // and naming a permission namespace. Both are checked at the door.
     if facet == FACET_FACET {
         if let Some(schema) = body.get("schema") {
-            guard_schema(schema)?;
+            crate::schema::compile(schema)?;
         }
     }
-    let def = load_facet(tx, facet)
-        .await?
+    let def: Value = sqlx::query_scalar(
+        "SELECT body FROM items WHERE facet = $1 AND body ->> 'name' = $2",
+    ).bind(FACET_FACET).bind(facet).fetch_optional(db).await?
         .ok_or_else(|| Error::UnknownFacet(facet.to_string()))?;
-    if def.strict {
-        let validator = st.validator(facet, &def.schema)?;
+    if def.get("strict").and_then(Value::as_bool).unwrap_or(true) {
+        let schema = def.get("schema").cloned().unwrap_or_else(|| json!({}));
+        let validator = st.validator(facet, &schema)?;
         if let Err(e) = validator.validate(body) {
             return Err(Error::SchemaViolation { facet: facet.to_string(), detail: e.to_string() });
         }
@@ -421,83 +338,6 @@ async fn check_against_facet(
 }
 
 // ---------------------------------------------------------------- changes
-
-/// Append a change row (the bus and the audit log) inside the mutation's
-/// own transaction and notify live subscribers on commit. `snapshot` is
-/// the item's (body, revision) after the change (`None` for deletes and
-/// ticks); `source` is who caused it. History is append-only: these rows
-/// are never edited.
-async fn record_change(
-    tx: &mut Transaction<'_, Postgres>,
-    item_id: Option<Uuid>,
-    facet: &str,
-    op: &str,
-    snapshot: Option<(&Value, i64)>,
-    source: &Value,
-) -> Result<i64> {
-    lock_changes(tx).await?;
-    let seq: i64 = sqlx::query_scalar(
-        "INSERT INTO changes (item_id, facet, op, body, revision, source)
-         VALUES ($1, $2, $3, $4, $5, $6) RETURNING seq",
-    )
-    .bind(item_id)
-    .bind(facet)
-    .bind(op)
-    .bind(snapshot.map(|(b, _)| b))
-    .bind(snapshot.map(|(_, r)| r))
-    .bind(source)
-    .fetch_one(&mut **tx)
-    .await?;
-    sqlx::query("SELECT pg_notify($1, $2)")
-        .bind(NOTIFY_CHANNEL)
-        .bind(seq.to_string())
-        .execute(&mut **tx)
-        .await?;
-    Ok(seq)
-}
-
-/// Take the append lock for the rest of this transaction. Every writer takes
-/// it after it has whatever item lock it needs, so the order is always item
-/// then feed and there is no cycle to deadlock on.
-async fn lock_changes(tx: &mut Transaction<'_, Postgres>) -> Result<()> {
-    sqlx::query("SELECT pg_advisory_xact_lock($1)")
-        .bind(CHANGES_LOCK)
-        .execute(&mut **tx)
-        .await?;
-    Ok(())
-}
-
-async fn fetch_changes(
-    pool: &PgPool,
-    since: i64,
-    facet: Option<&str>,
-    limit: i64,
-) -> Result<Vec<Change>> {
-    let rows = match facet {
-        Some(f) => {
-            sqlx::query_as::<_, Change>(
-                "SELECT seq, item_id, facet, op, at, body, revision, source FROM changes
-                 WHERE seq > $1 AND facet = $2 ORDER BY seq LIMIT $3",
-            )
-            .bind(since)
-            .bind(f)
-            .bind(limit)
-            .fetch_all(pool)
-            .await?
-        }
-        None => {
-            sqlx::query_as::<_, Change>(
-                "SELECT seq, item_id, facet, op, at, body, revision, source FROM changes
-                 WHERE seq > $1 ORDER BY seq LIMIT $2",
-            )
-            .bind(since)
-            .bind(limit)
-            .fetch_all(pool)
-            .await?
-        }
-    };
-    Ok(rows)
-}
 
 /// Reading changes for one facet needs read on that facet; reading the
 /// global feed needs a wildcard capability.
@@ -564,21 +404,9 @@ async fn create_item(
         cap.require(&permission::for_facet(&req.facet, "create"))?;
     }
     guard_core_facet(&req.facet, "create")?;
-    let source = src.stamp(&cap);
-    let mut tx = st.pool.begin().await?;
-    check_against_facet(&st, &mut tx, &req.facet, &req.body).await?;
-    let item = sqlx::query_as::<_, Item>(
-        "INSERT INTO items (id, facet, body, source) VALUES ($1, $2, $3, $4)
-         RETURNING id, facet, body, revision, created_at, updated_at, source",
-    )
-    .bind(Uuid::new_v4())
-    .bind(&req.facet)
-    .bind(&req.body)
-    .bind(&source)
-    .fetch_one(&mut *tx)
-    .await?;
-    record_change(&mut tx, Some(item.id), &item.facet, "created", Some((&item.body, item.revision)), &source)
-        .await?;
+    let mut tx = Write::begin(&st.pool, src.stamp(&cap)).await?;
+    check_against_facet(&st, tx.db(), &req.facet, &req.body).await?;
+    let item = tx.create(&req.facet, &req.body).await?;
     tx.commit().await?;
     Ok((axum::http::StatusCode::CREATED, Json(item)))
 }
@@ -588,13 +416,7 @@ async fn get_item(
     cap: Capability,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Item>> {
-    let item = sqlx::query_as::<_, Item>(
-        "SELECT id, facet, body, revision, created_at, updated_at, source FROM items WHERE id = $1",
-    )
-    .bind(id)
-    .fetch_optional(&st.pool)
-    .await?
-    .ok_or(Error::NotFound)?;
+    let item = Item::load(&st.pool, id).await?;
     cap.require(&permission::for_facet(&item.facet, "read"))?;
     Ok(Json(item))
 }
@@ -639,45 +461,14 @@ async fn update_item(
     Path(id): Path<Uuid>,
     Json(req): Json<UpdateItem>,
 ) -> Result<Json<Item>> {
-    let source = src.stamp(&cap);
-    let mut tx = st.pool.begin().await?;
-    let facet: String = sqlx::query_scalar("SELECT facet FROM items WHERE id = $1 FOR UPDATE")
-        .bind(id)
-        .fetch_optional(&mut *tx)
-        .await?
-        .ok_or(Error::NotFound)?;
-    cap.require(&permission::for_facet(&facet, "update"))?;
-    guard_core_facet(&facet, "update")?;
-    check_against_facet(&st, &mut tx, &facet, &req.body).await?;
-    let item = write_revision(&mut tx, id, &facet, &req.body, req.revision, &source).await?;
+    let mut tx = Write::begin(&st.pool, src.stamp(&cap)).await?;
+    let current = tx.lock_item(id).await?;
+    cap.require(&permission::for_facet(&current.facet, "update"))?;
+    guard_core_facet(&current.facet, "update")?;
+    check_against_facet(&st, tx.db(), &current.facet, &req.body).await?;
+    let item = tx.update(id, &req.body, req.revision).await?;
     tx.commit().await?;
     Ok(Json(item))
-}
-
-/// The one way an item's body ever changes: a revision-checked UPDATE that
-/// stamps the writer's source and appends the audit row atomically.
-async fn write_revision(
-    tx: &mut Transaction<'_, Postgres>,
-    id: Uuid,
-    facet: &str,
-    body: &Value,
-    revision: i64,
-    source: &Value,
-) -> Result<Item> {
-    let item = sqlx::query_as::<_, Item>(
-        "UPDATE items SET body = $1, revision = revision + 1, updated_at = now(), source = $2
-         WHERE id = $3 AND revision = $4
-         RETURNING id, facet, body, revision, created_at, updated_at, source",
-    )
-    .bind(body)
-    .bind(source)
-    .bind(id)
-    .bind(revision)
-    .fetch_optional(&mut **tx)
-    .await?
-    .ok_or(Error::RevisionConflict)?;
-    record_change(tx, Some(id), facet, "updated", Some((&item.body, item.revision)), source).await?;
-    Ok(item)
 }
 
 #[derive(Deserialize)]
@@ -695,33 +486,11 @@ async fn delete_item(
     Path(id): Path<Uuid>,
     Query(q): Query<DeleteQuery>,
 ) -> Result<axum::http::StatusCode> {
-    let source = src.stamp(&cap);
-    let mut tx = st.pool.begin().await?;
-    let facet: String = sqlx::query_scalar("SELECT facet FROM items WHERE id = $1 FOR UPDATE")
-        .bind(id)
-        .fetch_optional(&mut *tx)
-        .await?
-        .ok_or(Error::NotFound)?;
-    cap.require(&permission::for_facet(&facet, "delete"))?;
-    guard_core_facet(&facet, "delete")?;
-    match q.revision {
-        Some(revision) => {
-            let hit = sqlx::query("DELETE FROM items WHERE id = $1 AND revision = $2")
-                .bind(id)
-                .bind(revision)
-                .execute(&mut *tx)
-                .await?;
-            if hit.rows_affected() == 0 {
-                return Err(Error::RevisionConflict);
-            }
-        }
-        None => {
-            sqlx::query("DELETE FROM items WHERE id = $1").bind(id).execute(&mut *tx).await?;
-        }
-    }
-    // Body is null: the state after a delete is absence. The prior snapshot
-    // lives one row up in the history.
-    record_change(&mut tx, Some(id), &facet, "deleted", None, &source).await?;
+    let mut tx = Write::begin(&st.pool, src.stamp(&cap)).await?;
+    let current = tx.lock_item(id).await?;
+    cap.require(&permission::for_facet(&current.facet, "delete"))?;
+    guard_core_facet(&current.facet, "delete")?;
+    tx.delete(&current, q.revision).await?;
     tx.commit().await?;
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
@@ -780,27 +549,22 @@ async fn revert_item(
     Path(id): Path<Uuid>,
     Json(req): Json<RevertRequest>,
 ) -> Result<Json<Item>> {
-    let source = src.stamp(&cap);
-    let mut tx = st.pool.begin().await?;
-    let facet: String = sqlx::query_scalar("SELECT facet FROM items WHERE id = $1 FOR UPDATE")
-        .bind(id)
-        .fetch_optional(&mut *tx)
-        .await?
-        .ok_or(Error::NotFound)?;
-    cap.require(&permission::for_facet(&facet, "update"))?;
-    guard_core_facet(&facet, "update")?;
+    let mut tx = Write::begin(&st.pool, src.stamp(&cap)).await?;
+    let current = tx.lock_item(id).await?;
+    cap.require(&permission::for_facet(&current.facet, "update"))?;
+    guard_core_facet(&current.facet, "update")?;
     let snapshot: Option<Option<Value>> =
         sqlx::query_scalar("SELECT body FROM changes WHERE seq = $1 AND item_id = $2")
             .bind(req.seq)
             .bind(id)
-            .fetch_optional(&mut *tx)
+            .fetch_optional(tx.db())
             .await?;
     let body = snapshot
         .flatten()
         .ok_or_else(|| Error::BadRequest(format!("no snapshot at seq {} for this item", req.seq)))?;
     // The facet's schema may have tightened since the snapshot was live.
-    check_against_facet(&st, &mut tx, &facet, &body).await?;
-    let item = write_revision(&mut tx, id, &facet, &body, req.revision, &source).await?;
+    check_against_facet(&st, tx.db(), &current.facet, &body).await?;
+    let item = tx.update(id, &body, req.revision).await?;
     tx.commit().await?;
     Ok(Json(item))
 }
@@ -820,7 +584,7 @@ async fn list_changes(
 ) -> Result<Json<Value>> {
     authorize_feed(&cap, q.facet.as_deref())?;
     let limit = q.limit.unwrap_or(500).clamp(1, 5000);
-    let changes = fetch_changes(&st.pool, q.since, q.facet.as_deref(), limit).await?;
+    let changes = Change::since(&st.pool, q.since, q.facet.as_deref(), limit).await?;
     let next = changes.last().map(|c| c.seq).unwrap_or(q.since);
     Ok(Json(json!({ "changes": changes, "next": next })))
 }
@@ -839,115 +603,45 @@ async fn stream_changes(
         .clone()
         .try_acquire_owned()
         .map_err(|_| Error::Unavailable)?;
-    let mut listener = PgListener::connect_with(&st.pool).await?;
+    let mut listener = PgListener::connect_with(&st.listeners).await?;
     listener.listen(NOTIFY_CHANNEL).await?;
 
-    struct Feed {
-        pool: PgPool,
-        listener: PgListener,
-        facet: Option<String>,
-        cursor: i64,
-        queue: VecDeque<Change>,
-        /// Signature verification happens at subscribe; expiry and live
-        /// registration authority are checked before every emitted event.
-        expires_at: Option<i64>,
-        capability: Capability,
-        peer: Option<String>,
-        _permit: tokio::sync::OwnedSemaphorePermit,
-    }
-    let feed = Feed {
-        pool: st.pool.clone(),
-        listener,
-        facet: q.facet,
-        cursor: q.since,
-        queue: VecDeque::new(),
-        expires_at: cap.exp,
-        capability: cap,
-        peer: src.addr,
-        _permit: permit,
-    };
-
-    let stream = futures::stream::unfold(feed, |mut s| async move {
+    let stream = async_stream::stream! {
+        let _permit = permit;
+        let mut capability = cap;
+        let mut cursor = q.since;
         loop {
-            if s.expires_at.is_some_and(|exp| chrono::Utc::now().timestamp() >= exp) {
-                return None;
+            let rows = match Change::since(&st.pool, cursor, q.facet.as_deref(), 500).await {
+                Ok(rows) => rows,
+                Err(_) => break,
+            };
+            // An idle stream must also close promptly after expiry or revocation.
+            if !feed_is_live(&st.pool, &mut capability, &src, q.facet.as_deref()).await { break; }
+            if rows.is_empty() {
+                let _ = tokio::time::timeout(Duration::from_secs(1), listener.recv()).await;
             }
-            if installation::authorize(&s.pool, &mut s.capability, s.peer.as_deref()).await.is_err()
-                || authorize_feed(&s.capability, s.facet.as_deref()).is_err()
-            {
-                return None;
-            }
-            if let Some(change) = s.queue.pop_front() {
+            for change in rows {
+                if !feed_is_live(&st.pool, &mut capability, &src, q.facet.as_deref()).await { return; }
+                cursor = change.seq;
                 let data = serde_json::to_string(&change).expect("change serializes");
-                return Some((Ok(Event::default().event("change").data(data)), s));
-            }
-            match fetch_changes(&s.pool, s.cursor, s.facet.as_deref(), 500).await {
-                Ok(rows) if rows.is_empty() => {
-                    // Idle: wake on NOTIFY, or after a beat as a self-heal.
-                    let _ = tokio::time::timeout(Duration::from_secs(1), s.listener.recv()).await;
-                }
-                Ok(rows) => {
-                    s.cursor = rows.last().map(|r| r.seq).unwrap_or(s.cursor);
-                    s.queue.extend(rows);
-                }
-                Err(_) => return None,
+                yield Ok::<_, Infallible>(Event::default().event("change").data(data));
             }
         }
-    });
+    };
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }
 
-/// The poker's endpoint. Emits a tick on the bus, then sweeps every facet
-/// that declares a lapse rule. An item lapses at most once per edit: the
-/// tick's own change row takes the append lock first, so overlapping pokes
-/// run one at a time and the second one sees the first one's rows and finds
-/// nothing to do. The core knows field *names* from facet data, never facet
-/// semantics.
+async fn feed_is_live(pool: &PgPool, cap: &mut Capability, src: &SourceParts, facet: Option<&str>) -> bool {
+    cap.exp.is_none_or(|exp| Utc::now().timestamp() < exp)
+        && installation::authorize(pool, cap, src.addr.as_deref()).await.is_ok()
+        && authorize_feed(cap, facet).is_ok()
+}
+
+/// Emit a tick and all newly lapsed item revisions in one transaction.
 async fn tick(State(st): State<AppState>, cap: Capability, src: SourceParts) -> Result<Json<Value>> {
     cap.require("meta:system:tick")?;
-    let source = src.stamp(&cap);
-    let mut tx = st.pool.begin().await?;
-    let seq = record_change(&mut tx, None, SYSTEM_FACET, "tick", None, &source).await?;
-
-    let rules: Vec<Value> =
-        sqlx::query_scalar("SELECT body FROM items WHERE facet = $1 AND jsonb_exists(body, 'lapse')")
-            .bind(FACET_FACET)
-            .fetch_all(&mut *tx)
-            .await?;
-    let mut lapsed = 0i64;
-    for rule in &rules {
-        let (Some(facet), Some(due_field)) = (rule["name"].as_str(), rule["lapse"]["due"].as_str())
-        else {
-            continue;
-        };
-        let done_field = rule["lapse"]["done"].as_str().unwrap_or("");
-        let fired: Vec<i64> = sqlx::query_scalar(
-            "INSERT INTO changes (item_id, facet, op, body, revision, source)
-             SELECT i.id, i.facet, 'lapsed', i.body, i.revision, $4 FROM items i
-             WHERE i.facet = $1
-               AND safe_ts(i.body ->> $2) <= now()
-               AND NOT coalesce((i.body ->> $3) = 'true', false)
-               AND NOT EXISTS (
-                   SELECT 1 FROM changes c
-                   WHERE c.item_id = i.id AND c.op = 'lapsed' AND c.at >= i.updated_at
-               )
-             RETURNING seq",
-        )
-        .bind(facet)
-        .bind(due_field)
-        .bind(done_field)
-        .bind(&source)
-        .fetch_all(&mut *tx)
-        .await?;
-        lapsed += fired.len() as i64;
-        if let Some(max) = fired.iter().max() {
-            sqlx::query("SELECT pg_notify($1, $2)")
-                .bind(NOTIFY_CHANNEL)
-                .bind(max.to_string())
-                .execute(&mut *tx)
-                .await?;
-        }
-    }
+    let mut tx = Write::begin(&st.pool, src.stamp(&cap)).await?;
+    let (seq, lapsed) = tx.tick().await?;
     tx.commit().await?;
     Ok(Json(json!({ "seq": seq, "lapsed": lapsed })))
 }
@@ -1028,8 +722,8 @@ struct RefreshRequest {
 ///
 /// The line still ends. A refreshed token never reaches past `max_exp`,
 /// so a leaked token buys the holder the rest of the chain and no more;
-/// after that a human mints a new one. A token with no expiry has nothing
-/// to move and is refused.
+/// after that a human mints a new one. Refreshing a token with no expiry
+/// gives it the requested bounded lifetime.
 async fn refresh_capability(
     State(st): State<AppState>,
     cap: Capability,
@@ -1078,23 +772,15 @@ pub const PAIR_TTL_SECS: i64 = 600;
 pub const PAIRED_TTL_SECS: i64 = 604_800;
 
 async fn load_pairing(pool: &PgPool, id: Uuid) -> Result<Item> {
-    sqlx::query_as::<_, Item>(
-        "SELECT id, facet, body, revision, created_at, updated_at, source FROM items
-         WHERE id = $1 AND facet = $2",
-    )
-    .bind(id)
-    .bind(PAIR_FACET)
-    .fetch_optional(pool)
-    .await?
-    .ok_or(Error::NotFound)
+    Item::load(pool, id).await?.in_facet(PAIR_FACET)
 }
 
 /// Rewrite a session, revision-checked like any other item, so two
 /// approvals racing each other cannot both win.
 async fn write_pairing(st: &AppState, item: &Item, body: Value, source: &Value) -> Result<Item> {
-    let mut tx = st.pool.begin().await?;
-    check_against_facet(st, &mut tx, PAIR_FACET, &body).await?;
-    let updated = write_revision(&mut tx, item.id, PAIR_FACET, &body, item.revision, source).await?;
+    let mut tx = Write::begin(&st.pool, source.clone()).await?;
+    check_against_facet(st, tx.db(), PAIR_FACET, &body).await?;
+    let updated = tx.update(item.id, &body, item.revision).await?;
     tx.commit().await?;
     Ok(updated)
 }
@@ -1131,24 +817,11 @@ async fn create_pairing(
     cap.require("meta:pairing:create")?;
     let ttl = body.and_then(|Json(b)| b.ttl_secs).unwrap_or(PAIR_TTL_SECS).clamp(60, 3600);
     let expires = auth::deadline_from_now(ttl)?;
-    let id = Uuid::new_v4();
-    let source = src.stamp(&cap);
     let session = json!({ "status": "pending", "expires": expires });
-
-    let mut tx = st.pool.begin().await?;
-    check_against_facet(&st, &mut tx, PAIR_FACET, &session).await?;
-    let item = sqlx::query_as::<_, Item>(
-        "INSERT INTO items (id, facet, body, source) VALUES ($1, $2, $3, $4)
-         RETURNING id, facet, body, revision, created_at, updated_at, source",
-    )
-    .bind(id)
-    .bind(PAIR_FACET)
-    .bind(&session)
-    .bind(&source)
-    .fetch_one(&mut *tx)
-    .await?;
-    record_change(&mut tx, Some(id), PAIR_FACET, "created", Some((&item.body, item.revision)), &source)
-        .await?;
+    let mut tx = Write::begin(&st.pool, src.stamp(&cap)).await?;
+    check_against_facet(&st, tx.db(), PAIR_FACET, &session).await?;
+    let item = tx.create(PAIR_FACET, &session).await?;
+    let id = item.id;
     tx.commit().await?;
 
     // The code itself: redeem, once, for this session, until it expires.
@@ -1228,11 +901,8 @@ async fn redeem_pairing(
 /// response. Only that installation can recover the issued access token.
 async fn pairing_status(State(st): State<AppState>, cap: Capability, src: SourceParts) -> Result<Json<Value>> {
     let id = code_session(&cap)?;
-    let mut tx = st.pool.begin().await?;
-    let item = sqlx::query_as::<_, Item>(
-        "SELECT id, facet, body, revision, created_at, updated_at, source FROM items
-         WHERE id = $1 AND facet = $2 FOR UPDATE",
-    ).bind(id).bind(PAIR_FACET).fetch_optional(&mut *tx).await?.ok_or(Error::NotFound)?;
+    let mut tx = Write::begin(&st.pool, src.stamp(&cap)).await?;
+    let item = tx.lock_item(id).await?.in_facet(PAIR_FACET)?;
     pairing_is_live(&item.body)?;
     let status = item.body["status"].as_str().ok_or(Error::Unauthorized)?;
     if status == "pending" {
@@ -1244,7 +914,6 @@ async fn pairing_status(State(st): State<AppState>, cap: Capability, src: Source
     if !matches!(status, "approved" | "collected") {
         return Ok(Json(json!({ "status": status, "fingerprint": item.body["fingerprint"] })));
     }
-    let source = src.stamp(&cap);
     let mut client_id = item.body["client_id"].as_str().and_then(|id| id.parse::<Uuid>().ok()).unwrap_or(id);
     if status == "approved" {
         // Serialize enrollment of one proof, including the initially empty case.
@@ -1252,11 +921,11 @@ async fn pairing_status(State(st): State<AppState>, cap: Capability, src: Source
         let identity_json = sqlx::types::Json(&identity);
         sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 7))")
             .bind(serde_json::to_string(&identity).expect("identity serializes"))
-            .execute(&mut *tx).await?;
+            .execute(tx.db()).await?;
         let current = sqlx::query_as::<_, Installation>(
             "SELECT * FROM clients WHERE identity = $1
              ORDER BY (revoked_at IS NULL) DESC, created_at DESC, id DESC LIMIT 1 FOR UPDATE",
-        ).bind(identity_json).fetch_optional(&mut *tx).await?;
+        ).bind(identity_json).fetch_optional(tx.db()).await?;
         let expected: Option<installation::Version> = serde_json::from_value(item.body["approval_anchor"].clone())
             .map_err(|_| Error::Unauthorized)?;
         if expected != current.as_ref().map(Installation::version) {
@@ -1279,16 +948,16 @@ async fn pairing_status(State(st): State<AppState>, cap: Capability, src: Source
             .bind(item.body["user"].as_str())
             .bind(item.body["access_ttl_secs"].as_i64().ok_or(Error::Unauthorized)?)
             .bind(item.body["max_exp"].as_i64())
-            .fetch_one(&mut *tx).await?;
+            .fetch_one(tx.db()).await?;
         client_id = client.id;
         let mut body = item.body.clone();
         body["status"] = json!("collected");
         body["client_id"] = json!(client_id);
-        write_revision(&mut tx, item.id, PAIR_FACET, &body, item.revision, &source).await?;
-        audit_client(&mut tx, &client, if client.id == id { "created" } else { "updated" }, &source).await?;
+        tx.update(item.id, &body, item.revision).await?;
+        tx.audit_client(&client, if client.id == id { "created" } else { "updated" }).await?;
     }
     let client = sqlx::query_as::<_, Installation>("SELECT * FROM clients WHERE id = $1")
-        .bind(client_id).fetch_one(&mut *tx).await?;
+        .bind(client_id).fetch_one(tx.db()).await?;
     let issued = client.capability(None)?;
     let token = auth::mint_capability(&st.secret, &issued)?;
     tx.commit().await?;
@@ -1408,14 +1077,6 @@ async fn deny_pairing(
 
 // ---------------------------------------------------------------- installations
 
-async fn audit_client(
-    tx: &mut Transaction<'_, Postgres>, client: &Installation, op: &str, source: &Value,
-) -> Result<()> {
-    let body = json!({ "event": "client", "client": client });
-    record_change(tx, None, SYSTEM_FACET, op, Some((&body, client.revision)), source).await?;
-    Ok(())
-}
-
 async fn list_clients(State(st): State<AppState>, cap: Capability) -> Result<Json<Value>> {
     cap.require("meta:clients:read")?;
     let clients = sqlx::query_as::<_, Installation>("SELECT * FROM clients ORDER BY created_at, id")
@@ -1442,9 +1103,9 @@ async fn update_client(
     if !permission::encloses(&cap.grants, &req.grants) {
         return Err(Error::Forbidden { permission: req.grants.join(",") });
     }
-    let mut tx = st.pool.begin().await?;
+    let mut tx = Write::begin(&st.pool, src.stamp(&cap)).await?;
     let current = sqlx::query_as::<_, Installation>("SELECT * FROM clients WHERE id = $1 FOR UPDATE")
-        .bind(id).fetch_optional(&mut *tx).await?.ok_or(Error::NotFound)?;
+        .bind(id).fetch_optional(tx.db()).await?.ok_or(Error::NotFound)?;
     current.active()?;
     if !permission::encloses(&current.requested, &req.grants) {
         return Err(Error::Forbidden { permission: req.grants.join(",") });
@@ -1452,8 +1113,8 @@ async fn update_client(
     let client = sqlx::query_as::<_, Installation>(
         "UPDATE clients SET grants = $2, revision = revision + 1 WHERE id = $1 AND revision = $3 RETURNING *",
     ).bind(id).bind(&req.grants).bind(req.revision)
-        .fetch_optional(&mut *tx).await?.ok_or(Error::RevisionConflict)?;
-    audit_client(&mut tx, &client, "updated", &src.stamp(&cap)).await?;
+        .fetch_optional(tx.db()).await?.ok_or(Error::RevisionConflict)?;
+    tx.audit_client(&client, "updated").await?;
     tx.commit().await?;
     Ok(Json(client))
 }
@@ -1462,14 +1123,14 @@ async fn revoke_client(
     State(st): State<AppState>, cap: Capability, src: SourceParts, Path(id): Path<Uuid>,
 ) -> Result<Json<Installation>> {
     cap.require("meta:clients:revoke")?;
-    let mut tx = st.pool.begin().await?;
+    let mut tx = Write::begin(&st.pool, src.stamp(&cap)).await?;
     let current = sqlx::query_as::<_, Installation>("SELECT * FROM clients WHERE id = $1 FOR UPDATE")
-        .bind(id).fetch_optional(&mut *tx).await?.ok_or(Error::NotFound)?;
+        .bind(id).fetch_optional(tx.db()).await?.ok_or(Error::NotFound)?;
     if current.revoked_at.is_some() { return Ok(Json(current)); }
     let client = sqlx::query_as::<_, Installation>(
         "UPDATE clients SET revoked_at = now(), revision = revision + 1 WHERE id = $1 RETURNING *",
-    ).bind(id).fetch_one(&mut *tx).await?;
-    audit_client(&mut tx, &client, "updated", &src.stamp(&cap)).await?;
+    ).bind(id).fetch_one(tx.db()).await?;
+    tx.audit_client(&client, "updated").await?;
     tx.commit().await?;
     Ok(Json(client))
 }
@@ -1505,16 +1166,14 @@ async fn my_permissions(cap: Capability) -> Json<Value> {
 
 async fn server_state(State(st): State<AppState>, cap: Capability) -> Result<Json<Value>> {
     cap.require("meta:server:read")?;
-    let head: Option<i64> = sqlx::query_scalar("SELECT max(seq) FROM changes").fetch_one(&st.pool).await?;
-    let facets: i64 = sqlx::query_scalar("SELECT count(*) FROM items WHERE facet = $1")
-        .bind(FACET_FACET)
-        .fetch_one(&st.pool)
-        .await?;
-    let items: i64 = sqlx::query_scalar("SELECT count(*) FROM items").fetch_one(&st.pool).await?;
-    let changes: i64 = sqlx::query_scalar("SELECT count(*) FROM changes").fetch_one(&st.pool).await?;
+    let (items, facets, changes, head): (i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM items),
+                (SELECT count(*) FROM items WHERE facet = $1),
+                count(*), coalesce(max(seq), 0) FROM changes",
+    ).bind(FACET_FACET).fetch_one(&st.pool).await?;
     Ok(Json(json!({
         "version": env!("CARGO_PKG_VERSION"),
-        "feed_head": head.unwrap_or(0),
+        "feed_head": head,
         "facets": facets,
         "items": items,
         "changes": changes,

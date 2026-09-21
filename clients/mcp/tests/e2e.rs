@@ -922,3 +922,29 @@ async fn automatic_profiles_repair_in_place_and_failed_pairing_preserves_the_sav
     other_mcp.start().await;
     assert_eq!(other_mcp.tool("my_permissions", json!({})).await["client_id"], other);
 }
+
+#[tokio::test]
+async fn bounded_search_reports_unscanned_items_and_authentication_failures() {
+    let core = real_core!();
+    let root = core.mint("*", 3600);
+    core.api(reqwest::Method::POST, "/v1/items", &root,
+        json!({"facet": "facet", "body": {"name": "searchbound", "strict": false, "schema": {}}})).await;
+    let http = reqwest::Client::new();
+    for index in 0..1001 {
+        let response = http.post(format!("{}/v1/items", core.url)).bearer_auth(&root)
+            .json(&json!({"facet": "searchbound", "body": {"index": index}}))
+            .send().await.unwrap();
+        assert_eq!(response.status(), 201);
+    }
+    let mut mcp = Mcp::spawn(&core.url, &root);
+    mcp.start().await;
+    let result = mcp.tool("search_items", json!({"facet": "searchbound", "query": "absent-marker"})).await;
+    assert_eq!(result["items"], json!([]));
+    assert_eq!(result["scanned_facets"], 1);
+    assert_eq!(result["truncated"], true, "a full scan page cannot prove there are no later matches");
+
+    let mut unauthorized = Mcp::spawn(&core.url, "invalid-token");
+    unauthorized.start().await;
+    let error = unauthorized.tool_err("search_items", json!({"facet": "searchbound", "query": "index"})).await;
+    assert!(error.contains("401"), "authentication failures must not become empty results: {error}");
+}

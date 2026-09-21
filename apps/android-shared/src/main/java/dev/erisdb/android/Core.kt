@@ -1,4 +1,4 @@
-package dev.erisdb.lists
+package dev.erisdb.android
 
 import dev.erisdb.client.ErisDB
 import kotlinx.coroutines.Dispatchers
@@ -17,8 +17,7 @@ import java.net.URLEncoder
  * `{"status": n, "body": …}`, or `{"status": 0, "error": …}` when the
  * transport never got an answer.
  *
- * The sync engine speaks only this, so it runs on the JVM against a fake
- * core with no Android and no QUIC underneath it.
+ * Pairing, synchronization, and the outbox share this request boundary.
  */
 interface CoreApi {
     suspend fun request(method: String, path: String, body: String? = null): JSONObject
