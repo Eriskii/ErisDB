@@ -135,10 +135,8 @@ sealed class Launch {
     /**
      * Dial the core already paired, then ask what this token holds.
      *
-     * A token on disk is a token the core still honours: what changed is
-     * how permissions are named, not the tokens themselves. An install
-     * that was working keeps working, and `GET /v1/permissions` fills in
-     * what it may do once it is connected.
+     * The server checks the saved credential and current permissions. A
+     * paired installation can renew expired access using its Iroh identity.
      */
     data class Resume(val server: String, val token: String) : Launch()
 

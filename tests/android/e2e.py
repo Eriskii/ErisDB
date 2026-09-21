@@ -78,7 +78,7 @@ def edit(index, value):
 
 
 def run(app):
-    package = f'dev.erisdb.{app}'  # Retains installed data across the rename.
+    package = f'dev.erisdb.{app}'
     component = f'{package}/dev.erisdb.{app}.MainActivity'
     apk = ROOT / f'apps/{app}-android/app/build/outputs/apk/debug/app-debug.apk'
     assert apk.is_file(), f'build {apk} first'

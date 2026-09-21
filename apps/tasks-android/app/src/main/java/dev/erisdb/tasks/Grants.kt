@@ -5,7 +5,7 @@ import org.json.JSONArray
 // What this app may do is decided by a person, not by this app.
 //
 // Pairing asks for a set of grants and a human answers — with all of it,
-// some of it, `*`, or no. So "what I asked for" and "what I hold" are two
+// some of it, or no. So "what I asked for" and "what I hold" are two
 // different things, and every button that writes goes through `can`.
 //
 // The grammar is docs/permissions.md's, and `covers` below is the same
@@ -25,8 +25,8 @@ import org.json.JSONArray
  * facet", it is register, change and remove *every* facet on the core —
  * a tasks app holding it could rewrite the lists app's schema. The prompt
  * would read that way too, and the honest answer to it is no. So the
- * facet is the operator's to register (`erisdb` registers one in a
- * command), this app self-registers only when an operator has already
+ * facet is the operator's to register through `POST /v1/items`. This app
+ * self-registers only when an operator has already
  * granted `*`, and a facet that is missing produces a plain "ask your
  * operator" rather than a silent failure.
  */
