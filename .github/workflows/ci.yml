@@ -103,6 +103,15 @@ jobs:
       - run: sdkmanager "platforms;android-37.0" "build-tools;36.0.0" "ndk;29.0.14206865"
       - run: rustup target add aarch64-linux-android x86_64-linux-android
       - run: cargo install cargo-ndk --locked
+      - name: Cache native Android compilation
+        uses: actions/cache@v4
+        with:
+          path: |
+            erisdb-client/target/aarch64-linux-android/release
+            erisdb-client/target/x86_64-linux-android/release
+            erisdb-client/target/release
+          key: ${{ runner.os }}-android-ndk29-${{ hashFiles('erisdb-client/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-android-ndk29-
       - name: Build both apps with their actual JNI library
         run: ANDROID_NDK_HOME="$ANDROID_SDK_ROOT/ndk/29.0.14206865" scripts/build-android.sh
       - uses: actions/upload-artifact@v4

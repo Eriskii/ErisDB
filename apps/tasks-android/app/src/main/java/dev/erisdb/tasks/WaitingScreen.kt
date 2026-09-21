@@ -44,17 +44,19 @@ fun WaitingScreen(
         verticalArrangement = Arrangement.spacedBy(16.dp),
     ) {
         when (state) {
-            is Approval.Approved, is Approval.Waiting, is Approval.Unreachable -> {
+            is Approval.Pending, is Approval.Approved, is Approval.Waiting, is Approval.Unreachable -> {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     CircularProgressIndicator(Modifier.size(22.dp), strokeWidth = 2.dp)
                     Text(
-                        "Waiting for approval on $there…",
+                        if (state is Approval.Pending) "Requesting access to $there…"
+                        else "Waiting for approval on $there…",
                         style = MaterialTheme.typography.titleMedium,
                         modifier = Modifier.padding(start = 14.dp),
                     )
                 }
                 Text(
-                    "This app has asked $there for permission. Approve it there — in " +
+                    if (state is Approval.Pending) "Connecting to send this app’s permission request."
+                    else "This app has asked $there for permission. Approve it there — in " +
                         "the erisdb pair terminal, or any app that can approve pairings.",
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,

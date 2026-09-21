@@ -189,7 +189,7 @@ fun TasksApp(pairUri: String? = null, onPairHandled: () -> Unit = {}) {
     /** Redeem a ticket's code and go and wait for a person. */
     fun beginPairing(ticket: Ticket) {
         connected = false
-        approval = Approval.Waiting()
+        approval = Approval.Pending
         redeeming = ticket
         screen = Screen.Waiting
     }
@@ -344,7 +344,8 @@ fun TasksApp(pairUri: String? = null, onPairHandled: () -> Unit = {}) {
         while (pollingOn(approval)) {
             delay(PAIR_POLL_MS)
             approval = withContext(Dispatchers.IO) {
-                collect(ErisDBApi) { fresh -> moved = keep(ticket.eid!!, fresh, ticket.name) }
+                if (approval is Approval.Pending) requestPairing(ErisDBApi, CLIENT, MANIFEST)
+                else collect(ErisDBApi) { fresh -> moved = keep(ticket.eid!!, fresh, ticket.name) }
             }
         }
         if (approval is Approval.Approved) {

@@ -271,7 +271,11 @@ impl Client {
             }
             *slot = None;
         }
-        let conn = self.endpoint.connect(self.server.clone(), ALPN).await?;
+        // Discovery or a dead network must not hold a blocking/JNI caller
+        // forever. No application bytes have been sent at this boundary.
+        let conn = tokio::time::timeout(Duration::from_secs(30),
+            self.endpoint.connect(self.server.clone(), ALPN))
+            .await.context("connecting to the core timed out")??;
         *slot = Some(conn.clone());
         Ok(conn)
     }

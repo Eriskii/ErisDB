@@ -90,7 +90,17 @@ def run(app):
         session = api('POST', '/v1/pairings', {})
         payload = {'v': 1, 'name': 'Android E2E', 'eid': EID, 'token': session['secret']}
         ticket = 'bezel://pair/' + base64.urlsafe_b64encode(json.dumps(payload).encode()).decode().rstrip('=')
+        if app == 'lists':
+            # Actual loss of device connectivity, not an intercepted API reply.
+            adb('shell', 'svc', 'wifi', 'disable')
+            adb('shell', 'svc', 'data', 'disable')
         adb('shell', 'am', 'start', '-W', '-a', 'android.intent.action.VIEW', '-d', ticket, '-n', component)
+        if app == 'lists':
+            try:
+                eventually(lambda: has_text("can't reach"), seconds=75)
+            finally:
+                adb('shell', 'svc', 'wifi', 'enable')
+                adb('shell', 'svc', 'data', 'enable')
         path = f"/v1/pairings/{session['id']}"
         pending = eventually(lambda: (v if (v := api('GET', path))['body']['status'] == 'requested' else None))
         eventually(lambda: has_text(pending['body']['fingerprint']))

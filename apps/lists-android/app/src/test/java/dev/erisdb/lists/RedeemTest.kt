@@ -55,6 +55,11 @@ class RedeemTest {
     fun anUnreachableCoreIsWorthAnotherTryRatherThanAnEnding() = runTest {
         val core = core().apply { offline = true }
         assertTrue(requestPairing(core, CLIENT, MANIFEST) is Approval.Unreachable)
+        core.offline = false
+        val resumed = collect(core) { fail("nothing was approved") }
+        assertEquals(Approval.Pending, resumed)
+        assertTrue(pollingOn(resumed))
+        assertEquals(Approval.Waiting(), requestPairing(core, CLIENT, MANIFEST))
     }
 
     @Test
@@ -130,8 +135,7 @@ class RedeemTest {
         core.offline = true
         val out = collect(core) { fail("nothing arrived") }
         assertTrue(out is Approval.Unreachable)
-        // Unreachable and Waiting are the two states the poll loop keeps
-        // going through; the rest are endings.
+        // Transport failure and awaiting approval both keep polling.
         assertTrue(pollingOn(out))
         assertTrue(pollingOn(Approval.Waiting()))
         assertFalse(pollingOn(Approval.Denied))

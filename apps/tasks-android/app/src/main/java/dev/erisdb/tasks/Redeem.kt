@@ -22,6 +22,9 @@ const val PAIR_POLL_MS = 1500L
 
 /** Where a pairing session stands, as this app sees it. */
 sealed class Approval {
+    /** The core confirms no request was submitted; redeeming can safely resume. */
+    data object Pending : Approval()
+
     /** Redeemed. Somebody has to press a key on another machine. */
     data class Waiting(val fingerprint: String? = null) : Approval()
 
@@ -43,7 +46,7 @@ sealed class Approval {
 
 /** True while the conversation is still worth another poll. */
 fun pollingOn(state: Approval): Boolean =
-    state is Approval.Waiting || state is Approval.Unreachable
+    state is Approval.Pending || state is Approval.Waiting || state is Approval.Unreachable
 
 /**
  * Redeem a code: say who this app is and what it wants. The core raises
@@ -91,7 +94,8 @@ suspend fun collect(api: CoreApi, keep: (String) -> Unit): Approval {
     } ?: emptyList()
 
     return when (body.optString("status")) {
-        "pending", "requested" -> Approval.Waiting(body.optString("fingerprint").takeIf { it.isNotEmpty() })
+        "pending" -> Approval.Pending
+        "requested" -> Approval.Waiting(body.optString("fingerprint").takeIf { it.isNotEmpty() })
         "denied" -> Approval.Denied
         // Spent. The core mints the token once, at collection, and marks
         // the session collected in the same revision-checked write — so a
