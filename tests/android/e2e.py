@@ -82,7 +82,8 @@ def run(app):
     component = f'{package}/dev.erisdb.{app}.MainActivity'
     apk = ROOT / f'apps/{app}-android/app/build/outputs/apk/debug/app-debug.apk'
     assert apk.is_file(), f'build {apk} first'
-    assert not adb('shell', 'pm', 'path', package), 'use an isolated emulator; existing app data must be preserved'
+    installed = adb('shell', 'pm', 'list', 'packages', package).splitlines()
+    assert f'package:{package}' not in installed, 'use an isolated emulator; existing app data must be preserved'
     adb('install', '-g', str(apk))
     try:
         api('POST', '/v1/items', {'facet': 'facet', 'body': {'name': app, 'strict': False, 'schema': {'type': 'object'}}})
