@@ -591,8 +591,12 @@ fn token_from_env() -> anyhow::Result<String> {
 #[derive(Parser)]
 #[command(version, about = "ErisDB MCP bridge; pair once, renew until revoked")]
 struct Args {
-    #[arg(long, env = "ERISDB_SESSION_FILE")]
+    /// Advanced override for where this installation remembers its pairing.
+    #[arg(long, env = "ERISDB_SESSION_FILE", global = true)]
     session_file: Option<PathBuf>,
+    /// Remembered installation (default: default). Separate applications can use separate profiles.
+    #[arg(long, env = "ERISDB_PROFILE", global = true)]
+    profile: Option<String>,
     #[command(subcommand)]
     command: Option<Action>,
 }
@@ -602,9 +606,8 @@ enum Action {
     /// Pair this connection interactively, using a pasted ticket.
     Pair {
         ticket: String,
-        #[arg(long)] session_file: PathBuf,
         #[arg(long, env = "ERISDB_URL")] url: Option<String>,
-        #[arg(long, default_value = "erisdb-mcp")] name: String,
+        #[arg(long)] name: Option<String>,
         #[arg(long = "grant", value_delimiter = ',', required = true)] grants: Vec<String>,
     },
 }
@@ -612,10 +615,16 @@ enum Action {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
-    if let Some(Action::Pair { ticket, session_file, url, name, grants }) = args.command {
-        return session::pair(&ticket, url.as_deref(), &session_file, &name, &grants).await;
+    let profile = args.profile.as_deref().unwrap_or("default");
+    if let Some(Action::Pair { ticket, url, name, grants }) = args.command {
+        let path = session::path(args.session_file, profile)?;
+        let name = name.unwrap_or_else(|| format!("erisdb-mcp ({profile})"));
+        return session::pair(&ticket, url.as_deref(), &path, &name, &grants).await;
     }
-    let bridge = if let Some(path) = args.session_file {
+    let manual = args.session_file.is_none() && args.profile.is_none() &&
+        (std::env::var_os("ERISDB_TOKEN_FILE").is_some() || std::env::var_os("ERISDB_TOKEN").is_some());
+    let bridge = if !manual {
+        let path = session::path(args.session_file, profile)?;
         let session = session::Session::read(&path)?;
         let mut bridge = ErisDBMcp::new(session.url.clone(), session.token.clone(), Policy::from_env());
         bridge.session = Some(Arc::new(session));

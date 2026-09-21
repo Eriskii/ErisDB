@@ -16,23 +16,35 @@ making the dangerous field required.
 ## Pair a connection
 
 ```sh
-erisdb-mcp pair 'bezel://pair/…' --session-file ./tasks-session.json \
+erisdb-mcp pair 'bezel://pair/…' \
   --grant tasks:read,tasks:create,meta:facets:read
 # Compare the fingerprint and approve on the core's terminal.
-erisdb-mcp --session-file ./tasks-session.json
+erisdb-mcp
 ```
 
-Use a separate private session file per configured connection. The file is created
-with mode 0600, must not already exist, and is never returned through an MCP tool.
-`ERISDB_SESSION_FILE` is the environment equivalent. An HTTPS URL is required
+The connector remembers its pairing automatically in your user configuration
+directory. Restarting it requires no token, URL or file-path setup. To give two
+applications independent permissions and revocation, use `--profile coding` and
+`--profile chat` respectively, both when pairing and in each application's MCP
+launch command. Without that option, the `default` profile is used.
+
+Pairing the same profile with the same core again updates its existing registration.
+Its credential is replaced atomically only after approval; denial or cancellation
+preserves the old saved login. A profile cannot silently switch to a different core.
+
+On Linux, storage is `$XDG_CONFIG_HOME/erisdb/mcp/PROFILE.json`, defaulting to
+`~/.config/erisdb/mcp/PROFILE.json`; other systems use their user configuration
+directory. Credential files have Unix mode 0600 and are never returned through
+MCP tools. `--session-file PATH` / `ERISDB_SESSION_FILE` remains an advanced storage
+override. `--profile NAME` also accepts `ERISDB_PROFILE`. An HTTPS URL is required
 remotely; localhost HTTP is accepted. An Iroh-only ticket needs `--url` naming its
 HTTPS endpoint because this bridge speaks HTTP.
 
 Access renews after expiry, including after process restart, using the installation
 secret in that file. Revocation is checked by the core on each call. Only an explicit
 401 triggers renewal and one retry; ambiguous transport failures never repeat a
-write. A failed/interrupted pairing requires a fresh ticket; if the process was
-killed before cleanup, remove its empty session file before retrying.
+write. A failed/interrupted pairing requires a fresh ticket, with no manual file
+cleanup needed. An existing saved login remains usable with its current permissions.
 
 Existing `ERISDB_URL` plus `ERISDB_TOKEN_FILE`/`ERISDB_TOKEN` configuration still
 works with manual tokens and their original lifetime. For individually revocable,
@@ -155,7 +167,9 @@ to read and write your data.
 ### Environment
 
 ```
-ERISDB_URL                 the core's base URL. Required.
+ERISDB_PROFILE             remembered installation profile. Default: default.
+ERISDB_SESSION_FILE        advanced override for the saved pairing location.
+ERISDB_URL                 the core's base URL for manual-token configuration.
 ERISDB_TOKEN_FILE          path to a file holding the capability. Preferred.
 ERISDB_TOKEN               the capability itself. Used when no file is named.
 ERISDB_MCP_ALLOW_MINT      "1" enables mint_capability. Off by default.
@@ -233,9 +247,7 @@ tests that need a core find one in this order:
    checkout, as `ErisDB/erisdb-mcp`, next to `erisdb/`.
 3. `erisdb` on `PATH`.
 
-With none of those, those tests print what they need and stop; the rest —
-handshake, toolbox, input schemas, and every guard that refuses before it
-reaches the network — run anyway.
+Missing prerequisites fail the suite; real-core tests are never silently skipped.
 
 ## License
 

@@ -13,9 +13,9 @@ const ErisDBAuth = (() => {
     return url.href.replace(/\/$/, "");
   }
 
-  async function identity() {
+  async function identity(previousSecret) {
     if (!globalThis.crypto?.subtle) throw new Error("Open this app over HTTPS or on localhost to pair securely.");
-    const secret = b64(crypto.getRandomValues(new Uint8Array(32)));
+    const secret = previousSecret ?? b64(crypto.getRandomValues(new Uint8Array(32)));
     const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(secret));
     return { secret, challenge: b64(new Uint8Array(digest)) };
   }

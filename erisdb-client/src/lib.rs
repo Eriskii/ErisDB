@@ -322,9 +322,8 @@ impl Client {
     /// Persistence is the caller's job: the client holds the fresh token
     /// only for its own lifetime, so a device that wants to survive a
     /// restart writes the returned string to its own storage. Refresh
-    /// moves time, not privilege — the grants and the signed user carry
-    /// over untouched — and an expired token cannot refresh, so a
-    /// long-sleeping device refreshes on wake before its expiry passes.
+    /// uses the registration's current grants for paired installations,
+    /// even after access expiry. Manual tokens retain their bounded chain.
     pub async fn refresh_capability(&self, ttl_secs: i64) -> Result<String> {
         let _renewal = self.renewal.lock().await;
         self.renew_access(Some(ttl_secs)).await

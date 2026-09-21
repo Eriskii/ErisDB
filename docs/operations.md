@@ -252,7 +252,8 @@ iroh, which needs no open port at all.
 `--no-iroh` skips the endpoint entirely, for a deployment that only ever
 serves loopback and a proxy.
 
-`GET /v1/health` is the only unauthenticated route. It answers from the
+`GET /v1/health` needs no credential. Registered renewal authenticates an
+installation proof; other API routes require a bearer capability. Health answers from the
 process without touching the store, so it is liveness, not readiness — a
 core with a dead database still answers `{"ok": true}`.
 
@@ -275,12 +276,11 @@ Bounds the core enforces, and what hitting one looks like:
 | Plugin invocation timeout | 1 hour maximum; 10 minutes in the OpenAI manifest | Before response: **502** `plugin_failed`; during response: the stream ends with an error and the child is killed. |
 | Store pool | 16 connections | Requests queue. |
 
-The rate-limit key is the observed address: `iroh:<endpoint id>` over
-QUIC, `ip:port` over TCP. Over iroh that is a cryptographic identity and
-the bucket means what it says. Over TCP the key includes the source port,
-so it is per-connection: a caller opening a fresh connection per request
-gets a fresh bucket every time and the limit is close to meaningless
-there — one more reason that listener belongs on loopback.
+The rate-limit key is the authenticated `iroh:<endpoint id>` over QUIC and
+the actual peer IP over TCP. Opening new TCP connections does not reset a bucket.
+Clients behind the same local TLS proxy share its bucket; forwarded headers do
+not override the observed peer. Buckets are per replica and cover minting,
+legacy refresh and registered renewal.
 
 ## Watching it
 

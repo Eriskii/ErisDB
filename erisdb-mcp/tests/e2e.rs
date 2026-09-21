@@ -179,6 +179,9 @@ impl Mcp {
     /// which credential channel it reads, and which tools are switched on.
     fn spawn_with(url: &str, env: &[(&str, &str)]) -> Self {
         let mut command = Command::new(env!("CARGO_BIN_EXE_erisdb-mcp"));
+        for key in ["ERISDB_TOKEN", "ERISDB_TOKEN_FILE", "ERISDB_SESSION_FILE", "ERISDB_PROFILE"] {
+            command.env_remove(key);
+        }
         command.env("ERISDB_URL", url);
         for (key, value) in env {
             command.env(key, value);
@@ -819,7 +822,8 @@ async fn paired_mcp_renews_after_restart_and_stops_when_revoked() {
     let (id, code) = core.cut_a_pairing(&admin).await;
     let ticket = format!("bezel://pair/{}", URL_SAFE_NO_PAD.encode(
         serde_json::to_vec(&json!({"v": 1, "url": core.url, "token": code})).unwrap()));
-    let path = std::env::temp_dir().join(format!("erisdb-mcp-{id}.json"));
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("session.json");
     let mut child = Command::new(env!("CARGO_BIN_EXE_erisdb-mcp"))
         .args(["pair", &ticket, "--session-file"]).arg(&path)
         .args(["--grant", "tasks:read", "--name", "real MCP installation"])
@@ -854,4 +858,67 @@ async fn paired_mcp_renews_after_restart_and_stops_when_revoked() {
     mcp.start().await;
     assert!(mcp.tool_err("my_permissions", json!({})).await.contains("401"));
     std::fs::remove_file(path).unwrap();
+}
+
+/// Drive the real pairing subprocess up to the human comparison step.
+#[cfg(target_os = "linux")]
+async fn request_mcp_pair(core: &Core, admin: &str, config: &str, profile: Option<&str>) -> (String, Child) {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    let (id, code) = core.cut_a_pairing(admin).await;
+    let ticket = format!("bezel://pair/{}", URL_SAFE_NO_PAD.encode(
+        serde_json::to_vec(&json!({"v":1, "url":core.url, "token":code})).unwrap()));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_erisdb-mcp"));
+    command.args(["pair", &ticket, "--grant", "tasks:read,tasks:create"])
+        .env("XDG_CONFIG_HOME", config).env_remove("ERISDB_SESSION_FILE").env_remove("ERISDB_PROFILE");
+    if let Some(profile) = profile { command.args(["--profile", profile]); }
+    let mut child = command.stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true).spawn().unwrap();
+    let mut stderr = BufReader::new(child.stderr.take().unwrap()).lines();
+    let line = tokio::time::timeout(Duration::from_secs(10), stderr.next_line()).await.unwrap().unwrap().unwrap();
+    let pending = core.api(reqwest::Method::GET, &format!("/v1/pairings/{id}"), admin, Value::Null).await;
+    assert!(line.contains(pending["body"]["fingerprint"].as_str().unwrap()), "{line}");
+    child.stderr = Some(stderr.into_inner().into_inner());
+    (id, child)
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn automatic_profiles_repair_in_place_and_failed_pairing_preserves_the_saved_login() {
+    let core = real_core!();
+    let admin = core.mint("*", 3600);
+    let directory = tempfile::tempdir().unwrap();
+    let config = directory.path().to_str().unwrap();
+    let path = directory.path().join("erisdb/mcp/default.json");
+    let (id, child) = request_mcp_pair(&core, &admin, config, None).await;
+    core.api(reqwest::Method::POST, &format!("/v1/pairings/{id}/approve"), &admin, json!({})).await;
+    assert!(child.wait_with_output().await.unwrap().status.success());
+    let original = std::fs::read(&path).unwrap();
+    let saved: Value = serde_json::from_slice(&original).unwrap();
+    let (denied_id, child) = request_mcp_pair(&core, &admin, config, None).await;
+    core.api(reqwest::Method::POST, &format!("/v1/pairings/{denied_id}/deny"), &admin, json!({})).await;
+    assert!(!child.wait_with_output().await.unwrap().status.success());
+    assert_eq!(std::fs::read(&path).unwrap(), original);
+
+    let (again, child) = request_mcp_pair(&core, &admin, config, None).await;
+    core.api(reqwest::Method::POST, &format!("/v1/pairings/{again}/approve"), &admin,
+        json!({"granted":["tasks:read"]})).await;
+    assert!(child.wait_with_output().await.unwrap().status.success());
+    let renewed: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(renewed["client_id"], id);
+    assert_eq!(renewed["refresh_secret"], saved["refresh_secret"]);
+    let mut mcp = Mcp::spawn_with(&core.url, &[("XDG_CONFIG_HOME", config)]);
+    mcp.start().await;
+    assert_eq!(mcp.tool("my_permissions", json!({})).await["grants"], json!(["tasks:read"]));
+    assert_eq!(core.api(reqwest::Method::GET, "/v1/clients", &admin, Value::Null).await["clients"].as_array().unwrap().len(), 1);
+
+    let (other, child) = request_mcp_pair(&core, &admin, config, Some("other-app")).await;
+    core.api(reqwest::Method::POST, &format!("/v1/pairings/{other}/approve"), &admin, json!({})).await;
+    assert!(child.wait_with_output().await.unwrap().status.success());
+    let other_saved: Value = serde_json::from_slice(&std::fs::read(directory.path().join("erisdb/mcp/other-app.json")).unwrap()).unwrap();
+    assert_ne!(other_saved["refresh_secret"], saved["refresh_secret"]);
+    core.api(reqwest::Method::POST, &format!("/v1/clients/{id}/revoke"), &admin, json!({})).await;
+    assert!(mcp.tool_err("my_permissions", json!({})).await.contains("401"));
+    // An explicit profile must win over stale manual-token environment settings.
+    let mut other_mcp = Mcp::spawn_with(&core.url, &[("XDG_CONFIG_HOME", config), ("ERISDB_PROFILE", "other-app"), ("ERISDB_TOKEN", &admin)]);
+    other_mcp.start().await;
+    assert_eq!(other_mcp.tool("my_permissions", json!({})).await["client_id"], other);
 }

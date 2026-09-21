@@ -2228,3 +2228,93 @@ async fn upgrading_legacy_pairings_preserves_data_and_audits_invalidation() {
     assert_eq!(admin.get(&format!("/v1/items/{data_id}")).await.1["body"]["title"],"existing data");
     assert_eq!(admin.get("/v1/clients").await.1["clients"],json!([]));
 }
+
+async fn approve_reenrollment(operator: &Client, installation: &Client, granted: &[&str]) -> Client {
+    let (status, cut) = operator.post("/v1/pairings", json!({})).await;
+    assert_eq!(status, 201, "{cut}");
+    let mut pairing = Client::new(&operator.base, cut["secret"].as_str().unwrap());
+    pairing.proof = installation.proof.clone();
+    assert_eq!(pairing.post("/v1/pair/redeem", json!({"client":"Same installation", "requested":granted})).await.0, 200);
+    let id = cut["id"].as_str().unwrap();
+    assert_eq!(operator.post(&format!("/v1/pairings/{id}/approve"), json!({})).await.0, 200);
+    pairing
+}
+
+#[tokio::test]
+async fn reenrollment_updates_one_installation_and_stale_approval_cannot_undo_revocation() {
+    let (base, root, _) = setup().await;
+    let admin = Client::new(&base, &root);
+    let (app, id) = register_browser(&admin, &["tasks:read", "tasks:create"], 60).await;
+    let pairing = approve_reenrollment(&admin, &app, &["tasks:read"]).await;
+    let (status, collected) = pairing.get("/v1/pair/status").await;
+    assert_eq!(status, 200, "{collected}");
+    assert_eq!(collected["client_id"], id);
+    assert_eq!(pairing.get("/v1/pair/status").await.1["client_id"], id, "lost response recovery uses the same registration");
+    assert_eq!(admin.get("/v1/clients").await.1["clients"].as_array().unwrap().len(), 1);
+    assert_eq!(app.get("/v1/permissions").await.1["grants"], json!(["tasks:read"]));
+    let stale = approve_reenrollment(&admin, &app, &["tasks:read", "tasks:create"]).await;
+    assert_eq!(admin.post(&format!("/v1/clients/{id}/revoke"), json!({})).await.0, 200);
+    assert_eq!(stale.get("/v1/pair/status").await.0, 409, "earlier approval cannot resurrect a revoked installation");
+    assert_eq!(app.get("/v1/permissions").await.0, 401);
+    let fresh = approve_reenrollment(&admin, &app, &["tasks:read"]).await;
+    let (status, collected) = fresh.get("/v1/pair/status").await;
+    assert_eq!(status, 200, "{collected}");
+    assert_ne!(collected["client_id"], id, "fresh approval never revives old revoked tokens");
+    assert_eq!(app.get("/v1/permissions").await.0, 401);
+}
+
+#[tokio::test]
+async fn two_approved_pairings_cannot_create_two_active_registrations_for_one_proof() {
+    let (base, root, _) = setup().await;
+    let admin = Client::new(&base, &root);
+    let app = Client::new(&base, "unused");
+    let first = approve_reenrollment(&admin, &app, &["tasks:read"]).await;
+    let second = approve_reenrollment(&admin, &app, &["tasks:read"]).await;
+    let (a,b) = tokio::join!(first.get("/v1/pair/status"), second.get("/v1/pair/status"));
+    let mut statuses = [a.0,b.0]; statuses.sort();
+    assert_eq!(statuses, [200,409]);
+    assert_eq!(admin.get("/v1/clients").await.1["clients"].as_array().unwrap().len(),1);
+}
+
+#[tokio::test]
+async fn upgrading_duplicate_installations_retires_old_tokens_and_audits_every_change() {
+    let previous = sqlx::migrate::Migrator::with_migrations(
+        erisdb::MIGRATOR.iter().filter(|m| m.version < 7).cloned().collect());
+    let pool = fresh_pool_with(&previous).await;
+    let old = uuid::Uuid::new_v4();
+    let newest = uuid::Uuid::new_v4();
+    for (id, age) in [(old, 2i32), (newest, 1i32)] {
+        sqlx::query("INSERT INTO clients (id, name, identity, requested, grants, access_ttl_secs, created_at)
+            VALUES ($1, 'legacy duplicate', $2, ARRAY['tasks:read'], ARRAY['tasks:read'], 60,
+                now() - $3 * interval '1 day')")
+            .bind(id).bind(json!({"kind":"browser","key":"A".repeat(43)})).bind(age)
+            .execute(&pool).await.unwrap();
+    }
+    let pairing = uuid::Uuid::new_v4();
+    sqlx::query("INSERT INTO items (id, facet, body) VALUES ($1, 'pair', $2)")
+        .bind(pairing).bind(json!({"status":"approved","identity":{"kind":"browser","key":"A".repeat(43)}}))
+        .execute(&pool).await.unwrap();
+    erisdb::MIGRATOR.run(&pool).await.unwrap();
+    let retired = erisdb::installation::load(&pool, old).await.unwrap();
+    assert!(retired.revoked_at.is_some());
+    assert_eq!(retired.revision, 2);
+    assert!(erisdb::installation::load(&pool, newest).await.unwrap().revoked_at.is_none());
+    let audits: Vec<Value> = sqlx::query_scalar("SELECT body FROM changes
+        WHERE source->>'migration' = '0007_one_active_registration' AND facet = 'system'")
+        .fetch_all(&pool).await.unwrap();
+    assert_eq!(audits.len(), 1);
+    assert_eq!(audits[0]["client"]["id"], old.to_string());
+    let base = spawn_core(pool).await;
+    let root = erisdb::auth::mint(SECRET, &["*"], Some(60), None).unwrap();
+    let admin = Client::new(&base, &root);
+    let denied = admin.get(&format!("/v1/pairings/{pairing}")).await.1;
+    assert_eq!(denied["body"]["status"], "denied");
+    assert_eq!(denied["revision"], 2);
+    assert!(admin.get(&format!("/v1/items/{pairing}/history")).await.1.to_string().contains("0007_one_active_registration"));
+    for (id, status) in [(old, 401), (newest, 200)] {
+        let mut cap = erisdb::auth::verify(SECRET, &root).unwrap();
+        cap.client = Some(id);
+        let token = erisdb::auth::mint_capability(SECRET, &cap).unwrap();
+        assert_eq!(Client::new(&base, &token).get("/v1/permissions").await.0, status);
+    }
+}

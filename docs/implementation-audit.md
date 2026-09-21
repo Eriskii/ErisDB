@@ -64,6 +64,8 @@ actual device end-to-end coverage.
   renewal secret whose S256 commitment is all the server stores.
 - Comparison fingerprints on terminal, browser and Android approval screens.
 - Proof-bound, repeatable collection with one transactional registration.
+- Re-pairing updates the existing installation; stale approvals cannot undo
+  permission changes or revocation, and concurrent enrollment cannot duplicate it.
 - Renewal independent of access-token expiry, continuing until revocation.
 - Postgres-backed permission changes and revocation, including delegated tokens
   and idle subscriptions across replicas; registry changes are audited.
@@ -72,8 +74,9 @@ actual device end-to-end coverage.
 - Terminal cancellation/expiry handling and immediate `--qr-output` export.
 - Browser HTTPS enforcement, redirect refusal, pending-pair reload recovery,
   current permission UI, and shared enrollment/renewal code with checked CSP hashes.
-- MCP terminal pairing, private per-connection credential files and automatic
-  renewal on an explicit authorization failure.
+- MCP terminal pairing, automatically saved credentials, optional independent
+  profiles, and renewal on an explicit authorization failure. Re-pairing preserves
+  the existing identity and replaces its saved credential atomically.
 - Android comparison codes, live permission/revocation UI, and rebuilt ARM64
   and x86_64 JNI libraries under the new name.
 
@@ -84,7 +87,7 @@ for individual revocation. No mDNS or short-code service was added.
 ## Verification of the implementation
 
 Locally passed: Clippy with warnings denied on all three Rust components;
-162 Rust tests (including real Postgres, TCP, Iroh, terminal/PNG decoder and MCP
+166 Rust tests (including real Postgres, TCP, Iroh, terminal/PNG decoder and MCP
 subprocess flows); all three Chromium E2E scenarios against a real core and
 Postgres; 209 Android unit tests and both APK builds with real ARM64/x86_64 JNI.
 
@@ -93,7 +96,10 @@ only the photographed ticket received the approved credential. It now receives
 401. Additional integration cases cover post-expiry renewal, foreign Iroh keys,
 concurrent collection, grant intersection/ceilings, stale revisions, renewal-proof
 secrecy, delegated revocation, closing idle subscriptions across replicas, and
-upgrading a real pre-registry database without losing data or audit history.
+upgrading real pre-registry and duplicate-registration databases without losing
+data or audit history. Real MCP processes also prove that default storage works,
+re-pairing preserves identity, denial preserves the saved login, and revoking one
+profile does not affect another.
 
 `tests/android/e2e.py` drives actual APK screens through ADB, then validates writes
 and installation identity in the actual core. It exercises deep-link pairing,

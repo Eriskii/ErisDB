@@ -18,7 +18,7 @@ ROOT = Path(__file__).resolve().parents[2]
 CORE = 'http://127.0.0.1:18771'
 SECRET = 'erisdb-browser-e2e-only'
 ADB = os.environ.get('ADB', 'adb')
-BIN = ROOT / 'erisdb/target/debug/erisdb'
+BIN = Path(os.environ.get('ERISDB_BIN', ROOT / 'erisdb/target/debug/erisdb'))
 ADMIN = subprocess.check_output([BIN, 'mint', '--grant', '*', '--ttl', '3600', '--secret', SECRET], text=True).strip()
 EID = subprocess.check_output([BIN, 'endpoint-id', '--secret', SECRET], text=True).strip()
 
@@ -117,11 +117,37 @@ def run(app):
         api('PUT', f"/v1/items/{item['id']}", {'body': body, 'revision': item['revision']})
         adb('shell', 'am', 'start', '-W', '-n', component)
         eventually(lambda: has_text(changed))  # Cannot come from the cached snapshot.
+        # Re-pair this actual app installation. Wait beyond a normal background
+        # sync interval before approval so pairing and sync share a real runtime.
+        again = api('POST', '/v1/pairings', {})
+        payload['token'] = again['secret']
+        next_ticket = 'bezel://pair/' + base64.urlsafe_b64encode(json.dumps(payload).encode()).decode().rstrip('=')
+        adb('shell', 'am', 'start', '-W', '-a', 'android.intent.action.VIEW', '-d', next_ticket, '-n', component)
+        button('Pair again')
+        next_path = f"/v1/pairings/{again['id']}"
+        pending = eventually(lambda: (v if (v := api('GET', next_path))['body']['status'] == 'requested' else None))
+        eventually(lambda: has_text(pending['body']['fingerprint']))
+        time.sleep(11)
+        assert api('GET', next_path)['body']['status'] == 'requested'
+        api('POST', next_path + '/approve', {'granted': [f'{app}:read', f'{app}:create'], 'ttl_secs': 5})
+        collected = eventually(lambda: (v if (v := api('GET', next_path))['body']['status'] == 'collected' else None))
+        assert collected['body']['client_id'] == session['id']
+        current = api('GET', f"/v1/clients/{session['id']}")
+        assert current['identity'] == client['identity']
+        client = current
+        eventually(lambda: has_text(changed))
         api('PUT', f"/v1/clients/{session['id']}", {'grants': [f'{app}:read'], 'revision': client['revision']})
         eventually(lambda: find_button('add task' if app == 'tasks' else 'add entry') is None)
         api('POST', f"/v1/clients/{session['id']}/revoke", {})
         eventually(lambda: has_text('revoked'))
-        print(f'{app}: real deep-link pairing, fingerprint, UI write, restart renewal, permissions, revocation passed', flush=True)
+        print(f'{app}: real deep-link pairing, fingerprint, UI write, restart renewal, re-pairing, permissions, revocation passed', flush=True)
+    except Exception:
+        Path('/tmp/erisdb-android-logcat.txt').write_text(adb('logcat', '-d'))
+        try:
+            Path('/tmp/erisdb-android-screen.xml').write_text(ET.tostring(screen(), encoding='unicode'))
+        except Exception:
+            pass
+        raise
     finally:
         adb('uninstall', package)
 

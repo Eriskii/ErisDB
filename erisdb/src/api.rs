@@ -1235,27 +1235,50 @@ async fn pairing_status(State(st): State<AppState>, cap: Capability, src: Source
         return Ok(Json(json!({ "status": status, "fingerprint": item.body["fingerprint"] })));
     }
     let source = src.stamp(&cap);
+    let mut client_id = item.body["client_id"].as_str().and_then(|id| id.parse::<Uuid>().ok()).unwrap_or(id);
     if status == "approved" {
+        // Serialize enrollment of one proof, including the initially empty case.
+        // Existing row locks also serialize collection against permission/revoke writes.
+        let identity_json = sqlx::types::Json(&identity);
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 7))")
+            .bind(serde_json::to_string(&identity).expect("identity serializes"))
+            .execute(&mut *tx).await?;
+        let current = sqlx::query_as::<_, Installation>(
+            "SELECT * FROM clients WHERE identity = $1
+             ORDER BY (revoked_at IS NULL) DESC, created_at DESC, id DESC LIMIT 1 FOR UPDATE",
+        ).bind(identity_json).fetch_optional(&mut *tx).await?;
+        let expected: Option<installation::Version> = serde_json::from_value(item.body["approval_anchor"].clone())
+            .map_err(|_| Error::Unauthorized)?;
+        if expected != current.as_ref().map(Installation::version) {
+            return Err(Error::RevisionConflict);
+        }
         let requested: Vec<String> = serde_json::from_value(item.body["requested"].clone())
             .map_err(|_| Error::Unauthorized)?;
         let grants: Vec<String> = serde_json::from_value(item.body["granted"].clone())
             .map_err(|_| Error::Unauthorized)?;
         let client = sqlx::query_as::<_, Installation>(
             "INSERT INTO clients (id, name, identity, requested, grants, user_name, access_ttl_secs, expires)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *",
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+             ON CONFLICT (identity) WHERE revoked_at IS NULL DO UPDATE SET
+                 name = EXCLUDED.name, requested = EXCLUDED.requested, grants = EXCLUDED.grants,
+                 user_name = EXCLUDED.user_name, access_ttl_secs = EXCLUDED.access_ttl_secs,
+                 expires = EXCLUDED.expires, revision = clients.revision + 1
+             RETURNING *",
         ).bind(id).bind(item.body["client"].as_str().ok_or(Error::Unauthorized)?)
             .bind(sqlx::types::Json(&identity)).bind(&requested).bind(&grants)
             .bind(item.body["user"].as_str())
             .bind(item.body["access_ttl_secs"].as_i64().ok_or(Error::Unauthorized)?)
             .bind(item.body["max_exp"].as_i64())
             .fetch_one(&mut *tx).await?;
+        client_id = client.id;
         let mut body = item.body.clone();
         body["status"] = json!("collected");
+        body["client_id"] = json!(client_id);
         write_revision(&mut tx, item.id, PAIR_FACET, &body, item.revision, &source).await?;
-        audit_client(&mut tx, &client, "created", &source).await?;
+        audit_client(&mut tx, &client, if client.id == id { "created" } else { "updated" }, &source).await?;
     }
     let client = sqlx::query_as::<_, Installation>("SELECT * FROM clients WHERE id = $1")
-        .bind(id).fetch_one(&mut *tx).await?;
+        .bind(client_id).fetch_one(&mut *tx).await?;
     let issued = client.capability(None)?;
     let token = auth::mint_capability(&st.secret, &issued)?;
     tx.commit().await?;
@@ -1318,6 +1341,11 @@ async fn approve_pairing(
     if !(1..=installation::MAX_ACCESS_TTL).contains(&ttl) {
         return Err(Error::BadRequest(format!("ttl_secs must be 1..={}", installation::MAX_ACCESS_TTL)));
     }
+    let identity: Identity = serde_json::from_value(item.body["identity"].clone()).map_err(|_| Error::Unauthorized)?;
+    let previous = sqlx::query_as::<_, Installation>(
+        "SELECT * FROM clients WHERE identity = $1
+         ORDER BY (revoked_at IS NULL) DESC, created_at DESC, id DESC LIMIT 1",
+    ).bind(sqlx::types::Json(identity)).fetch_optional(&st.pool).await?;
     let expires = req.max_ttl_secs.map(|secs| {
         if !(1..=auth::MAX_CHAIN_SECS).contains(&secs) {
             Err(Error::BadRequest("max_ttl_secs is outside the supported lifetime".into()))
@@ -1331,6 +1359,7 @@ async fn approve_pairing(
     body["status"] = json!("approved");
     body["granted"] = json!(granted);
     body["access_ttl_secs"] = json!(ttl);
+    body["approval_anchor"] = json!(previous.as_ref().map(Installation::version));
     body["exp"] = json!(auth::deadline_from_now(ttl)?);
     if let Some(expires) = expires { body["max_exp"] = json!(expires); }
     if let Some(user) = req.user { body["user"] = json!(user); }

@@ -5,6 +5,7 @@ const { readFile } = require("node:fs/promises");
 const path = require("node:path");
 const root = path.resolve(__dirname, "../..");
 const secret = "erisdb-browser-e2e-only";
+const binary = process.env.ERISDB_BIN || path.join(root, "erisdb/target/debug/erisdb");
 let postgres, core, http;
 let stopping = false;
 
@@ -20,7 +21,7 @@ process.once("SIGINT", () => { stop(); process.exit(0); });
 process.once("exit", stop);
 
 (async () => {
-  execFileSync("cargo", ["build", "--locked", "--manifest-path", "erisdb/Cargo.toml", "--bin", "erisdb"], { cwd: root, stdio: "inherit" });
+  if (!process.env.ERISDB_BIN) execFileSync("cargo", ["build", "--locked", "--manifest-path", "erisdb/Cargo.toml", "--bin", "erisdb"], { cwd: root, stdio: "inherit" });
   postgres = execFileSync("docker", ["run", "--rm", "-d", "-e", "POSTGRES_PASSWORD=erisdb-e2e", "-p", "127.0.0.1::5432", "postgres:17-alpine"], { encoding: "utf8" }).trim();
   const address = execFileSync("docker", ["port", postgres, "5432/tcp"], { encoding: "utf8" }).trim();
   const database = `postgres://postgres:erisdb-e2e@${address}/postgres`;
@@ -28,7 +29,7 @@ process.once("exit", stop);
     try { execFileSync("docker", ["exec", postgres, "pg_isready", "-h", "127.0.0.1", "-U", "postgres"], { stdio: "ignore" }); break; }
     catch (error) { if (tries === 100) throw error; await new Promise(resolve => setTimeout(resolve, 100)); }
   }
-  core = spawn(path.join(root, "erisdb/target/debug/erisdb"), ["serve", "--database-url", database, "--secret", secret, "--listen", "127.0.0.1:18771", ...(process.env.ERISDB_TEST_IROH ? [] : ["--no-iroh"])], { stdio: "inherit" });
+  core = spawn(binary, ["serve", "--database-url", database, "--secret", secret, "--listen", "127.0.0.1:18771", ...(process.env.ERISDB_TEST_IROH ? [] : ["--no-iroh"])], { stdio: "inherit" });
   for (let tries = 0; ; tries++) {
     try { if ((await fetch("http://127.0.0.1:18771/v1/health")).ok) break; }
     catch {}

@@ -80,6 +80,18 @@ for (const app of ["tasks", "lists"]) {
     const resumed = await page.evaluate(app => JSON.parse(localStorage.getItem(`bezel.${app}.config`)), app);
     expect(resumed.token).not.toBe(saved.token);
 
+    // Pair this same browser installation again; its identity stays singular.
+    const again = await ticket(request, "Same core");
+    await page.locator("#settings > summary").click();
+    await page.locator("#cfg-ticket").fill(again.ticket);
+    await page.locator("#cfg-pair").click();
+    await expect(page.locator("#pair-wait-what")).toContainText("Compare");
+    expect((await api(request, "POST", `/v1/pairings/${again.id}/approve`, { granted: [`${app}:read`, `${app}:create`], ttl_secs: 3 })).status()).toBe(200);
+    await expect(page.locator("#pair-wait")).toBeHidden();
+    const pairedAgain = await page.evaluate(app => JSON.parse(localStorage.getItem(`bezel.${app}.config`)), app);
+    expect(pairedAgain.refreshSecret).toBe(saved.refreshSecret);
+    expect(JSON.parse(Buffer.from(pairedAgain.token.split(".")[1], "base64url")).client).toBe(session.id);
+
     const record = await (await api(request, "GET", `/v1/clients/${session.id}`)).json();
     expect((await api(request, "PUT", `/v1/clients/${session.id}`, { grants: [`${app}:read`], revision: record.revision })).status()).toBe(200);
     await page.reload();

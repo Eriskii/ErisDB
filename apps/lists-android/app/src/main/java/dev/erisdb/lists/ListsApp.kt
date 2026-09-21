@@ -125,8 +125,8 @@ fun ListsApp(pairUri: String? = null, onPairHandled: () -> Unit = {}) {
      * Write a core and a capability to disk, and say whether that moved
      * this phone to a different core.
      *
-     * Durable before it returns. A pairing token is handed over exactly
-     * once, so the moment it exists it belongs on disk with the core it
+     * Durable before it returns. As soon as collection returns a token,
+     * it belongs on disk with the core it
      * opens — a kill between here and the first sync then costs a cache,
      * not another trip to the core.
      */
@@ -181,6 +181,7 @@ fun ListsApp(pairUri: String? = null, onPairHandled: () -> Unit = {}) {
 
     /** Redeem a ticket's code and go and wait for a person. */
     fun beginPairing(ticket: Ticket) {
+        connected = false
         approval = Approval.Waiting()
         redeeming = ticket
         screen = Screen.Waiting
@@ -212,6 +213,7 @@ fun ListsApp(pairUri: String? = null, onPairHandled: () -> Unit = {}) {
      * of these at once would send the same queued op twice.
      */
     suspend fun sync() = gate.serialized {
+        if (!connected || redeeming != null) return@serialized
         withContext(Dispatchers.IO) {
             val refreshed = maybeRefresh(store)
             if (refreshed.token != null || refreshed.dead) {
@@ -277,25 +279,30 @@ fun ListsApp(pairUri: String? = null, onPairHandled: () -> Unit = {}) {
         }
     }
 
-    suspend fun connect() = withContext(Dispatchers.IO) {
-        withContext(Dispatchers.Main) { connecting = true; status = "dialing…" }
-        val err = ErisDB.configure(server, token, CLIENT, store.identityHex())
-        if (err == null) {
-            // The human may have approved less than this app asked for,
-            // so ask the core what this token holds before drawing a
-            // single button that writes.
-            val held = when (val asked = fetchGrants(ErisDBApi)) {
-                is Read.Ok -> asked.value.also { store.grants = it.held }
-                is Read.Failed -> Grants(store.grants)
+    suspend fun connect() {
+        gate.serialized {
+            if (redeeming != null) return@serialized
+            withContext(Dispatchers.IO) {
+                withContext(Dispatchers.Main) { connecting = true; status = "dialing…" }
+                val err = ErisDB.configure(server, token, CLIENT, store.identityHex())
+                if (err == null) {
+                    // The human may have approved less than this app asked for,
+                    // so ask the core what this token holds before drawing a
+                    // single button that writes.
+                    val held = when (val asked = fetchGrants(ErisDBApi)) {
+                        is Read.Ok -> asked.value.also { store.grants = it.held }
+                        is Read.Failed -> Grants(store.grants)
+                    }
+                    withContext(Dispatchers.Main) { grants = held }
+                    ensureFacet(ErisDBApi, held)
+                    withContext(Dispatchers.Main) { connected = true; status = "syncing…" }
+                } else {
+                    withContext(Dispatchers.Main) { status = err }
+                }
+                withContext(Dispatchers.Main) { connecting = false }
             }
-            withContext(Dispatchers.Main) { grants = held }
-            ensureFacet(ErisDBApi, held)
-            withContext(Dispatchers.Main) { connected = true; status = "syncing…" }
-            sync()
-        } else {
-            withContext(Dispatchers.Main) { status = err }
         }
-        withContext(Dispatchers.Main) { connecting = false }
+        if (connected && redeeming == null) sync()
     }
 
     /**
@@ -303,13 +310,14 @@ fun ListsApp(pairUri: String? = null, onPairHandled: () -> Unit = {}) {
      * answers. The token is written to the sealed store inside `collect`,
      * before this coroutine can be cancelled out from under it.
      */
-    suspend fun runPairing(ticket: Ticket) {
+    suspend fun runPairing(ticket: Ticket) = gate.serialized {
+        connected = false
         val err = withContext(Dispatchers.IO) {
             ErisDB.configure(ticket.eid!!, ticket.code, CLIENT, store.identityHex())
         }
         if (err != null) {
             approval = Approval.Unreachable(err)
-            return
+            return@serialized
         }
         var moved = false
         approval = withContext(Dispatchers.IO) { requestPairing(ErisDBApi, CLIENT, MANIFEST) }

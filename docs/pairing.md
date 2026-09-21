@@ -32,8 +32,8 @@ days), independent of the installation's continuing ability to renew.
    [a] approve as asked   [s] select   [d] deny
    ```
 
-4. Only that installation can collect the credential. Collection creates its
-   registration transactionally. Repeating collection with the same proof is
+4. Only that installation can collect the credential. Collection creates or
+   updates its active registration transactionally. Repeating collection with the same proof is
    safe while the ticket remains live, including after a lost response.
 5. The app saves its installation credential and renews access until revoked.
 

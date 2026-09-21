@@ -6,7 +6,7 @@
   Content-Security-Policy, inline because this is a single file served
   from anywhere — a file:// path, a static host, whatever.
 
-  script-src 'sha256-1XcSVYkQFxHQxfNe1yoxrx6TATRCNWlP31dIF//bgsQ=' 'sha256-nxwv3C3/0RSUi4XqMRbdj8JzbItzeTkB3gUbe+6w0iA='; recompute
+  script-src 'sha256-Sxxu/DWt8DEIYmS/2h2LmaoYRgsBUa9T2UIAci7WMP8=' 'sha256-2oURPQzQhf71gaus/YD5r40xTQ50+M5jTgtQbzs6cxc='; recompute
   with:
 
     { printf '\n'; sed -n '/^<script>$/,/^<\/script>$/p' index.html \
@@ -23,7 +23,7 @@
   BarcodeDetector reads the <video> element directly with no canvas and
   no blob: URL in between.
 -->
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'sha256-1XcSVYkQFxHQxfNe1yoxrx6TATRCNWlP31dIF//bgsQ=' 'sha256-nxwv3C3/0RSUi4XqMRbdj8JzbItzeTkB3gUbe+6w0iA='; style-src 'unsafe-inline'; connect-src *; base-uri 'none'; form-action 'none'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'sha256-Sxxu/DWt8DEIYmS/2h2LmaoYRgsBUa9T2UIAci7WMP8=' 'sha256-2oURPQzQhf71gaus/YD5r40xTQ50+M5jTgtQbzs6cxc='; style-src 'unsafe-inline'; connect-src *; base-uri 'none'; form-action 'none'">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>ErisDB · tasks</title>
 <style>
@@ -194,7 +194,7 @@
   </div>
 </main>
 
-<script src="../shared/auth.js" integrity="sha256-1XcSVYkQFxHQxfNe1yoxrx6TATRCNWlP31dIF//bgsQ="></script>
+<script src="../shared/auth.js" integrity="sha256-Sxxu/DWt8DEIYmS/2h2LmaoYRgsBUa9T2UIAci7WMP8="></script>
 <script>
 "use strict";
 // The facet name is the permission namespace, so it carries no version:
@@ -559,6 +559,7 @@ function parseTicket(str) {
  */
 async function connect(url, token, name, granted, refreshSecret = null) {
   url = ErisDBAuth.baseURL(url);
+  const sameInstallation = config?.url === url && refreshSecret && config.refreshSecret === refreshSecret;
   // The token's remaining life is the lifetime to keep renewing at; a
   // token without an exp never expires, so it never refreshes.
   const exp = tokenExp(token);
@@ -570,7 +571,10 @@ async function connect(url, token, name, granted, refreshSecret = null) {
   save(LS.config, config);
   grants = config.grants;
   permsStale = false; facetMissing = false;
-  items = {}; cursor = null; notified = {}; outbox = []; lastDrop = null;
+  if (!sameInstallation) {
+    items = {}; cursor = null; notified = {}; outbox = []; lastDrop = null;
+  }
+  cursor = null; // Re-fetch the newly approved scope without losing queued work.
   persist(); saveOutbox();
   renderPairState();
   renderConfigState();
@@ -621,7 +625,7 @@ async function pairWith(str) {
   $("#cfg-url").value = t.url;
   const who = t.name ?? t.url;
   let identity;
-  try { identity = await ErisDBAuth.identity(); }
+  try { identity = await ErisDBAuth.identity(config?.url === t.url ? config.refreshSecret : null); }
   catch (error) { pairMsg(error.message, "bad"); return; }
   pairing = { code: t.code, url: t.url, name: t.name, proof: identity.secret, challenge: identity.challenge, live: true };
   const mine = pairing;
@@ -696,6 +700,9 @@ async function pollPairing(who, mine) {
           "nothing. Run erisdb pair on the core again to ask once more.");
         return;
       }
+    } else if (r.status === 409) {
+      failPairing("This installation changed after approval. Start a fresh pairing and approve its current permissions.");
+      return;
     } else if (r.status === 400 || r.status === 401 || r.status === 404) {
       failPairing("The pairing code ran out before anyone answered — a code is good for " +
         "about ten minutes. Run erisdb pair on the core again for a fresh one.");

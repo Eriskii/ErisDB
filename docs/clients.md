@@ -12,6 +12,15 @@ installation, checks revocation and identity, then intersects token grants with
 current installation grants. Delegated tokens retain the installation ID, so
 revocation and permission reductions apply to them too.
 
+Re-pairing with the same installation key updates its existing active registration
+and replaces its permissions with the newly approved set. There is at most one
+active registration per proof. Revoked registrations stay revoked: a fresh human
+approval creates a new registration, so old tokens cannot return to use. Browser
+apps reuse their current proof only when pairing with the same core URL.
+Approval records the registration's current revision. Collection returns 409 if
+another approval, permission change or revocation has since changed it; an old
+approval cannot silently restore older authority.
+
 Installations live in a dedicated `clients` table, outside generic item CRUD.
 Pairings remain `pair` items for history and approval. Registry changes produce
 `system` change events, with no item ID; they cannot be mistaken for a pairing
@@ -46,8 +55,10 @@ a routing hint to clients; the server authenticates the actual key or secret.
 The browser apps save the renewal secret with their existing local configuration
 and save pending enrollment separately so reloads can resume collection. Serve
 these apps from an origin you control: scripts executing on that origin can read
-browser storage. MCP uses a separate mode-0600 file per configured connection and
-keeps its renewal credential out of tool results. File backups must be protected
+browser storage. MCP automatically saves its pairing in the user's configuration
+directory; optional named profiles give separate applications independent identities.
+Its credential files use mode 0600 on Unix, are replaced atomically, and never
+appear in tool results. File backups must be protected
 as credentials. A copied installation key/secret is the same identity until
 revoked; display names are never an authentication factor.
 
@@ -104,6 +115,11 @@ have no installation binding. Cut fresh QR tickets after updating core and apps.
 Already issued legacy tokens remain valid under their existing scope and expiry;
 they have no `client` claim and cannot be individually revoked. Re-pair apps to
 register them. Manual/operator tokens keep their bounded refresh-chain behavior.
+
+Migration 0007 enforces one active registration per proof. If an early registry
+contains duplicates, it retains the newest and revokes the older registrations
+with audit records. Approved but uncollected pairings without revision anchors
+are denied and must be restarted.
 
 Signing-key rotation invalidates old token signatures, but a registered client
 can obtain a new token using its still-valid installation proof. Revoke the

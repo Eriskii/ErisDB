@@ -74,6 +74,12 @@ fn private_hop(peer: Option<&str>) -> Result<()> {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Version {
+    pub id: Uuid,
+    pub revision: i64,
+}
+
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct Installation {
     pub id: Uuid,
@@ -90,6 +96,8 @@ pub struct Installation {
 }
 
 impl Installation {
+    pub fn version(&self) -> Version { Version { id: self.id, revision: self.revision } }
+
     pub fn active(&self) -> Result<()> {
         if self.revoked_at.is_some() || self.expires.is_some_and(|end| Utc::now().timestamp() >= end) {
             Err(Error::Unauthorized)
