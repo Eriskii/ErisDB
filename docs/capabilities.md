@@ -59,10 +59,11 @@ Three properties of that design matter to everything below.
 
 **The namespace is open.** The core keeps no registry of valid
 permissions and never checks that a namespace exists. `sensors:create` is
-a legal grant the moment it is typed; it matches nothing until a facet
-called `sensors` is registered, and then it matches. So standing up a new
-client requires `meta:facets:write` and nothing else, ever — no deploy, no
-allowlist entry, no core release. The e2e suite pins that path end to end.
+a legal grant the moment it is typed. It permits initializing the missing
+`sensors` schema and creating readings, without authority to change existing
+schemas or initialize other namespaces. A new client needs no deploy,
+allowlist entry, or core release. The app E2E tests exercise this from a fresh
+installation with no app schemas pre-registered.
 
 **Operation permissions use the same grant syntax.** For example, the shipped
 OpenAI operation requires `openai:chat`. It is delegated and bounded by the same

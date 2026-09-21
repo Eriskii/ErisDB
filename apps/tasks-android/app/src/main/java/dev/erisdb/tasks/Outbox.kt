@@ -56,20 +56,15 @@ sealed class Sent {
  *
  * A 403 is the human's answer arriving late: the pairing granted less
  * than this app asked for, and no number of retries turns that into a
- * yes, so the op goes and the permission is named. A 422 naming an
- * unregistered facet is the operator's to fix — this app does not ask for
- * `meta:facets:write`, so it cannot register one itself.
+ * yes, so the op goes and the permission is named. Missing schema is
+ * retryable: sync initializes it before the next attempt.
  */
 fun rejected(action: String, facet: String, r: JSONObject): Sent.Dropped {
     val status = r.optInt("status")
-    val code = r.optJSONObject("body")?.optString("error")
     return Sent.Dropped(
         when {
             status == 403 ->
                 "dropped $action: this pairing does not grant $facet:$action"
-            status == 422 && code == "unknown_facet" ->
-                "dropped $action: the $facet facet is not registered on this core — " +
-                    "ask your operator to register it"
             else -> "dropped $action: " + why(r)
         }
     )
@@ -88,7 +83,7 @@ suspend fun sendOp(
         when {
             r.optInt("status") == 201 ->
                 Sent.Done(op.getString("tmp") to r.getJSONObject("body").getString("id"))
-            transportDown(r) -> Sent.Retry
+            transportDown(r) || r.optJSONObject("body")?.optString("error") == "unknown_facet" -> Sent.Retry
             else -> rejected("create", facet, r)
         }
     }

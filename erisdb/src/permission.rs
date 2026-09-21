@@ -138,8 +138,9 @@ pub fn check_facet_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-/// The permission a facet operation requires. The core's own facets answer
-/// to `meta:` and nothing else, so each has exactly one name.
+/// The default permission for a facet operation. Core facets use `meta:`.
+/// Initializing a missing definition additionally accepts its NAME:create
+/// grant; that insert-only exception is authorized by the create handler.
 pub fn for_facet(facet: &str, action: &str) -> String {
     match facet {
         crate::api::FACET_FACET => format!("{META}:facets:{}", meta_action(action)),

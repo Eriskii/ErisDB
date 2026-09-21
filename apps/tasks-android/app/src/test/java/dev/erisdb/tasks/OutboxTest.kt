@@ -135,18 +135,15 @@ class OutboxTest {
     }
 
     @Test
-    fun aFacetNobodyRegisteredIsTheOperatorsJobAndSaysSo() = runTest {
-        // This app does not ask for meta:facets:write, so it cannot
-        // register the facet itself — and says who can.
+    fun aMissingFacetKeepsTheEntryQueuedUntilSetupSucceeds() = runTest {
         val core = FakeCore().apply { facetRegistered = false }
         val box = FakeOutbox()
-        box.enqueue(createOp("pending-x", """{"title":"nowhere to go","done":false}"""))
-
-        val reason = drainOutbox(box, core, facet)
-
-        assertEquals(emptyList<JSONObject>(), box.ops())
-        assertTrue(reason!!.contains("not registered"))
-        assertTrue(reason.contains("operator"))
+        box.enqueue(createOp("pending-x", """{"title":"waiting for setup","done":false}"""))
+        assertNull(drainOutbox(box, core, facet))
+        assertEquals(1, box.ops().size)
+        core.facetRegistered = true
+        assertNull(drainOutbox(box, core, facet))
+        assertTrue(box.ops().isEmpty())
     }
 
     // ------------------------------------------------------- ordering

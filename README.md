@@ -146,10 +146,9 @@ with an Android app. Compare the fingerprint shown in the app and terminal, then
 approve the requested permissions or a subset. For a remote browser, replace
 `--client-url` with your server's HTTPS URL.
 
-On a fresh server, the browser apps can register their schemas if you approve
-the optional facet permissions. Android apps need those schemas registered
-before saving data; use the browser apps first or the
-[facet API](docs/api.md#items-and-facets).
+Both browser and Android apps initialize their own schemas automatically with
+their `tasks:create` or `lists:create` permission. No manual schema setup or global
+facet administration is needed; existing schemas are left unchanged.
 
 Build the Android APKs with `scripts/build-android.sh`; the Android READMEs above
 list build requirements. Paired installations renew access automatically until

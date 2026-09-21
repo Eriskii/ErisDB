@@ -15,8 +15,8 @@ For a facet named `tasks`, the permissions are `tasks:read`,
 `tasks:create`, `tasks:update` and `tasks:delete`. Nothing declares them
 and nothing registers them: the core computes the permission a request
 requires from the facet the request names, and asks whether the token
-covers it. A grant naming a facet nobody has registered is legal and inert
-until somebody does.
+covers it. Grants may name a namespace before its schema exists. Its create
+grant also authorizes initializing that missing schema.
 
 That has consequences for what a name may be:
 
@@ -36,18 +36,17 @@ survives the schema moving. See [Versioning](#version-field).
 
 `facet` is the facet whose items are facet definitions. It is bootstrapped
 by the first migration and it validates registrations against its own
-schema — but it is not an ordinary facet, because it answers to `meta:`
-and nothing else:
+schema. Its permissions distinguish initialization from administration:
 
 | operation | permission |
 |-----------|------------|
 | list or read registrations | `meta:facets:read` |
-| register, change or remove one | `meta:facets:write` |
+| initialize a missing registration named `NAME` | `NAME:create` or `meta:facets:write` |
+| change, revert or remove a registration | `meta:facets:write` |
 
-Two permissions rather than four: reading a schema and changing one are
-different things, and there is no useful grant between them. `*:read` does
-**not** reach `meta:facets:read` — read-everything is about your data, not
-about the deployment.
+Initialization is insert-only: it cannot replace an existing definition, even
+when repeated by the same installation. `*:read` does **not** reach
+`meta:facets:read`. Reading item data does not grant schema administration.
 
 A definition is a body with six fields:
 
@@ -98,12 +97,11 @@ curl -fsS http://127.0.0.1:7700/v1/items \
 `exercise` is validated against that schema, and `exercise:create` starts
 meaning something to every token that already held it.
 
-**That is the whole path to a new client.** One token holding
-`meta:facets:write` registers the facet; the client pairs and asks for
-`exercise:read` and `exercise:create`; a human approves. No deploy, no
-allowlist, no core release, nothing restarted. The e2e suite pins exactly
-that sequence, including that a grant issued *before* the facet existed
-starts working the moment it does.
+**That is the whole path to a new client.** The client pairs and asks for
+`exercise:read` and `exercise:create`; a human approves. The client initializes
+its missing schema with `exercise:create`, then saves data. No deploy,
+allowlist, core release, or restart is needed. An administrator can also
+register schemas with `meta:facets:write`.
 
 Names are unique, so a second registration of the same name is **409
 `conflict`** with `that value already exists`. The apps use exactly that:
@@ -284,8 +282,8 @@ change.
 
 Two facets ship with clients in this tree. Neither is special to the core
 — they are ordinary registrations that several apps happen to agree on,
-pinned by the e2e suite so a change to either breaks a test rather than a
-phone.
+used by the actual browser and Android apps in E2E tests that begin without
+pre-registered application schemas.
 
 ### `tasks`
 

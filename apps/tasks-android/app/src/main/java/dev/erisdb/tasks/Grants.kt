@@ -21,14 +21,8 @@ import org.json.JSONArray
  * permissions, so an operator can hand out "add tasks but do not touch
  * mine" and this app will honour it.
  *
- * `meta:facets:write` is deliberately absent. It is not "register my
- * facet", it is register, change and remove *every* facet on the core —
- * a tasks app holding it could rewrite the lists app's schema. The prompt
- * would read that way too, and the honest answer to it is no. So the
- * facet is the operator's to register through `POST /v1/items`. This app
- * self-registers only when an operator has already
- * granted `*`, and a facet that is missing produces a plain "ask your
- * operator" rather than a silent failure.
+ * Creating items also permits initializing this app's missing schema.
+ * Global facet administration is not requested; existing schemas stay intact.
  */
 val MANIFEST = listOf(
     "$FACET:read",    // the tasks themselves, their history, and the change feed

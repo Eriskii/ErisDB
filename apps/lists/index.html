@@ -6,7 +6,7 @@
   Content-Security-Policy, inline because this is a single file served
   from anywhere — a file:// path, a static host, whatever.
 
-  script-src 'sha256-Sxxu/DWt8DEIYmS/2h2LmaoYRgsBUa9T2UIAci7WMP8=' 'sha256-FWI3BZJsiezq/Ybticd1YiTDauWUDNo1D6mjgw0VZis='; recompute
+  script-src 'sha256-Sxxu/DWt8DEIYmS/2h2LmaoYRgsBUa9T2UIAci7WMP8=' 'sha256-GifrQ3F15RTx5v+RFNx4bHkJFVsRK6sxNy9ge+Jtau4='; recompute
   with:
 
     { printf '\n'; sed -n '/^<script>$/,/^<\/script>$/p' index.html \
@@ -23,7 +23,7 @@
   BarcodeDetector reads the <video> element directly with no canvas and
   no blob: URL in between.
 -->
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'sha256-Sxxu/DWt8DEIYmS/2h2LmaoYRgsBUa9T2UIAci7WMP8=' 'sha256-FWI3BZJsiezq/Ybticd1YiTDauWUDNo1D6mjgw0VZis='; style-src 'unsafe-inline'; connect-src *; base-uri 'none'; form-action 'none'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'sha256-Sxxu/DWt8DEIYmS/2h2LmaoYRgsBUa9T2UIAci7WMP8=' 'sha256-GifrQ3F15RTx5v+RFNx4bHkJFVsRK6sxNy9ge+Jtau4='; style-src 'unsafe-inline'; connect-src *; base-uri 'none'; form-action 'none'">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>ErisDB · lists</title>
 <style>
@@ -224,26 +224,13 @@ const CLIENT = "Lists (Web) v0.2"; // stamped into every write's source
 // update are separate permissions, so "may add an entry but not edit one"
 // is a real reply and the UI honours it.
 //
-// `meta:facets:write` is asked for and never required. With it, a
-// brand-new core learns the lists schema during pairing and a fresh install
-// costs no terminal work. Without it the app is fully usable — it registers
-// nothing, and says who to ask if the facet turns out to be missing.
-// Demanding it would be the wrong trade: `meta:facets:write` registers,
-// changes and removes EVERY facet on the core, tasks and pairing sessions
-// included, which is far more than a lists app should hold for the sake of
-// a one-time setup step. So it is offered as a convenience the operator may
-// decline, not as the price of using the app.
-//
-// `meta:facets:read` is not asked for at all. Registering needs no reading,
-// so it would be a permission this app never spends — and the rule for the
-// person answering is to approve the narrowest set that works, which starts
-// with not asking for slack.
+// Creating items also permits initializing this namespace's missing schema.
+// No global facet administration is requested.
 const WANTED = [
   `${FACET}:read`,
   `${FACET}:create`,
   `${FACET}:update`,
   `${FACET}:delete`,
-  "meta:facets:write",
 ];
 
 // What each request means, for the waiting screen — the same sentences the
@@ -253,8 +240,6 @@ const WANT_SAYS = {
   [`${FACET}:create`]: "add entries",
   [`${FACET}:update`]: "change entries",
   [`${FACET}:delete`]: "delete entries",
-  "meta:facets:write": "register the lists facet — optional, decline it and " +
-    "someone else registers the facet instead",
 };
 
 const LS = {
@@ -942,21 +927,13 @@ const FACET_BODY = {
 // schema error nobody can act on.
 let facetMissing = false;
 
-/**
- * Register the facet if the core has no registration under this name.
- *
- * Runs only when the operator approved `meta:facets:write`. That grant is
- * asked for so a fresh core needs no terminal work, and doing without it is
- * an ordinary state rather than a failure: the app skips this entirely and
- * `permissionNote` says who to ask if the facet turns out to be missing.
- * Asking the core and taking a 403 for an answer would say the same thing
- * less politely. A 409 is the registration already being there, which is
- * the outcome this is for.
- */
 async function ensureFacet() {
-  if (!can("meta:facets:write")) return;
+  if (!can("create") && !can("meta:facets:write")) return true;
   const r = await api("POST", "/v1/items", { facet: "facet", body: FACET_BODY });
-  if (r.status === 201) { facetMissing = false; renderPermissions(); }
+  facetMissing = r.status !== 201 && r.status !== 409;
+  if (r.status === 403) permsStale = true;
+  renderPermissions();
+  return !facetMissing;
 }
 
 // ---------------------------------------------------------------- outbox
@@ -1029,12 +1006,14 @@ const detail = r => r.body?.detail ?? r.body?.error ?? ("status " + r.status);
  *
  * Two refusals say something the screen should react to as well. 403 means
  * the grants on file are behind whatever the core believes, so they are
- * re-read; `unknown_facet` means nothing can be saved here at all until
- * someone registers the facet.
+ * re-read; `unknown_facet` keeps the write queued until setup succeeds.
  */
 function refused(r, what) {
   if (r.status === 403) permsStale = true;
-  if (r.body?.error === "unknown_facet") facetMissing = true;
+  if (r.body?.error === "unknown_facet") {
+    facetMissing = true;
+    return null; // Keep the entry queued; setup is retried before the next create.
+  }
   return { drop: what + " refused: " + detail(r) };
 }
 
@@ -1046,6 +1025,7 @@ function refused(r, what) {
 async function sendOp(op) {
   try {
     if (op.op === "create") {
+      if (!await ensureFacet()) return null;
       const r = await api("POST", "/v1/items", { facet: FACET, body: op.body });
       if (r.status === 201) { facetMissing = false; return { item: r.body }; }
       return retryable(r.status) ? null : refused(r, "create");
@@ -1406,9 +1386,8 @@ const NOT_ALLOWED = {
 function permissionNote() {
   if (!config) return "";
   if (facetMissing) {
-    return `This core has no “${FACET}” facet registered, so nothing can be saved to it. ` +
-      `Ask whoever runs the core to register it — or disconnect, pair again, and approve ` +
-      `this app's request to register facets.`;
+    return `Setup for “${FACET}” has not completed. Pending entries are saved on this ` +
+      `device; the app will retry automatically.`;
   }
   if (!can("read")) {
     return "This app was not given permission to read your lists, so there is nothing to " +

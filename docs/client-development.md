@@ -63,11 +63,10 @@ Two rules for the manifest, both about the human at the other end:
 - **Ask for what you use, and no more.** The request is a list a person
   reads and answers item by item. A client that asks for `*` because it is
   easier is asking to be denied.
-- **Ask for optional things separately, and work without them.** A client
-  that wants to register its own facet asks for `meta:facets:write`
-  knowing that grant registers, changes and removes *every* facet on the
-  core. Declining it should cost the operator a sentence — "ask whoever
-  runs this to register `tasks`" — not the app.
+- **Initialize only your own namespace.** `tasks:create` allows registering
+  the missing `tasks` schema as well as creating tasks. It does not allow
+  registering other namespaces or altering existing schemas. Ordinary apps
+  do not need `meta:facets:write`. A read-only client skips initialization.
 
 After pairing, `GET /v1/permissions` tells you exactly what you got:
 
@@ -296,9 +295,9 @@ Four clients, four different shapes, all against the same API.
   fullest examples, with a shared enrollment/renewal helper in `apps/shared/auth.js`.
   Offline-first outbox, cursor sync over `fetch`, SSE read off a
   `ReadableStream` (so the `Authorization` header can be set — `EventSource`
-  cannot carry one), refresh at half-life, and facet self-registration on
-  connect for an app that was granted `meta:facets:write` and degrades
-  politely when it was not. Tasks also drives its UI off
+  cannot carry one), refresh at half-life, and initialization of their own
+  missing schema with their create permission. Setup is retried before queued
+  creations are sent. Tasks also drives its UI off
   `GET /v1/permissions`, and takes due notifications from two sources:
   `lapsed` rows from the poker's sweep, and a local due-check between
   ticks, deduped.
@@ -335,6 +334,7 @@ Four clients, four different shapes, all against the same API.
   retry, or fall back to polling).
 - Ask for the permissions you use and no more; read `GET /v1/permissions`
   and draw the UI from what you actually hold.
-- Register your facet only with `meta:facets:write`. On 409, inspect the existing
-  schema if allowed; on 403, ask the operator to register it. Do not assume an
-  existing schema matches the bodies your app writes.
+- Initialize your missing facet with its own `NAME:create` grant. On 409, keep
+  the existing schema; never overwrite it. Inspect it if you have
+  `meta:facets:read`, and handle validation failures when writing items.
+  Retain queued creations if initialization fails; retry after reconnecting.

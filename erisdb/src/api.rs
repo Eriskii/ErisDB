@@ -552,7 +552,17 @@ async fn create_item(
     src: SourceParts,
     Json(req): Json<CreateItem>,
 ) -> Result<impl IntoResponse> {
-    cap.require(&permission::for_facet(&req.facet, "create"))?;
+    if req.facet == FACET_FACET && !cap.granted("meta:facets:write") {
+        // Creating data in a namespace includes initializing its schema.
+        // Validate the name before deriving authority; the unique index keeps
+        // this insert-only. Changing or deleting a definition still needs admin.
+        let name = req.body.get("name").and_then(Value::as_str)
+            .ok_or_else(|| Error::BadRequest("facet name must be a string".into()))?;
+        permission::check_facet_name(name)?;
+        cap.require(&permission::for_facet(name, "create"))?;
+    } else {
+        cap.require(&permission::for_facet(&req.facet, "create"))?;
+    }
     guard_core_facet(&req.facet, "create")?;
     let source = src.stamp(&cap);
     let mut tx = st.pool.begin().await?;

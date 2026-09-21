@@ -49,14 +49,10 @@ knows a task has gone overdue and emits a `lapsed` change. It also
 carries `version: 1` and a line of prose per permission, so the pairing
 prompt reads *add tasks* rather than `tasks:create`.
 
-Registering a facet needs `meta:facets:write`, which is register, change
-and remove *every* facet on the core — so this app does not ask for it
-(see **Permissions**). An operator who granted `*` gets self-registration
-anyway: the app registers its schema if it is absent. An existing registration
-is left unchanged. Without that permission, the operator registers the facet
-through `POST /v1/items`. A write against a missing facet returns 422 and the app
-shows *the tasks
-facet is not registered on this core — ask your operator to register it*.
+The app initializes its missing schema automatically with `tasks:create`
+before sending queued creations. It cannot replace an existing schema or
+administer other namespaces. If initialization fails, pending entries remain
+on the device and the app retries. No manual registration is needed.
 
 ## Recurrence
 
@@ -111,8 +107,10 @@ replays on next launch. What the screen shows is the cache with the
 queued ops replayed on top, so a change is visible the instant it is
 made. The outbox drains in order and stops at the first transport
 failure, so ordering holds; permanent rejections — a schema violation, a
-403, a facet nobody registered — drop out with a reason on the status
-line instead of retrying forever.
+403 — drop out with a reason on the status
+line instead of retrying forever. Schema initialization failures keep creations
+queued. A failed startup connection is retried automatically, and queued entries
+remain visible after an offline restart.
 
 A create names its item with a pending id the moment it is queued, so the
 screen has something to hand back on the next tap. The core mints the
@@ -261,7 +259,7 @@ The manifest is what this app asks for at pairing time:
 | grant          | what it buys |
 |----------------|--------------|
 | `tasks:read`   | the tasks, their history, and the change feed |
-| `tasks:create` | add a task |
+| `tasks:create` | add an item and initialize its missing schema |
 | `tasks:update` | edit one, tick one off, roll a repeating one forward |
 | `tasks:delete` | delete one |
 

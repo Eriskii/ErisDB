@@ -165,11 +165,10 @@ class GrantsTest {
     }
 
     @Test
-    fun theManifestDoesNotAskToRegisterFacets() {
+    fun theManifestDoesNotAskForGlobalFacetAdministration() {
         // meta:facets:write is register, change and remove *every* facet.
         // A lists app asking for it would be asking for the tasks app's
-        // schema too, so it does not ask — an operator who wants
-        // self-registration grants `*` and gets it anyway.
+        // schema too. Its own create grant handles missing-schema setup.
         assertFalse("meta:facets:write" in MANIFEST)
         assertTrue(MANIFEST.none { it.startsWith("meta:") })
     }

@@ -255,6 +255,18 @@ fun TasksApp(pairUri: String? = null, onPairHandled: () -> Unit = {}) {
                 }
             }
 
+            // Initialize before draining, after renewal and the live grant check.
+            // A setup failure must not erase the user's pending creations.
+            if (store.ops().any { it.optString("op") == "create" }) {
+                val setupError = ensureFacet(ErisDBApi, grants)
+                if (setupError != null) {
+                    withContext(Dispatchers.Main) {
+                        status = "setup pending: $setupError · ${store.ops().size} queued"
+                    }
+                    return@withContext
+                }
+            }
+
             val drop = drainOutbox(store, ErisDBApi, FACET)
 
             val working = LinkedHashMap(cache)
@@ -314,7 +326,6 @@ fun TasksApp(pairUri: String? = null, onPairHandled: () -> Unit = {}) {
                         is Read.Failed -> Grants(store.grants)
                     }
                     withContext(Dispatchers.Main) { grants = held }
-                    ensureFacet(ErisDBApi, held)
                     withContext(Dispatchers.Main) { connected = true; status = "syncing…" }
                 } else {
                     withContext(Dispatchers.Main) { status = err }
@@ -368,6 +379,7 @@ fun TasksApp(pairUri: String? = null, onPairHandled: () -> Unit = {}) {
             delay(10_000)
             nowMs = System.currentTimeMillis()
             if (connected) sync()
+            else if (redeeming == null && launch(server, token) is Launch.Resume) connect()
         }
     }
     LaunchedEffect(syncTick) { if (syncTick > 0 && connected) sync() }
@@ -422,7 +434,7 @@ fun TasksApp(pairUri: String? = null, onPairHandled: () -> Unit = {}) {
         is Screen.Main -> TasksScreen(
             items = shown,
             nowMs = nowMs,
-            haveData = haveData,
+            haveData = haveData || outbox.isNotEmpty(),
             grants = grants,
             statusLine = if (status == "synced") null else status,
             onToggle = { item ->

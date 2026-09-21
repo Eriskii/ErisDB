@@ -222,6 +222,9 @@ pub async fn run(
         .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
         .unwrap_or_default();
 
+    // Keystrokes entered while waiting are not an answer to a request the
+    // operator has not seen. In particular, a queued newline must not deny it.
+    while lines.try_recv().is_ok() {}
     let fingerprint = session["body"]["fingerprint"].as_str().context("pairing has no verification code")?;
     println!("\n\nCompare this code with the app: {fingerprint}");
     println!("Approve only if both displays match.\n{client} wants:");
@@ -232,23 +235,34 @@ pub async fn run(
     prompt("> ");
 
     let expires = session["body"]["expires"].as_i64().context("pairing has no expiry")?;
-    let answer = answer_before(&mut lines, expires).await?.trim().to_lowercase();
-    let granted: Vec<String> = match answer.as_str() {
-        "a" => asked.clone(),
-        "s" => {
-            println!("Numbers to approve, comma separated (empty denies):");
-            prompt("> ");
-            let picks = answer_before(&mut lines, expires).await?;
-            picks
-                .split(',')
-                .filter_map(|p| p.trim().parse::<usize>().ok())
-                .filter_map(|n| asked.get(n.wrapping_sub(1)).cloned())
-                .collect()
+    let granted = loop {
+        let answer = answer_before(&mut lines, expires).await?;
+        match answer.trim().to_ascii_lowercase().as_str() {
+            "a" => break Some(asked.clone()),
+            "d" => break None,
+            "s" => {
+                let selected = loop {
+                    println!("Numbers to approve, comma separated (empty denies):");
+                    prompt("> ");
+                    let picks = answer_before(&mut lines, expires).await?;
+                    if picks.trim().is_empty() { break None; }
+                    let grants: Option<Vec<String>> = picks.split(',').map(|p| {
+                        let index = p.trim().parse::<usize>().ok()?.checked_sub(1)?;
+                        asked.get(index).cloned()
+                    }).collect();
+                    if let Some(grants) = grants { break Some(grants); }
+                    println!("Enter valid permission numbers from 1 to {}.", asked.len());
+                };
+                break selected;
+            }
+            _ => {
+                println!("Enter a, s, or d.");
+                prompt("> ");
+            }
         }
-        _ => Vec::new(),
     };
 
-    if granted.is_empty() {
+    let Some(granted) = granted else {
         let r = http
             .post(format!("{base}/v1/pairings/{id}/deny"))
             .bearer_auth(admin)
@@ -257,7 +271,7 @@ pub async fn run(
             .await?;
         println!("{}", if r.status().is_success() { "denied." } else { "could not deny." });
         return Ok(());
-    }
+    };
 
     let r = http
         .post(format!("{base}/v1/pairings/{id}/approve"))

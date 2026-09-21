@@ -235,6 +235,63 @@ async fn register_browser(operator: &Client, requested: &[&str], ttl: i64) -> (C
 }
 
 #[tokio::test]
+async fn paired_app_initializes_only_its_own_missing_facet() {
+    let (url, root, _pool) = setup().await;
+    let operator = Client::new(&url, &root);
+    let (app, id) = register_browser(&operator,
+        &["lists:read", "lists:create", "lists:update", "lists:delete"], 600).await;
+    let definition = json!({"facet": "facet", "body": {
+        "name": "lists", "strict": true,
+        "schema": {"type": "object", "required": ["name"],
+            "properties": {"name": {"type": "string", "minLength": 1}},
+            "additionalProperties": false}
+    }});
+    let (_, before) = operator.get("/v1/items?facet=facet").await;
+    assert!(!before["items"].as_array().unwrap().iter().any(|f| f["body"]["name"] == "lists"));
+
+    let (status, registered) = app.post("/v1/items", definition.clone()).await;
+    assert_eq!(status, 201, "paired app must initialize its own schema: {registered}");
+    assert_eq!(registered["source"]["installation"], id);
+    assert_eq!(registered["body"], definition["body"]);
+    let path = format!("/v1/items/{}", registered["id"].as_str().unwrap());
+    assert_eq!(app.post("/v1/items", definition.clone()).await.0, 409);
+    let mut replacement = definition.clone();
+    replacement["body"]["strict"] = json!(false);
+    assert_eq!(app.post("/v1/items", replacement.clone()).await.0, 409);
+    assert_eq!(app.put(&path, json!({"revision": 1, "body": replacement["body"]})).await.0, 403);
+    assert_eq!(app.delete(&path).await, 403);
+    assert_eq!(operator.get(&path).await.1["body"], definition["body"]);
+
+    let mut unrelated = definition.clone();
+    unrelated["body"]["name"] = json!("tasks");
+    assert_eq!(app.post("/v1/items", unrelated).await.0, 403);
+    for name in ["meta", "facet", "system", "pair", "*", "lists:read", ""] {
+        let mut invalid = definition.clone();
+        invalid["body"]["name"] = json!(name);
+        assert_eq!(app.post("/v1/items", invalid).await.0, 400, "{name}");
+    }
+    let mut remote_ref = definition.clone();
+    remote_ref["body"]["schema"] = json!({"$ref": "http://127.0.0.1/private"});
+    assert_eq!(app.post("/v1/items", remote_ref).await.0, 400);
+    let mut malformed = definition.clone();
+    malformed["body"]["strict"] = json!("yes");
+    assert_eq!(app.post("/v1/items", malformed).await.0, 422);
+    assert_eq!(app.get("/v1/items?facet=facet").await.0, 403);
+    assert_eq!(app.post("/v1/items", json!({"facet": "lists", "body": {}})).await.0, 422);
+    let (status, item) = app.post("/v1/items", json!({"facet": "lists", "body": {"name": "Groceries"}})).await;
+    assert_eq!(status, 201, "{item}");
+    assert_eq!(item["source"]["installation"], id);
+
+    let (_, record) = operator.get(&format!("/v1/clients/{id}")).await;
+    assert_eq!(operator.put(&format!("/v1/clients/{id}"), json!({
+        "revision": record["revision"], "grants": ["lists:read"]
+    })).await.0, 200);
+    assert_eq!(app.post("/v1/items", definition.clone()).await.0, 403);
+    assert_eq!(operator.post(&format!("/v1/clients/{id}/revoke"), json!({})).await.0, 200);
+    assert_eq!(app.post("/v1/items", definition).await.0, 401);
+}
+
+#[tokio::test]
 async fn registered_browsers_renew_after_access_expiry_until_revoked() {
     let (url, root, _pool) = setup().await;
     let operator = Client::new(&url, &root);
@@ -663,9 +720,9 @@ async fn capabilities_scope_facet_access() {
     assert_eq!(status, 403);
     let (status, _) = tasks.get(&format!("/v1/items/{secret_id}")).await;
     assert_eq!(status, 403);
-    // Nor register facets or tail the global change feed.
+    // Nor initialize another namespace or tail the global change feed.
     let (status, _) = tasks
-        .post("/v1/items", json!({"facet": "facet", "body": {"name": "sneaky/v1", "schema": {}}}))
+        .post("/v1/items", json!({"facet": "facet", "body": {"name": "sneaky", "schema": {}}}))
         .await;
     assert_eq!(status, 403);
     let (status, _) = tasks.get("/v1/changes?since=0").await;

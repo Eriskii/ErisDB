@@ -32,6 +32,10 @@ days), independent of the installation's continuing ability to renew.
    [a] approve as asked   [s] select   [d] deny
    ```
 
+   Blank or unrecognized input at this menu asks again. Only `d`, or an
+   explicitly empty selection after `s`, denies the request. Invalid permission
+   numbers ask again without approving a partial selection.
+
 4. Only that installation can collect the credential. Collection creates or
    updates its active registration transactionally. Repeating collection with the same proof is
    safe while the ticket remains live, including after a lost response.

@@ -7,11 +7,8 @@ import org.json.JSONObject
 // grant `tasks:read` survives a move to schema v2, which is what a
 // permission should do.
 //
-// Registering one needs `meta:facets:write` — register, change and remove
-// *every* facet on the core — which this app does not ask for (see
-// MANIFEST). So this runs only for an operator who granted `*` anyway,
-// and an unregistered facet reads as "ask your operator" on the first
-// write instead.
+// `tasks:create` can initialize this namespace when absent. It cannot
+// replace a schema or administer other namespaces.
 
 private const val SCHEMA = """{"type":"object","required":["title","done"],"properties":{
     "title":{"type":"string","minLength":1},
@@ -47,9 +44,11 @@ private fun facetBody(): JSONObject = JSONObject()
     .put("lapse", JSONObject(LAPSE))
     .put("permissions", descriptions())
 
-/** Register the schema when absent and explicitly authorized. */
-suspend fun ensureFacet(api: CoreApi, grants: Grants) {
-    if (!grants.can("meta:facets:write")) return
+/** Initialize this namespace before saving; 409 leaves the existing schema intact.
+ * Return an error so a failed setup keeps pending entries queued. */
+suspend fun ensureFacet(api: CoreApi, grants: Grants): String? {
+    if (!grants.can("$FACET:create") && !grants.can("meta:facets:write")) return null
     val req = JSONObject().put("facet", "facet").put("body", facetBody())
-    api.request("POST", "/v1/items", req.toString())
+    val response = api.request("POST", "/v1/items", req.toString())
+    return if (response.optInt("status") in listOf(201, 409)) null else why(response)
 }

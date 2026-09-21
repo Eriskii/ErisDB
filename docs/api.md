@@ -218,8 +218,10 @@ See [permission matching](permissions.md) for enclosure and wildcard rules.
 | GET | `/v1/plugins` | Valid token; filters operations by effective grants |
 | POST | `/v1/call` | The selected operation's concrete permission |
 
-For the core's facets, `facet` reads require `meta:facets:read` and its writes
-require `meta:facets:write`; `pair` reads require `meta:pairing:read`; `system`
+For the core's facets, `facet` reads require `meta:facets:read`. Creating a new
+registration named `NAME` requires `NAME:create` or `meta:facets:write`; changing,
+reverting, or deleting a registration requires `meta:facets:write`.
+`pair` reads require `meta:pairing:read`; `system`
 reads require `meta:system:read`. Generic writes/reverts to `pair` and `system`
 are refused: use their dedicated routes. A client registry UUID is not an item ID.
 
@@ -300,7 +302,9 @@ not necessarily equal to `changes` (the row count). `streams_free` is per replic
 Body: required `facet: string` and `body: JSON`. Requires create authority on that
 facet. **201** returns an [Item](#item). There is no client-chosen ID or upsert.
 
-Register a namespace through the same route, with `meta:facets:write`:
+Initialize a missing namespace through the same route. This example needs
+`notes:create` (or the broader `meta:facets:write`). A namespace grant permits
+only its own initialization, never replacing or deleting an existing schema:
 
 ```bash
 api POST /v1/items --data '{
@@ -327,7 +331,11 @@ The built-in meta-facet accepts these registration body fields and rejects other
 Local `$ref` values are supported; external references are refused. Changing a
 schema affects subsequent writes, not a retroactive rewrite of existing items.
 See [facet schemas](facets.md) for schema and lapse examples.
-If `notes` already exists, read its schema instead of registering it twice (409).
+If `notes` already exists, registration returns 409 and leaves its schema intact.
+An app can proceed using that schema; 409 does not guarantee schema compatibility.
+Reading definitions separately requires `meta:facets:read`. Schema validation
+failures must be handled when writing data. A failed initialization should leave
+pending user data queued for retry.
 
 ```bash
 ITEM_JSON=$(api POST /v1/items --data \
@@ -1057,6 +1065,8 @@ Put parent options before the clients subcommand, for example
 `erisdb clients --url http://127.0.0.1:7700 list`. Administration prints JSON.
 `mint --no-expiry` is for manual/operator authority; it has no individually
 revocable registration. Pairing offers approve-requested, select-subset, or deny;
+blank or invalid menu input asks again. Invalid subset numbers also ask again.
+Only `d` or an empty subset selection denies the request;
 it never silently grants beyond the request.
 
 ## Limits

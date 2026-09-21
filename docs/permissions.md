@@ -36,7 +36,7 @@ For a facet named `tasks`, the namespace is `tasks` and the actions are:
 | permission      | what it allows |
 |-----------------|----------------|
 | `tasks:read`    | read items, list them, read their history, read the facet's change feed |
-| `tasks:create`  | create items |
+| `tasks:create`  | create items; initialize the missing `tasks` schema |
 | `tasks:update`  | update items, and revert one to an earlier snapshot |
 | `tasks:delete`  | delete items |
 
@@ -49,9 +49,10 @@ expressed with a write verb.
 permissions and never checks that a namespace exists. `newthing:read` is a
 legal grant the moment it is typed — it simply matches nothing until a facet
 called `newthing` is registered, and then it matches. This is what makes a
-new client cost zero backend changes: register a facet with
-`meta:facets:write`, pair the client, approve the grants it asks for. There
-is no deploy, no allowlist, and no core release in that path.
+new client cost zero backend changes: pair it, approve its namespace grants,
+and let it initialize its missing schema using `newthing:create`. That grant
+cannot replace an existing definition or register another namespace. There is
+no deploy, no allowlist, and no core release in that path.
 
 Operation manifests name their required permissions. The shipped OpenAI
 operation requires `openai:chat`. `POST /v1/call` checks that permission and

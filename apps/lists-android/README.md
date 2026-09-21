@@ -39,13 +39,10 @@ permission should do. The registration also carries `version: 1` and a
 line of prose per permission, so the pairing prompt reads *add entries*
 rather than `lists:create`.
 
-Registering a facet needs `meta:facets:write`, which is register, change
-and remove *every* facet on the core — so this app does not ask for it
-(see **Permissions**). An operator who granted `*` gets self-registration
-anyway. Without it, the facet is the operator's to register through
-`POST /v1/items`, and a write against a facet nobody registered comes back
-422 and lands on the status line as *the lists facet is not registered on
-this core — ask your operator to register it*.
+The app initializes its missing schema automatically with `lists:create`
+before sending queued creations. It cannot replace an existing schema or
+administer other namespaces. If initialization fails, pending entries remain
+on the device and the app retries. No manual registration is needed.
 
 ## Sync
 
@@ -78,8 +75,10 @@ loses nothing, and the op replays on next launch. What the screen shows
 is the cache with the queued ops replayed on top, so a change is visible
 the instant it is made. The outbox drains in order and stops at the first
 transport failure, so ordering holds; permanent rejections — a schema
-violation, a 403, a facet nobody registered — drop out with a reason on
-the status line instead of retrying forever.
+violation, a 403 — drop out with a reason on
+the status line instead of retrying forever. Schema initialization failures keep creations
+queued. A failed startup connection is retried automatically, and queued entries
+remain visible after an offline restart.
 
 A create names its entry with a pending id the moment it is queued, so
 the screen has something to hand back on the next tap. The core mints the
