@@ -1,10 +1,5 @@
 # ErisDB
 
-ErisDB is a self-hosted personal data server written in Rust, with PostgreSQL
-storage. It stores JSON records under named schemas called facets, checks client
-permissions, and keeps a change history that apps can use to sync. Clients connect
-through the HTTP API or encrypted Iroh connections.
-
 ErisDB is a self-hostable personal data server and universal app backend designed
 for personal software ecosystems. It stores app data in a shared postgres database
 allowing for easy interop between allowed apps. ErisDB includes and is designed to
