@@ -7,11 +7,12 @@ apps, and deployment files:
   capabilities, change feed, tick sweep. See its README.
 - **`poker/`** — the clock. A curl in a systemd timer. Knows one URL, one
   token, nothing else.
-- **`apps/tasks/`** — the first client. One HTML file: local cache in
+- **`apps/tasks/`** — the first browser client, with shared authentication in
+  `apps/shared/`: local cache in
   localStorage, cursor-based sync against the change feed, revision-safe
   writes, and due notifications fed by both the poker's lapse sweep and a
   local due-check between ticks.
-- **`apps/lists/`** — lists of stuff. Same one-file shape as tasks. Each
+- **`apps/lists/`** — lists of stuff. Same browser structure as tasks. Each
   entry is `list` + `name`, with optional description, link, and a flat
   frontmatter-style attributes map; lists are implicit — a list is the set
   of entries naming it. Added/modified timestamps ride the item envelope.
@@ -30,8 +31,8 @@ apps, and deployment files:
   `tasks`; completing a repeating task advances its due date instead
   of finishing it. See its [README](apps/tasks-android/README.md).
 - **`apps/lists-android/`** — the lists client as an Android app over
-  `erisdb-client`: no IP, no port, just the server's iroh endpoint id and
-  a token. See its [README](apps/lists-android/README.md).
+  `erisdb-client`, using QR/deep-link pairing and its own Iroh installation
+  identity. See its [README](apps/lists-android/README.md).
 - **`deploy/`** — how the core runs on a machine: a systemd unit and an
   environment file to fill in.
 
@@ -43,7 +44,8 @@ This file is the tour. [`docs/`](docs/) is the detail:
 [capabilities.md](docs/capabilities.md) the token that carries one,
 [facets.md](docs/facets.md) how the store gets structure without a deploy,
 [change-feed.md](docs/change-feed.md) the feed that is both bus and audit
-log, [clients.md](docs/clients.md) how to build a client,
+log, [clients.md](docs/clients.md) installation identity and administration,
+[client-development.md](docs/client-development.md) how to build a client,
 [plugins.md](docs/plugins.md) how one-shot external operations are installed
 and invoked,
 [pairing.md](docs/pairing.md) the ticket format, and
@@ -153,8 +155,9 @@ just as well as the timer.
 
 ### The apps
 
-Serve `apps/tasks/` or `apps/lists/` statically (or open `index.html`
-directly) and give each one a ticket: scan the QR `erisdb pair` prints, or
+Serve the `apps/` directory statically over HTTPS (HTTP is supported on localhost),
+preserving `shared/` alongside `tasks/` and `lists/`. Open either app and give it
+a ticket: scan the QR `erisdb pair` prints, or
 paste the `bezel://pair/…` string. The app redeems it, asks for the
 permissions it needs, and waits while you answer in the terminal. Pasting
 a URL and a token still works for a token you already hold. The Android
@@ -180,9 +183,11 @@ pg_restore --dbname="$DATABASE_URL" --no-owner erisdb-YYYY-MM-DD.dump
 
 Three things to keep straight:
 
-- **Both tables matter.** `items` is current truth; `changes` is the
-  append-only feed every sync client reads by cursor. Restoring `items`
-  alone leaves clients holding cursors into a history that no longer exists.
+- **Restore the whole database together.** `items` is current truth; `changes`
+  is the append-only feed every sync client reads by cursor; `clients` holds
+  installation permissions and revocation. Partial restores can break sync or
+  restore inconsistent authority. An older backup can restore registrations
+  revoked after that backup.
 - **`changes` grows without bound.** Every write snapshots the full body it
   produced, deletes keep the bodies that came before them, and the poker
   adds a `tick` row a minute. Nothing prunes any of it — the feed *is* the

@@ -116,6 +116,26 @@ holds before trying anything.
 
 ## Run
 
+After pairing, launch `erisdb-mcp`. For example, configure Claude Code to launch
+the already-paired default profile:
+
+```sh
+claude mcp add erisdb -- erisdb-mcp
+```
+
+For an independent named profile, pair with `--profile coding`, then include
+`--profile coding` in the MCP launch command:
+
+```sh
+claude mcp add erisdb -- erisdb-mcp --profile coding
+```
+
+### Manual-token configuration
+
+Existing integrations can still supply a manually minted token. This keeps the
+manual token's original expiry and refresh limits; pairing above enables renewal
+until the installation is revoked.
+
 The core's default listen address is `127.0.0.1:7700`.
 
 ```sh
@@ -170,7 +190,7 @@ to read and write your data.
 ERISDB_PROFILE             remembered installation profile. Default: default.
 ERISDB_SESSION_FILE        advanced override for the saved pairing location.
 ERISDB_URL                 the core's base URL for manual-token configuration.
-ERISDB_TOKEN_FILE          path to a file holding the capability. Preferred.
+ERISDB_TOKEN_FILE          path to a manually supplied capability.
 ERISDB_TOKEN               the capability itself. Used when no file is named.
 ERISDB_MCP_ALLOW_MINT      "1" enables mint_capability. Off by default.
 ERISDB_MCP_ALLOW_APPROVE   "1" enables approve_pairing. Off by default.
@@ -179,7 +199,7 @@ ERISDB_MCP_MAX_MINT_TTL    ceiling on the lifetime of any token this server
                           Default 86400.
 ```
 
-Prefer `ERISDB_TOKEN_FILE`. A token in `--env ERISDB_TOKEN=bz1.…` is written
+For manual tokens, prefer `ERISDB_TOKEN_FILE`. A token in `--env ERISDB_TOKEN=bz1.…` is written
 in cleartext into the MCP client's config, ends up in this process's
 environment where anything else running as you can read it, and tends to
 be copied into shell history and screenshots on the way. A path is a

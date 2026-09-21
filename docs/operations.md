@@ -70,15 +70,15 @@ The practical consequences:
 
 - **Deploying is replacing the binary and restarting.** The new one
   migrates on the way up.
-- **Rolling back means rolling back the binary,** and only works if the
-  migrations in between were additive. Every migration in the tree so far
-  is: new columns, new indexes, a widened `CHECK`, a function redefined.
+- **Rollback needs a compatible binary and data model.** A pre-registry binary
+  cannot enforce installation binding or revocation; do not roll back to one
+  after enabling registered clients.
 - **Two replicas starting at once are fine.** sqlx takes a lock; the
   second waits and then finds nothing to do.
 - **A migration that fails stops the process** with `migrating the store`
   in the message. It does not serve on a half-migrated schema.
 
-Five migrations exist. `0001_init` creates `items` and `changes` and
+Seven migrations exist. `0001_init` creates `items` and `changes` and
 bootstraps the `facet` meta-facet. `0002_lapse` adds the `lapsed` op and
 the `safe_ts` helper. `0003_source_history` adds attribution and the body
 snapshots that make the feed a full audit log. `0004_safe_ts_stable`
@@ -88,8 +88,11 @@ call — and would silently corrupt any expression index built on it.
 `0005_namespaced_permissions` moves the schema version out of facet names
 and into their bodies, rewrites `items.facet` and `changes.facet` to
 match, grows the meta-facet with `version` and `permissions`, and
-bootstraps the `pair` facet. It is the one migration that rewrites
-existing rows; the file explains why, at length.
+bootstraps the `pair` facet. `0006_registered_clients` adds the installation
+registry and denies unfinished pairings without installation binding.
+`0007_one_active_registration` enforces one active registration per identity,
+audits retirement of duplicates, and denies uncollected approvals lacking a
+registration revision anchor. See [migration and recovery](clients.md#migration-and-recovery).
 
 `0005` is also the one to read before rolling a binary backwards, since a
 core that predates it looks for `tasks/v1` and finds `tasks`.
@@ -170,9 +173,10 @@ Covered in full in
 [the root README](../README.md#backup-and-restore). The three things that
 bite, restated because they are the ones that lose data:
 
-1. **Both tables or neither.** `items` is current truth, `changes` is the
-   feed every sync client holds a cursor into. Restoring `items` alone
-   leaves those cursors pointing into a history that no longer exists.
+1. **Restore the whole database together.** `items`, the `changes` feed, and
+   the `clients` registry must agree. Partial restores can break sync or
+   restore inconsistent authority. Restoring an older backup can also restore
+   registrations revoked since that backup.
 2. **A dump contains everything ever written**, including every prior
    version and everything since deleted, because the feed *is* the
    history and nothing prunes it.

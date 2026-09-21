@@ -78,7 +78,10 @@ actual device end-to-end coverage.
   profiles, and renewal on an explicit authorization failure. Re-pairing preserves
   the existing identity and replaces its saved credential atomically.
 - Android comparison codes, live permission/revocation UI, and rebuilt ARM64
-  and x86_64 JNI libraries under the new name.
+  and x86_64 JNI libraries under the new name. Pairing and background sync are
+  serialized; interrupted initial requests resume after the core confirms that
+  submission is still pending. Native connection establishment has a 30-second
+  deadline before application data is sent.
 
 See [clients.md](clients.md) for the architecture, API, transport and migration
 contract. Existing unregistered tokens retain their old semantics; re-pair them
@@ -103,10 +106,16 @@ profile does not affect another.
 
 `tests/android/e2e.py` drives actual APK screens through ADB, then validates writes
 and installation identity in the actual core. It exercises deep-link pairing,
-fingerprint comparison, UI writes, renewal after a stopped-app expiry, permission
-changes and revocation. This host has no emulator, connected device or KVM; device
-execution is assigned to the Android CI job and must be reported separately from
-unit/build results.
+fingerprint comparison, UI writes, renewal after a stopped-app expiry, re-pairing
+with the same identity, permission changes and revocation. Both applications
+passed those flows on an Android 35 x86_64 emulator in
+[CI run 35549222326](https://github.com/Eriskii/ErisDB/actions/runs/35549222326)
+at implementation commit `cddd6cb`. The Lists flow also disables the emulator's
+actual Wi-Fi and mobile data before initial pairing, waits for the unreachable
+state, restores connectivity, and completes pairing with the same ticket.
+All seven CI jobs passed, including the dependency audits and browser suite.
+Physical-device testing is deferred at the user's request; ARM64 JNI compilation
+does not establish runtime behavior on an ARM device.
 
 ## Dependency review
 

@@ -65,10 +65,9 @@ A client gets its token by pairing, and the QR code it scans is not the
 token. The ticket carries a **pairing code**: a token holding exactly
 `meta:pairing:redeem`, naming one session, good for minutes. The client
 redeems it with a manifest — who it is, which permissions it wants — and
-a human answers. A photographed pairing screen is therefore worth
-nothing on its own: redeeming it raises a prompt on the operator's
-device, naming a client they did not install, asking for permissions
-they can refuse.
+a human answers. Compare the request's fingerprint on both screens before
+approving; display names are untrusted. A photographed ticket can race to request
+enrollment, but it cannot collect another installation's approved credential.
 
 ```rust
 let ticket = erisdb_client::Ticket::parse(scanned)?;   // bezel://pair/…
@@ -94,8 +93,8 @@ match erisdb_client::pair(
 
 The approved set is not always the requested set: an operator may select
 the requested set or a subset. Read `granted` and render from it — and ask what
-you hold at any time with `client.permissions()`, which needs no
-permission because the answer is already inside the token.
+you hold at any time with `client.permissions()`, which needs no additional
+permission and returns the token's grants intersected with current registry grants.
 
 **The installation proves possession of its Iroh key.** A copied QR cannot
 collect another installation's approved token. Preserve the key passed to `dial`:

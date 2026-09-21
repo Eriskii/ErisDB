@@ -136,7 +136,8 @@ handle it accordingly — see
 The other half of the same fact: **restoring `items` without `changes` is
 not a restore.** Every sync client holds a cursor into the feed, and a feed
 that has lost its tail leaves those cursors pointing at a history that no
-longer exists. Back up both tables or neither.
+longer exists. Back up and restore the whole database, including the `clients`
+registry, together; see [migration and recovery](clients.md#migration-and-recovery).
 
 If a body should never be in the store, it must never be written. There is
 no route that removes a row from `changes` — deleting the item does not,

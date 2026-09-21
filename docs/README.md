@@ -30,8 +30,7 @@ which is cheaper to get right at install time than later.
 shape, and it links out to everything it depends on.
 [permissions.md](permissions.md) to decide what to ask a human for,
 [api.md](api.md) as you go, [pairing.md](pairing.md) if the thing has a
-camera. `apps/tasks/index.html` is a complete working client in one file
-and reads faster than any of this.
+camera. `apps/tasks/index.html` and `apps/shared/auth.js` are a working example.
 
 **I want to understand the design.** [permissions.md](permissions.md) and
 [change-feed.md](change-feed.md) are the two ideas the rest follows from —
@@ -45,12 +44,12 @@ computed requests against external systems.
 
 ## The shape, in a paragraph
 
-One Postgres store with two tables: `items` is current truth, `changes` is
-an append-only, totally-ordered feed that doubles as the event bus. The
-core is a stateless process over that store — it verifies a signed
-capability, checks its grants against the one permission the request
-requires, validates a body against a facet's JSON Schema, writes both
-tables in one transaction, and holds nothing a restart would lose. A facet
+One Postgres store holds `items` as current truth, `changes` as an append-only,
+totally-ordered feed, and `clients` as the installation authority registry. The
+core is a stateless process over that store — it verifies a signed capability,
+checks installation identity and current grants for registered clients, checks
+the request's required permission, validates a body against a facet's JSON
+Schema, and writes the item and its history in one transaction. A facet
 is a contract registered as an item, and its name is the namespace its
 permissions live in, so new structure and the authority over it are both a
 `POST` rather than a deploy. Apps, bridges, the poker and Android builds are

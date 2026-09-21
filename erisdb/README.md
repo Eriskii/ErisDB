@@ -8,9 +8,9 @@ executables for non-durable calls into external systems.
 
 ## Vocabulary
 
-- **Store** — Postgres. The only stateful thing. Two tables: `items`
-  (current truth) and `changes` (a durable, totally-ordered change feed that
-  doubles as the event bus).
+- **Store** — Postgres. `items` holds current truth, `changes` is a durable,
+  totally-ordered change feed that doubles as the event bus, and `clients`
+  holds installation identities, permissions and revocation.
 - **Core** — this process. Verifies capabilities, validates writes against
   facet schemas, serves the API. Holds nothing a restart would lose; run as
   many replicas as you like.
@@ -22,6 +22,9 @@ executables for non-durable calls into external systems.
 - **Client** — anything with a capability token. A bridge is a client that
   represents an external system and keeps its config as items in its own
   facet.
+- **Installation** — a registered app identity, bound to an Iroh key or a
+  browser/MCP renewal secret. Human pairing approval establishes its authority;
+  Postgres stores its current grants and revocation status.
 - **Plugin** — an operator-installed executable described by a manifest. One
   call starts one fresh process and streams its stdout; it never listens,
   persists, retries, or touches Postgres. An operation declares its own JSON
@@ -29,22 +32,25 @@ executables for non-durable calls into external systems.
 - **Capability** — a signed, self-describing token carrying **grants**:
   permission patterns like `tasks:read`, `tasks:*`, `*:read` or
   `meta:facets:write`, with an expiry and optionally a `user` identity.
-  The core verifies a signature and looks nothing up.
+  Registered tokens also identify their installation: the core verifies its
+  identity and intersects the token's grants with current registry grants.
 - **Permission** — what a request requires, computed from the request:
   `tasks:create`, `meta:pairing:approve`. Four actions per facet — `read`,
   `create`, `update`, `delete` — so an append-only logger can hold
   `sensors:create` and nothing else. The core keeps **no registry** of
   valid permissions: a grant for a facet that does not exist yet is legal
   and inert until it does.
-- **Chain** — the second clock on a token. `exp` is when this token stops
-  working; `max_exp` is when its line does. Refresh moves `exp` forward and
+- **Chain** — the second clock on a manual or delegated token. `exp` is when
+  this token stops working; `max_exp` is when its line does. Refresh moves `exp` forward and
   never past `max_exp`, so a token renews itself for a bounded stretch and
-  then a human mints a new one.
+  then a human mints a new one. Registered installations renew independently
+  of access-token expiry until revoked.
 - **Source** — server-stamped attribution on every write:
-  `{addr, user, client}` with a trust gradient. `addr` is observed from
-  the connection (peer IP over TCP, `iroh:<endpoint id>` over QUIC),
+  `{addr, user, client, installation}` with a trust gradient. `addr` is observed
+  from the connection (peer IP over TCP, `iroh:<endpoint id>` over QUIC),
   `user` is signed into the capability, `client` is whatever the caller
-  claims via the `X-Bezel-Client` header. Items carry their last writer's
+  claims via the `X-Bezel-Client` header, and `installation` is the authenticated
+  registration ID when present. Items carry their last writer's
   source; every change row carries the source that produced it.
 - **History** — every change row snapshots the body and revision it
   produced. The feed is a full, append-only audit log: any past state can
@@ -78,6 +84,10 @@ GET    /v1/pairings, /v1/pairings/{id}                                 meta:pair
 POST   /v1/pairings/{id}/approve, /deny                                meta:pairing:approve
 POST   /v1/pair/redeem              {client, requested}                the code itself
 GET    /v1/pair/status              collect with installation proof    the code and identity
+GET    /v1/clients, /v1/clients/{id}                                  meta:clients:read
+PUT    /v1/clients/{id}             {grants, revision}                 meta:clients:write
+POST   /v1/clients/{id}/revoke                                        meta:clients:revoke
+POST   /v1/clients/{id}/refresh     renew independently of expiry      installation proof
 ```
 
 The core's own facets answer only to `meta:`: `facet` to
@@ -87,8 +97,14 @@ reaches none of them.
 
 ## Capability lifetime
 
-Nothing is looked up, so nothing can be taken back — a token is only as
-bounded as it was minted. Two rules keep that honest:
+Registered access requires an active installation and current grants on every
+authorization check. Revoke one installation with `erisdb clients revoke ID`;
+this blocks subsequent access and renewal, including delegated tokens, and closes
+idle change streams across replicas. An installation remains authorized until
+revoked unless the operator explicitly chooses a temporary registration.
+
+Manual tokens have no registry entry and retain their original expiry and
+refresh-chain limits. Two rules apply to token delegation and bounded refresh:
 
 - **Enclosure covers scope and time.** A minted token never grants what its
   minter lacks, and never outlives it, in expiry or in chain. A ten-minute
@@ -106,9 +122,10 @@ secret: `erisdb mint --no-expiry`. Do it for daemons that must not fail at
 `--ttl 0` is an error rather than a spelling of "forever", because it
 produces a token that is already expired.
 
-Revoking everything at once means rotating `ERISDB_SECRET`, which also moves
-the iroh endpoint id unless `ERISDB_IROH_SECRET` is set separately. Set it
-separately if you ever intend to rotate.
+Rotating `ERISDB_SECRET` invalidates outstanding token signatures. Registered
+installations can still renew using their installation proof; revoke their
+registrations to remove that authority. Rotation also moves the Iroh endpoint
+unless `ERISDB_IROH_SECRET` is set separately. See [clients.md](../docs/clients.md).
 
 ## Limits
 
