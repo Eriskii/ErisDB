@@ -5,6 +5,10 @@ Paired applications have their own installation identity and renewable access
 token. The poker uses a manually minted token. [api.md](api.md) documents the
 server routes and [clients.md](clients.md) documents installation renewal.
 
+Agents building clients can use the repository's
+[client-development skill](../.agents/skills/erisdb-client-development/SKILL.md),
+which routes to the relevant contracts and implementation examples.
+
 ## 1. Pair an installation
 
 Read the server address and pairing token from the QR, deep link, or pasted

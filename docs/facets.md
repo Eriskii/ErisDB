@@ -170,11 +170,11 @@ Compiled validators are cached per replica, keyed by facet name and
 matched on the schema itself, so editing a registration recompiles on the
 next write and no restart is needed. Each replica caches independently.
 
-The meta-facet only requires that `schema` be an object, so a schema that
-is well-formed JSON but not a valid JSON Schema registers successfully and
-fails on the **first write to that facet**, as `400 bad_request` with
-`facet X carries an invalid schema`. Registration is not a compile step.
-Write one item to a new facet before you believe in it.
+Schemas are compiled before a definition is created or updated, including
+when `strict` is false. Well-formed JSON that is not a valid JSON Schema is
+rejected with **400 `bad_request`**. A failed schema edit leaves the previous
+definition, revision, and history intact. Test representative item bodies too:
+successful compilation does not establish that a schema fits an app's data.
 
 ## Why `$ref` may not leave the document
 
