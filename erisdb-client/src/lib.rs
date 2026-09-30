@@ -550,91 +550,16 @@ impl Drop for PluginStream {
 
 // ---------------------------------------------------------------- pairing
 
-/// The literal prefix of a pairing ticket. Everything after it is the
-/// encoded payload.
-pub const TICKET_SCHEME: &str = "erisdb://pair/";
+/// The app name in ErisDB's tickets, `erisdb://pair/…`. Reading and
+/// refusing tickets is [`erislogin::ticket`]'s: a wrong prefix, a payload
+/// that does not decode, an unknown version, no address, no code, or an
+/// endpoint id that is not 64 hex characters.
+pub const APP: &str = "erisdb";
 
-/// The only ticket version this client understands. A ticket carrying
-/// another is refused rather than guessed at.
-pub const TICKET_VERSION: u64 = 1;
+pub use erislogin::ticket::Ticket;
 
 /// How often a waiting client asks whether the human has answered.
 pub const PAIR_POLL_INTERVAL: Duration = Duration::from_millis(500);
-
-/// A scanned pairing ticket: where the core is, and the code to start the
-/// conversation with.
-///
-/// `token` is **not** a capability over any data. It grants exactly
-/// `meta:pairing:redeem` on one session and expires in minutes, so a
-/// photographed screen gets an attacker as far as raising a prompt on
-/// somebody else's device.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Ticket {
-    pub v: u64,
-    /// A label for the human — *paired with my-laptop*. Never trusted.
-    pub name: Option<String>,
-    /// Iroh endpoint id, 64 lowercase hex characters.
-    pub eid: Option<String>,
-    /// Plain HTTP base URL, for clients that cannot speak QUIC.
-    pub url: Option<String>,
-    /// The pairing code.
-    pub token: String,
-}
-
-impl Ticket {
-    /// Read `erisdb://pair/<base64url-nopad(JSON)>`.
-    ///
-    /// Everything the format says to refuse is refused here: a wrong
-    /// prefix, a payload that does not decode, an unknown version, no
-    /// address at all, no code, or an endpoint id that is not 64 hex
-    /// characters. Refusing loudly beats storing half a config.
-    pub fn parse(s: &str) -> Result<Self> {
-        let payload = s
-            .trim()
-            .strip_prefix(TICKET_SCHEME)
-            .ok_or_else(|| anyhow!("a pairing ticket starts with {TICKET_SCHEME}"))?;
-        let json = B64
-            .decode(payload)
-            .map_err(|_| anyhow!("ticket payload is not unpadded base64url"))?;
-        let v: Value =
-            serde_json::from_slice(&json).context("ticket payload is not a ticket")?;
-
-        let version = v["v"].as_u64().ok_or_else(|| anyhow!("ticket names no version"))?;
-        if version != TICKET_VERSION {
-            return Err(anyhow!(
-                "ticket version {version} is not supported; this client speaks v{TICKET_VERSION}"
-            ));
-        }
-        let text = |key: &str| v[key].as_str().filter(|s| !s.is_empty()).map(str::to_string);
-        let ticket = Ticket {
-            v: version,
-            name: text("name"),
-            eid: text("eid"),
-            url: text("url"),
-            token: text("token").ok_or_else(|| anyhow!("ticket carries no code"))?,
-        };
-        if ticket.eid.is_none() && ticket.url.is_none() {
-            return Err(anyhow!(
-                "ticket names no address: it needs an endpoint id, a url, or both"
-            ));
-        }
-        if let Some(eid) = &ticket.eid {
-            if eid.len() != 64 || !eid.chars().all(|c| c.is_ascii_hexdigit()) {
-                return Err(anyhow!("endpoint id must be 64 hex characters"));
-            }
-        }
-        Ok(ticket)
-    }
-
-    /// The endpoint id to dial. A ticket may legally carry only a `url` —
-    /// one QR serves a browser on the LAN and a phone anywhere — but this
-    /// client speaks QUIC and nothing else, so it says so plainly.
-    pub fn endpoint_id(&self) -> Result<&str> {
-        self.eid.as_deref().ok_or_else(|| {
-            anyhow!("this ticket carries no endpoint id, only a url; this client dials iroh")
-        })
-    }
-}
 
 /// A stop signal for a wait, shareable and clonable. Every clone names
 /// the same signal, so the thread showing a pairing screen can hand one
@@ -728,8 +653,13 @@ pub async fn pair(
     within: Duration,
     cancel: &Cancel,
 ) -> Result<Pairing> {
-    let client =
-        Client::dial(ticket.endpoint_id()?, &ticket.token, client_name, identity).await?;
+    // A ticket may legally carry only a `url` — one QR serves a browser on
+    // the LAN and a phone anywhere — but this client speaks QUIC and nothing
+    // else, so it says so plainly.
+    let server = ticket.endpoint_addr().ok_or_else(|| {
+        anyhow!("this ticket carries no endpoint id, only a url; this client dials iroh")
+    })?;
+    let client = Client::dial_addr(server, &ticket.token, client_name, identity).await?;
     client.pair(client_name, requested, within, cancel).await
 }
 
@@ -1077,7 +1007,7 @@ pub mod blocking {
     /// Separate from redeeming on purpose: an app shows the core's name
     /// and asks the user before it dials anything.
     pub fn parse_ticket(ticket: &str) -> String {
-        match Ticket::parse(ticket) {
+        match Ticket::parse(APP, ticket) {
             Ok(t) => serde_json::json!({"ok": true, "ticket": {
                 "v": t.v,
                 "name": t.name,

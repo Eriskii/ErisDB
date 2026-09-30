@@ -68,6 +68,22 @@ impl Error {
     }
 }
 
+impl From<erislogin::Error> for Error {
+    fn from(e: erislogin::Error) -> Self {
+        match e {
+            erislogin::Error::Unauthorized => Error::Unauthorized,
+            erislogin::Error::Forbidden { permission } => Error::Forbidden { permission },
+            erislogin::Error::BadRequest(detail) => Error::BadRequest(detail),
+            erislogin::Error::Conflict(detail) => Error::Conflict(detail),
+            erislogin::Error::Expired => Error::BadRequest(e.to_string()),
+            // Only a terminal prompt is cancelled; on the API it is a bug.
+            erislogin::Error::Cancelled(_) | erislogin::Error::Io(_) | erislogin::Error::Internal(_) => {
+                Error::Internal(e.to_string())
+            }
+        }
+    }
+}
+
 impl IntoResponse for Error {
     fn into_response(self) -> Response {
         // Unique-index violations surface as conflicts, not 500s.

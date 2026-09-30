@@ -1176,22 +1176,20 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "clap",
+ "erislogin",
  "futures",
- "hmac 0.12.1",
  "http-body-util",
  "hyper",
  "hyper-util",
  "iroh",
  "jsonschema",
  "png",
- "qrcode",
  "reqwest 0.12.28",
  "rqrr",
  "serde",
  "serde_json",
  "sha2 0.10.9",
  "sqlx",
- "subtle",
  "testcontainers-modules",
  "thiserror 2.0.20",
  "tokio",
@@ -1200,6 +1198,26 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "erislogin"
+version = "0.3.1"
+source = "git+https://github.com/Eriskii/ErisLogin?tag=v0.3.1#320133a513abf068d3bf8b1d5f7fc1654b6348db"
+dependencies = [
+ "base64 0.22.1",
+ "hmac 0.12.1",
+ "iroh",
+ "png",
+ "qrcode",
+ "rand 0.9.5",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "subtle",
+ "thiserror 2.0.20",
+ "tokio",
  "uuid",
 ]
 

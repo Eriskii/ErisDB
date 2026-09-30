@@ -890,7 +890,7 @@ async fn redeem_pairing(
     body["status"] = json!("requested");
     body["client"] = json!(req.client);
     body["requested"] = json!(req.requested);
-    body["fingerprint"] = json!(identity.fingerprint(id, &req.requested));
+    body["fingerprint"] = json!(identity.fingerprint(installation::PAIR_DOMAIN, &id, &req.requested));
     body["identity"] = json!(identity);
     let updated = write_pairing(&st, &item, body, &src.stamp(&cap)).await?;
     tracing::info!(client = %req.client, pairing = %id, "pairing requested");

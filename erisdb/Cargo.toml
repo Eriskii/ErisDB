@@ -26,17 +26,12 @@ chrono = { version = "0.4", features = ["serde"] }
 # a hole, not a feature. Local `$ref` still resolves; `guard_schema` refuses
 # the rest at registration.
 jsonschema = { version = "0.49", default-features = false }
-hmac = "0.12"
-sha2 = "0.10"
-base64 = "0.22"
-subtle = "2"
 thiserror = "2"
+erislogin = { git = "https://github.com/Eriskii/ErisLogin", tag = "v0.3.1" }
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-qrcode = { version = "0.14.1", default-features = false }
-png = "0.18.1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 
 [dev-dependencies]
@@ -46,6 +41,9 @@ http-body-util = "0.1"
 testcontainers-modules = { version = "0.15", features = ["postgres"] }
 anyhow = "1"
 rqrr = "0.10.1"
+png = "0.18.1"
+sha2 = "0.10"
+base64 = "0.22"
 
 [[bin]]
 name = "erisdb"

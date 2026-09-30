@@ -68,11 +68,9 @@ impl Session {
 /// Re-pairing reuses the proof and atomically replaces only this core's credential.
 pub async fn pair(ticket: &str, fallback_url: Option<&str>, path: &Path, name: &str, grants: &[String]) -> Result<()> {
     if grants.is_empty() { bail!("request at least one permission with --grant"); }
-    let payload = ticket.trim().strip_prefix("erisdb://pair/").context("expected an ErisDB pairing ticket")?;
-    let ticket: Value = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(payload)?)?;
-    if ticket["v"] != 1 { bail!("unsupported ticket version"); }
-    let url = base_url(ticket["url"].as_str().or(fallback_url).context("this ticket needs --url for the HTTPS endpoint")?)?;
-    let code = ticket["token"].as_str().context("ticket omitted pairing capability")?;
+    let ticket = erislogin::ticket::Ticket::parse("erisdb", ticket)?;
+    let url = base_url(ticket.url.as_deref().or(fallback_url).context("this ticket needs --url for the HTTPS endpoint")?)?;
+    let code = ticket.token.as_str();
     let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
     let mut directory = std::fs::DirBuilder::new();
     directory.recursive(true);

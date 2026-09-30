@@ -1,6 +1,7 @@
 //! Signed capability tokens and bounded delegation.
 //!
-//! A token is `erisdb1.<b64url(payload)>.<b64url(hmac_sha256(secret, payload))>`.
+//! A token is `erisdb1.<b64url(payload)>.<b64url(hmac_sha256(secret, payload))>`,
+//! sealed and opened by [`erislogin::token`].
 //! The payload carries an upper scope bound. Registered tokens also name an
 //! installation; installation.rs intersects that bound with its live authority.
 //!
@@ -14,11 +15,7 @@
 //! Only the CLI can mint a token with no `exp`; refreshing one gives it a
 //! bounded lifetime.
 
-use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
-use base64::Engine;
-use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
 
 use crate::error::{Error, Result};
 
@@ -31,10 +28,8 @@ pub const DEFAULT_CHAIN_SECS: i64 = 30 * 86_400;
 /// The longest chain the HTTP surface mints, whatever it is asked for.
 pub const MAX_CHAIN_SECS: i64 = 365 * 86_400;
 
-/// Caps on the attacker-controlled strings that get baked into a payload and
-/// then HMAC'd on every request.
-pub const MAX_GRANTS: usize = 64;
-pub const MAX_GRANT_LEN: usize = 128;
+/// Cap on the signed user label, which is baked into a payload and then
+/// HMAC'd on every request. Grant sets are capped by [`erislogin::permission`].
 pub const MAX_USER_LEN: usize = 128;
 
 /// The scope a token grants: which permissions, until when — and
@@ -94,18 +89,7 @@ impl Capability {
 
 /// Reject the unbounded strings a caller would otherwise get to sign.
 pub fn check_grants(grants: &[String], user: Option<&str>) -> Result<()> {
-    if grants.is_empty() {
-        return Err(Error::BadRequest("a capability needs at least one grant".into()));
-    }
-    if grants.len() > MAX_GRANTS {
-        return Err(Error::BadRequest(format!("at most {MAX_GRANTS} grants")));
-    }
-    if let Some(g) = grants.iter().find(|g| g.len() > MAX_GRANT_LEN) {
-        return Err(Error::BadRequest(format!("grant is longer than {MAX_GRANT_LEN}: {g:?}")));
-    }
-    for grant in grants {
-        crate::permission::check_grant(grant)?;
-    }
+    erislogin::permission::check_grants(grants)?;
     if user.is_some_and(|u| u.len() > MAX_USER_LEN) {
         return Err(Error::BadRequest(format!("user is longer than {MAX_USER_LEN}")));
     }
@@ -121,12 +105,6 @@ pub fn deadline_from_now(secs: i64) -> Result<i64> {
         .timestamp()
         .checked_add(secs)
         .ok_or_else(|| Error::BadRequest("lifetime overflows".into()))
-}
-
-fn signature(secret: &[u8], payload: &[u8]) -> Hmac<Sha256> {
-    let mut mac = Hmac::<Sha256>::new_from_slice(secret).expect("hmac accepts any key length");
-    mac.update(payload);
-    mac
 }
 
 /// Mint a token. `ttl_secs` counts from now; `None` never expires.
@@ -155,25 +133,12 @@ pub fn mint_chain(
 }
 
 pub fn mint_capability(secret: &[u8], cap: &Capability) -> Result<String> {
-    let payload = serde_json::to_vec(cap).map_err(|e| Error::Internal(e.to_string()))?;
-    let sig = signature(secret, &payload).finalize().into_bytes();
-    Ok(format!("{PREFIX}.{}.{}", B64.encode(&payload), B64.encode(sig)))
+    Ok(erislogin::token::seal(PREFIX, secret, cap)?)
 }
 
 /// Verify a token's signature and expiry; return its scope.
 pub fn verify(secret: &[u8], token: &str) -> Result<Capability> {
-    let mut parts = token.split('.');
-    let (prefix, payload_b64, sig_b64) = match (parts.next(), parts.next(), parts.next(), parts.next()) {
-        (Some(p), Some(pl), Some(s), None) => (p, pl, s),
-        _ => return Err(Error::Unauthorized),
-    };
-    if prefix != PREFIX {
-        return Err(Error::Unauthorized);
-    }
-    let payload = B64.decode(payload_b64).map_err(|_| Error::Unauthorized)?;
-    let sig = B64.decode(sig_b64).map_err(|_| Error::Unauthorized)?;
-    signature(secret, &payload).verify_slice(&sig).map_err(|_| Error::Unauthorized)?;
-    let cap: Capability = serde_json::from_slice(&payload).map_err(|_| Error::Unauthorized)?;
+    let cap: Capability = erislogin::token::open(PREFIX, secret, token)?;
     let now = chrono::Utc::now().timestamp();
     if cap.exp.is_some_and(|exp| now >= exp) {
         return Err(Error::Unauthorized);

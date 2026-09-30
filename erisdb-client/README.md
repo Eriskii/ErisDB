@@ -74,7 +74,7 @@ fingerprint before approval. This example takes an already-persisted installatio
 key and returns the pairing result for the caller to save:
 
 ```rust
-use erisdb_client::{Cancel, Client, Pairing, Ticket};
+use erisdb_client::{Cancel, Client, Pairing, Ticket, APP};
 use std::time::Duration;
 
 async fn pair_ticket(
@@ -82,9 +82,12 @@ async fn pair_ticket(
     identity: [u8; 32],
     cancel: &Cancel,
 ) -> anyhow::Result<Pairing> {
-    let ticket = Ticket::parse(scanned)?;
-    let client = Client::dial(
-        ticket.endpoint_id()?,
+    let ticket = Ticket::parse(APP, scanned)?;
+    let server = ticket
+        .endpoint_addr()
+        .ok_or_else(|| anyhow::anyhow!("this ticket has no endpoint id"))?;
+    let client = Client::dial_addr(
+        server,
         &ticket.token,
         "Tasks (Rust)",
         Some(identity),
@@ -128,9 +131,11 @@ a different key cannot use, collect or renew its registered credentials.
   redemption returns 409. After a lost response, inspect the session state before
   deciding whether to submit again.
 
-`Client::dial` resolves a bare endpoint ID through Iroh discovery. A caller with a
-known `EndpointAddr` can dial that address directly. An Iroh client needs the
-ticket's `eid`; `Ticket::endpoint_id()` returns an error for a URL-only ticket.
+`Ticket` is [ErisLogin](https://github.com/Eriskii/ErisLogin)'s, read with this
+crate's `APP`. `Ticket::endpoint_addr()` gives the ticket's endpoint ID with any
+direct addresses it carries, so a device on the same network dials without waiting
+on discovery. It is `None` for a URL-only ticket, which an Iroh client cannot dial.
+`Client::dial` resolves a bare endpoint ID through Iroh discovery.
 
 Save pending enrollment and the key before sending redemption. If its response
 is lost, use `GET /v1/pair/status` through `Client::request` to inspect the raw state

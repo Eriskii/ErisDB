@@ -23,15 +23,11 @@ pub const ALPN: &[u8] = b"erisdb/0";
 const IROH_KEY_TAG: &[u8] = b"erisdb/iroh-endpoint-key/0";
 
 /// The endpoint's ed25519 key, derived deterministically from the
-/// deployment secret (HMAC-SHA256 as a KDF, domain-separated). Same
-/// secret → same endpoint id across restarts: clients hold one address
-/// forever, and the core stays stateless — no key file to lose.
+/// deployment secret. Same secret → same endpoint id across restarts:
+/// clients hold one address forever, and the core stays stateless — no key
+/// file to lose.
 fn derive_key(secret: &[u8]) -> iroh::SecretKey {
-    use hmac::{Hmac, Mac};
-    let mut mac = Hmac::<sha2::Sha256>::new_from_slice(secret).expect("hmac accepts any key length");
-    mac.update(IROH_KEY_TAG);
-    let bytes: [u8; 32] = mac.finalize().into_bytes().into();
-    iroh::SecretKey::from_bytes(&bytes)
+    erislogin::key::derive(secret, IROH_KEY_TAG)
 }
 
 /// The endpoint id a core with this secret serves under — the address

@@ -231,7 +231,7 @@ async fn main() -> Result<()> {
             let id = cut["id"].as_str().context("the core returned no pairing id")?.to_string();
             let code = cut["secret"].as_str().context("the core returned no code")?.to_string();
 
-            let ticket = erisdb::ticket::Ticket::new(code, eid, ticket_url, name)?;
+            let ticket = erislogin::ticket::Ticket::new(code, eid, ticket_url, name)?;
             if let Err(error) = erisdb::pair::run(&http, &base, &admin, &id, &ticket, token_ttl, qr_output.as_deref()).await {
                 let _ = http.post(format!("{base}/v1/pairings/{id}/deny")).bearer_auth(&admin).send().await;
                 return Err(error);

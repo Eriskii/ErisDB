@@ -814,6 +814,24 @@ fn now_secs() -> i64 {
         .as_secs() as i64
 }
 
+/// A pasted ticket is read by the rules every ErisDB client reads one by:
+/// a damaged ticket is refused before anything is dialed or written.
+#[tokio::test]
+async fn a_damaged_ticket_is_refused_before_anything_is_contacted() {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("session.json");
+    let ticket = format!("erisdb://pair/{}", URL_SAFE_NO_PAD.encode(serde_json::to_vec(
+        &json!({"v": 1, "url": "http://127.0.0.1:1", "eid": "too-short", "token": "erisdb1.a.b"})).unwrap()));
+    let out = Command::new(env!("CARGO_BIN_EXE_erisdb-mcp"))
+        .args(["pair", &ticket, "--session-file"]).arg(&path).args(["--grant", "tasks:read"])
+        .output().await.unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success());
+    assert!(stderr.contains("endpoint id must be 64 hex characters"), "{stderr}");
+    assert!(std::fs::read_dir(directory.path()).unwrap().next().is_none(), "the profile was touched");
+}
+
 #[tokio::test]
 async fn paired_mcp_renews_after_restart_and_stops_when_revoked() {
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};

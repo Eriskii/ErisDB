@@ -2,14 +2,11 @@
 //! Native installations prove possession of their Iroh key through QUIC.
 //! Browsers use a random 256-bit renewal secret over HTTPS, stored here only
 //! as its S256 commitment. Neither display names nor caller-supplied IDs
-//! authenticate an installation.
+//! authenticate an installation. [`Identity`] is [`erislogin`]'s.
 
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD as B64, Engine};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use sqlx::{types::Json, PgPool};
-use subtle::ConstantTimeEq;
 use uuid::Uuid;
 
 use crate::{auth::Capability, error::{Error, Result}, permission};
@@ -17,62 +14,11 @@ use crate::{auth::Capability, error::{Error, Result}, permission};
 pub const MAX_ACCESS_TTL: i64 = 7 * 86_400;
 pub const PROOF_HEADER: &str = "x-erisdb-client-proof";
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", content = "key", rename_all = "snake_case")]
-pub enum Identity {
-    Iroh(String),
-    Browser(String),
-}
+pub use erislogin::identity::Identity;
 
-impl Identity {
-    pub fn enrollment(peer: Option<&str>, challenge: Option<String>) -> Result<Self> {
-        if let Some(key) = peer.and_then(|p| p.strip_prefix("iroh:")) {
-            return Ok(Self::Iroh(key.to_string()));
-        }
-        private_hop(peer)?;
-        let challenge = challenge.ok_or_else(|| Error::BadRequest(
-            "browser pairing requires an S256 challenge from a random installation secret".into(),
-        ))?;
-        if !B64.decode(&challenge).is_ok_and(|bytes| bytes.len() == 32 && B64.encode(bytes) == challenge) {
-            return Err(Error::BadRequest("challenge must encode a SHA-256 digest as unpadded base64url".into()));
-        }
-        Ok(Self::Browser(challenge))
-    }
-
-    pub fn prove(&self, peer: Option<&str>, verifier: Option<&str>) -> Result<()> {
-        let valid = match self {
-            Self::Iroh(key) => peer.and_then(|p| p.strip_prefix("iroh:")) == Some(key),
-            Self::Browser(expected) => private_hop(peer).is_ok() && verifier
-                .filter(|v| (43..=128).contains(&v.len()) && v.bytes().all(|b| b.is_ascii_alphanumeric() || b"-._~".contains(&b)))
-                .map(|v| B64.encode(Sha256::digest(v.as_bytes())))
-                .is_some_and(|actual| actual.as_bytes().ct_eq(expected.as_bytes()).into()),
-        };
-        if valid { Ok(()) } else { Err(Error::Unauthorized) }
-    }
-
-    pub fn bind_access(&self, peer: Option<&str>) -> Result<()> {
-        match self {
-            Self::Iroh(_) => self.prove(peer, None),
-            Self::Browser(_) => private_hop(peer),
-        }
-    }
-
-    pub fn fingerprint(&self, session: Uuid, requested: &[String]) -> String {
-        let transcript = serde_json::to_vec(&("erisdb-pair-v1", session, self, requested)).expect("serializable transcript");
-        let digest = Sha256::digest(transcript);
-        format!("{:02X}{:02X}-{:02X}{:02X}-{:02X}{:02X}", digest[0], digest[1], digest[2], digest[3], digest[4], digest[5])
-    }
-}
-
-/// TLS terminates at a local reverse proxy. Trust the actual TCP peer,
-/// never forwarded headers that a direct caller can forge.
-fn private_hop(peer: Option<&str>) -> Result<()> {
-    if peer.and_then(|p| p.parse::<std::net::SocketAddr>().ok()).is_some_and(|p| p.ip().is_loopback()) {
-        Ok(())
-    } else {
-        Err(Error::Unauthorized)
-    }
-}
+/// The tag in every ErisDB pairing fingerprint, so that no other app's
+/// fingerprints match one of ours.
+pub const PAIR_DOMAIN: &str = "erisdb-pair-v1";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Version {

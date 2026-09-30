@@ -2261,7 +2261,7 @@ async fn terminal_qr_subset_and_client_management_work_end_to_end() {
         if pixel == '█' || (pixel == '▀' && y % 8 < 4) || (pixel == '▄' && y % 8 >= 4) { 255 } else { 0 }
     });
     assert_eq!(terminal_qr.detect_grids()[0].decode().unwrap().1, decoded);
-    let ticket = erisdb::ticket::Ticket::parse(&decoded).unwrap();
+    let ticket = erislogin::ticket::Ticket::parse(erisdb::APP, &decoded).unwrap();
     assert_eq!(ticket.url.as_deref(), Some(base.as_str()));
     let app = Client::new(&base, &ticket.token);
     let (status, request) = app.post("/v1/pair/redeem", json!({"client":"Scanned QR app", "requested":["tasks:read","tasks:create"]})).await;
@@ -2441,7 +2441,7 @@ async fn the_pairing_cli_reports_a_denial_conflict_as_failure() {
     let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
     let ticket = tokio::time::timeout(Duration::from_secs(10), async {
         while let Some(line) = lines.next_line().await.unwrap() {
-            if let Some(start) = line.find("erisdb://pair/") { return erisdb::ticket::Ticket::parse(&line[start..]).unwrap(); }
+            if let Some(start) = line.find("erisdb://pair/") { return erislogin::ticket::Ticket::parse(erisdb::APP, &line[start..]).unwrap(); }
         }
         panic!("CLI closed before emitting a ticket");
     }).await.unwrap();

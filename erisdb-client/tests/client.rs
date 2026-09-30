@@ -409,14 +409,14 @@ async fn the_blocking_facade_works_from_sync_code() {
 
 /// A ticket for this core, exactly as `erisdb pair` cuts one.
 fn ticket_for(code: &str) -> String {
-    erisdb::ticket::Ticket::new(
+    erisdb_client::Ticket::new(
         code.to_string(),
         Some(erisdb::net::endpoint_id(SECRET).to_string()),
         None,
         Some("my-laptop".into()),
     )
     .expect("a ticket")
-    .encode()
+    .encode(erisdb::APP)
     .expect("encode")
 }
 
@@ -483,7 +483,7 @@ async fn a_client_pairs_itself_and_a_human_decides_what_it_gets() {
     let (id, code) = cut_a_pairing(&op).await;
 
     // The code travels as a ticket; the client reads it back off the QR.
-    let ticket = erisdb_client::Ticket::parse(&ticket_for(&code)).expect("the ticket parses");
+    let ticket = erisdb_client::Ticket::parse(erisdb_client::APP, &ticket_for(&code)).expect("the ticket parses");
     assert_eq!(ticket.v, 1);
     assert_eq!(ticket.name.as_deref(), Some("my-laptop"));
     assert_eq!(ticket.token, code);
@@ -715,23 +715,27 @@ async fn the_blocking_pairing_poll_is_cancellable() {
 /// A ticket is read with what every platform already has, and refused
 /// loudly rather than half-stored. The good case is a ticket the core
 /// itself built.
-#[test]
-fn a_ticket_is_read_or_refused() {
+#[tokio::test]
+async fn a_ticket_is_read_or_refused() {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
     use base64::Engine;
+    use erisdb_client::{Ticket, APP};
+
+    // The client reads the scheme the core writes.
+    assert_eq!(APP, erisdb::APP);
 
     let eid = "e718b50236b0b98637fbf39cb4040e79800094313dc195e221e8e075304a6a06";
-    let good = erisdb::ticket::Ticket::new(
+    let good = Ticket::new(
         "erisdb1.payload.sig".into(),
         Some(eid.into()),
         Some("http://10.0.0.2:7700".into()),
         Some("my-laptop".into()),
     )
     .unwrap()
-    .encode()
+    .encode(erisdb::APP)
     .unwrap();
 
-    let t = erisdb_client::Ticket::parse(&format!("  {good}\n")).expect("whitespace is forgiven");
+    let t = Ticket::parse(APP, &format!("  {good}\n")).expect("whitespace is forgiven");
     assert_eq!(t.v, 1);
     assert_eq!(t.token, "erisdb1.payload.sig");
     assert_eq!(t.eid.as_deref(), Some(eid));
@@ -756,15 +760,18 @@ fn a_ticket_is_read_or_refused() {
         encode(json!({"v": 1, "token": "erisdb1.a.b", "eid": "too-short"})),
         encode(json!({"v": 1, "token": "erisdb1.a.b", "eid": "g".repeat(64)})),
     ] {
-        assert!(erisdb_client::Ticket::parse(&bad).is_err(), "accepted {bad:?}");
+        assert!(Ticket::parse(APP, &bad).is_err(), "accepted {bad:?}");
     }
 
     // A url-only ticket is legal, and this client says plainly that it
     // cannot dial one: it speaks QUIC and nothing else.
     let browser_only = encode(json!({"v": 1, "token": "erisdb1.a.b", "url": "http://10.0.0.2:7700"}));
-    let t = erisdb_client::Ticket::parse(&browser_only).expect("legal ticket");
-    assert_eq!(t.eid, None);
-    let refused = t.endpoint_id().unwrap_err().to_string();
+    let t = Ticket::parse(APP, &browser_only).expect("legal ticket");
+    assert!(t.endpoint_addr().is_none());
+    let refused = erisdb_client::pair(&t, "Tasks", &["tasks:read"], None, Duration::from_secs(1), &Cancel::new())
+        .await
+        .unwrap_err()
+        .to_string();
     assert!(refused.contains("endpoint id"), "{refused}");
 }
 
