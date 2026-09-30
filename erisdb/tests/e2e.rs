@@ -2527,3 +2527,37 @@ async fn invalid_facet_schemas_are_rejected_before_create_or_update_commits() {
     assert_eq!(feed["changes"].as_array().unwrap().len(), 1,
         "only the valid schema creation belongs in the change feed");
 }
+
+/// A plugin learns which registered installation called it — the one fact a
+/// caller cannot choose — and nothing at all about a caller with none.
+#[tokio::test]
+async fn a_plugin_is_told_which_installation_called_it() {
+    let pool = fresh_pool().await;
+    let directory = std::env::temp_dir().join(format!("erisdb-e2e-plugin-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&directory).unwrap();
+    std::fs::write(directory.join("echo.json"), serde_json::to_vec(&json!({
+        "protocol": 1, "name": "echo", "executable": "/bin/sh",
+        "args": ["-c", "IFS= read -r invocation\nprintf '%s\\n' '{\"protocol\":1,\"status\":200,\"content_type\":\"application/json\"}'\nprintf '%s' \"$invocation\""],
+        "environment": {}, "timeout_secs": 5,
+        "operations": {"call": {"permission": "echo:call", "request_schema": {"type": "object"}}}
+    })).unwrap()).unwrap();
+    let plugins = erisdb::PluginRegistry::load_dir(&directory).unwrap();
+    std::fs::remove_dir_all(&directory).unwrap();
+    let app = erisdb::app_with_plugins(pool, SECRET.to_vec(), plugins);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>()).await.unwrap();
+    });
+    let operator = Client::new(&url, &erisdb::auth::mint(SECRET, &["*"], Some(3600), None).unwrap());
+    let call = json!({"plugin": "echo", "operation": "call", "input": {}});
+
+    let (browser, id) = register_browser(&operator, &["echo:call"], 3600).await;
+    let (status, invocation) = browser.post("/v1/call", call.clone()).await;
+    assert_eq!(status, 200, "{invocation}");
+    assert_eq!(invocation["context"], json!({"installation": id}));
+
+    let (status, invocation) = operator.post("/v1/call", call).await;
+    assert_eq!(status, 200, "{invocation}");
+    assert_eq!(invocation["context"], json!({}), "a manual token names no installation");
+}

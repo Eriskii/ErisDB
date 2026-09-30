@@ -110,13 +110,16 @@ Stdin is one JSON line followed by EOF:
   "plugin": "openai",
   "operation": "chat.completions",
   "input": {"model": "…", "messages": []},
-  "context": {"user": "alice"}
+  "context": {"user": "alice", "installation": "ad6caf6b-ece2-442a-a178-a93cc5aa0802"}
 }
 ```
 
 `context.user` is present only when the caller's signed capability carries
-one. The process does not receive the capability or its grants; the core has
-already enforced the operation permission.
+one. `context.installation` is the registered installation that called, which
+the core has already authenticated, including through a token delegated from
+it; it is absent for manual tokens. The process does not receive the
+capability or its grants; the core has already enforced the operation
+permission.
 
 Stdout begins with one JSON line:
 

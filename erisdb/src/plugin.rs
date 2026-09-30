@@ -216,6 +216,7 @@ impl PluginRegistry {
             input,
             context: InvocationContext {
                 user: cap.user.as_deref(),
+                installation: cap.client,
             },
         };
         let mut payload = serde_json::to_vec(&invocation)
@@ -254,6 +255,10 @@ struct Invocation<'a> {
 struct InvocationContext<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     user: Option<&'a str>,
+    /// The registered installation that called, which the core has already
+    /// authenticated: a plugin may rely on it to say who is asking.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    installation: Option<uuid::Uuid>,
 }
 
 #[derive(Debug, Deserialize)]

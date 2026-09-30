@@ -1026,10 +1026,12 @@ sandbox. Complete installation examples are in [plugins.md](plugins.md).
 Stdin receives one JSON line then EOF:
 
 ```json
-{"protocol":1,"plugin":"example","operation":"echo","input":{"message":"hello"},"context":{"user":"alice"}}
+{"protocol":1,"plugin":"example","operation":"echo","input":{"message":"hello"},"context":{"user":"alice","installation":"ad6caf6b-ece2-442a-a178-a93cc5aa0802"}}
 ```
 
-`context.user` is omitted when the caller has no signed user label. Stdout starts
+`context.user` is omitted when the caller has no signed user label.
+`context.installation` names the authenticated registered installation that
+called, and is omitted for manual tokens. Stdout starts
 with one JSON header line, followed immediately by raw response bytes:
 
 ```text
