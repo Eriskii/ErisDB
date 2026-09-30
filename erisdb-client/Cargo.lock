@@ -1198,6 +1198,7 @@ dependencies = [
  "jni 0.21.1",
  "serde_json",
  "sqlx",
+ "tempfile",
  "testcontainers-modules",
  "tokio",
  "uuid",
@@ -1205,8 +1206,8 @@ dependencies = [
 
 [[package]]
 name = "erislogin"
-version = "0.3.1"
-source = "git+https://github.com/Eriskii/ErisLogin?tag=v0.3.1#320133a513abf068d3bf8b1d5f7fc1654b6348db"
+version = "0.4.1"
+source = "git+https://github.com/Eriskii/ErisLogin?tag=v0.4.1#973ad3699af7e7b782d1fc20c4bfb28081365017"
 dependencies = [
  "base64 0.22.1",
  "hmac 0.12.1",
@@ -4632,6 +4633,19 @@ name = "tagptr"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7b2093cf4c8eb1e67749a6762251bc9cd836b6fc171623bd0a9d324d37af2417"
+
+[[package]]
+name = "tempfile"
+version = "3.27.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
+dependencies = [
+ "fastrand",
+ "getrandom 0.4.3",
+ "once_cell",
+ "rustix",
+ "windows-sys 0.61.2",
+]
 
 [[package]]
 name = "testcontainers"

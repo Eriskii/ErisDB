@@ -1038,3 +1038,109 @@ async fn the_facade_serves_calls_while_a_subscription_is_parked() {
     parked.join().unwrap();
     erisdb_client::blocking::close_subscription(sub);
 }
+
+/// A stand-in for the device's ErisAuth, speaking its socket protocol: it
+/// cuts the pairing, hands over the ticket, checks that the redeemer is the
+/// app that asked, and answers as the person would. `granted` of `None` says no.
+async fn a_stand_in_erisauth(
+    op: Client,
+    addr: iroh::EndpointAddr,
+    granted: Option<Vec<String>>,
+) -> (tempfile::TempDir, std::path::PathBuf) {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("agent.sock");
+    let listener = tokio::net::UnixListener::bind(&path).unwrap();
+    tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let (read, mut write) = stream.into_split();
+        let mut line = String::new();
+        BufReader::new(read).read_line(&mut line).await.unwrap();
+        let ask: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(ask["service"], "erisdb");
+        let (id, code) = cut_a_pairing(&op).await;
+        let ticket = erisdb_client::Ticket::new(code, Some(addr.id.to_string()), None, Some("laptop".into()))
+            .unwrap()
+            .with_addrs(addr.ip_addrs().copied().collect())
+            .encode(erisdb_client::APP)
+            .unwrap();
+        write.write_all(format!("{}\n", json!({"ticket": ticket})).as_bytes()).await.unwrap();
+        let session = loop {
+            let (_, session) = op.request("GET", &format!("/v1/pairings/{id}"), None).await.unwrap();
+            if session["body"]["status"] == "requested" {
+                break session;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        assert_eq!(session["body"]["identity"], ask["identity"], "the app redeemed with the key it named");
+        let reply = match granted {
+            Some(granted) => {
+                answer(&op, &id, Some(&granted.iter().map(String::as_str).collect::<Vec<_>>())).await;
+                json!({"approved": granted})
+            }
+            None => {
+                answer(&op, &id, None).await;
+                json!({"denied": "the person said no"})
+            }
+        };
+        write.write_all(format!("{reply}\n").as_bytes()).await.unwrap();
+    });
+    (dir, path)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_app_signs_in_through_erisauth_with_one_call() {
+    let (_pg, addr, op) = a_core_to_pair_with().await;
+    let (_dir, socket) = a_stand_in_erisauth(op, addr.clone(), Some(vec!["tasks:read".into()])).await;
+    let key = [41u8; 32];
+    let (ticket, pairing) = erisdb_client::pair_via_erisauth_at(
+        &socket,
+        "Tasks (Linux)",
+        &["tasks:read", "tasks:create"],
+        key,
+        Duration::from_secs(60),
+        &Cancel::new(),
+    )
+    .await
+    .expect("signing in ran")
+    .expect("an ErisAuth was listening");
+    assert_eq!(ticket.endpoint_addr().unwrap().id, addr.id, "the app learns where the core is");
+    let Pairing::Approved { token, granted } = pairing else { panic!("{pairing:?}") };
+    assert_eq!(granted, ["tasks:read"]);
+    let signed_in = Client::dial_addr(addr, &token, "Tasks (Linux)", Some(key)).await.unwrap();
+    assert_eq!(signed_in.permissions().await.unwrap().grants, ["tasks:read"]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_no_through_erisauth_is_a_denial() {
+    let (_pg, addr, op) = a_core_to_pair_with().await;
+    let (_dir, socket) = a_stand_in_erisauth(op, addr, None).await;
+    let (_, pairing) = erisdb_client::pair_via_erisauth_at(
+        &socket,
+        "Tasks (Linux)",
+        &["tasks:read"],
+        [42u8; 32],
+        Duration::from_secs(60),
+        &Cancel::new(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(pairing, Pairing::Denied);
+}
+
+#[tokio::test]
+async fn without_erisauth_an_app_hears_none_and_pairs_by_ticket() {
+    let dir = tempfile::tempdir().unwrap();
+    let outcome = erisdb_client::pair_via_erisauth_at(
+        &dir.path().join("agent.sock"),
+        "Tasks (Linux)",
+        &["tasks:read"],
+        [43u8; 32],
+        Duration::from_secs(1),
+        &Cancel::new(),
+    )
+    .await
+    .unwrap();
+    assert!(outcome.is_none());
+}

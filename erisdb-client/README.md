@@ -144,6 +144,29 @@ means wait with the same identity. Successful collection is repeatable while the
 session remains live. `pairing_status()` maps both pending states to `Waiting`,
 so it cannot by itself distinguish whether resubmission is safe.
 
+### Signing in through ErisAuth
+
+On a device running [ErisAuth](https://github.com/Eriskii/ErisAuth), an app can skip the ticket.
+`pair_via_erisauth` asks ErisAuth for the app's grants, redeems the ticket it hands over with the
+app's key, and waits while the person answers on ErisAuth's screen:
+
+```rust
+use erisdb_client::{pair, pair_via_erisauth, Cancel, Pairing};
+use std::time::Duration;
+
+let cancel = Cancel::new();
+let wants = ["tasks:read", "tasks:create"];
+match pair_via_erisauth("Tasks (Linux)", &wants, identity, Duration::from_secs(300), &cancel).await? {
+    Some((ticket, Pairing::Approved { token, granted })) => { /* save ticket, token, key */ }
+    Some((_, other)) => { /* Denied, TimedOut or Cancelled */ }
+    None => { /* no ErisAuth here: show the scan-or-paste screen and use `pair` */ }
+}
+```
+
+The returned ticket names the core, which the app has not otherwise seen; save it with the token and
+the key, as after any pairing. The app's installation is its own, bound to its own key; nothing it
+does later passes through ErisAuth. Cancelling or timing out withdraws the request.
+
 ### Retries
 
 The client retries reads and failures it can identify as occurring before request

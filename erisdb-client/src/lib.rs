@@ -663,6 +663,67 @@ pub async fn pair(
     client.pair(client_name, requested, within, cancel).await
 }
 
+/// Sign in through the device's ErisAuth, when one runs here: ask it for
+/// `requested`, redeem the ticket it hands over with this app's `identity`
+/// key, and wait for the person's answer on ErisAuth's screen.
+///
+/// Returns the ticket, which says where the core is, with how pairing
+/// ended; save both, and the key, as after any pairing. `None` means no
+/// ErisAuth is listening, and the app pairs by a scanned or pasted ticket
+/// with [`pair`] instead. Cancelling or timing out withdraws the request.
+#[cfg(unix)]
+pub async fn pair_via_erisauth(
+    client_name: &str,
+    requested: &[&str],
+    identity: [u8; 32],
+    within: Duration,
+    cancel: &Cancel,
+) -> Result<Option<(Ticket, Pairing)>> {
+    match erislogin::agent::socket_path() {
+        Some(socket) => pair_via_erisauth_at(&socket, client_name, requested, identity, within, cancel).await,
+        None => Ok(None),
+    }
+}
+
+/// [`pair_via_erisauth`] with ErisAuth listening at `socket`.
+#[cfg(unix)]
+pub async fn pair_via_erisauth_at(
+    socket: &std::path::Path,
+    client_name: &str,
+    requested: &[&str],
+    identity: [u8; 32],
+    within: Duration,
+    cancel: &Cancel,
+) -> Result<Option<(Ticket, Pairing)>> {
+    use erislogin::agent::{Answer, Ask};
+    let Some(mut agent) = erislogin::agent::connect_to(socket).await? else { return Ok(None) };
+    let ask = Ask {
+        service: APP.to_string(),
+        client: client_name.to_string(),
+        requested: requested.iter().map(|s| s.to_string()).collect(),
+        identity: erislogin::identity::Identity::Iroh(SecretKey::from_bytes(&identity).public().to_string()),
+    };
+    let ticket = Ticket::parse(APP, &agent.ask(&ask).await?)?;
+    let server = ticket.endpoint_addr().ok_or_else(|| anyhow!("ErisAuth handed over a ticket with no endpoint id"))?;
+    let client = Client::dial_addr(server, &ticket.token, client_name, Some(identity)).await?;
+    client.redeem_pairing(client_name, requested).await?;
+
+    let deadline = Instant::now() + within;
+    let answer = tokio::select! {
+        answer = agent.answer() => answer?,
+        _ = tokio::time::sleep_until(deadline.into()) => return Ok(Some((ticket, Pairing::TimedOut))),
+        _ = async { while !cancel.sleep(Duration::from_secs(3600)).await {} } => {
+            return Ok(Some((ticket, Pairing::Cancelled)));
+        }
+    };
+    let pairing = match answer {
+        Answer::Denied(_) => Pairing::Denied,
+        // Approved: the credential is collected from the core, not from ErisAuth.
+        Answer::Approved(_) => client.await_pairing(deadline.saturating_duration_since(Instant::now()), cancel).await?,
+    };
+    Ok(Some((ticket, pairing)))
+}
+
 /// Percent-encode everything outside the unreserved set, so a facet name
 /// survives as one query value whatever characters it uses.
 fn urlencode(s: &str) -> String {

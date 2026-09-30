@@ -15,7 +15,7 @@ crate-type = ["lib", "cdylib"]
 [dependencies]
 anyhow = "1"
 base64 = "0.22"
-erislogin = { git = "https://github.com/Eriskii/ErisLogin", tag = "v0.3.1" }
+erislogin = { git = "https://github.com/Eriskii/ErisLogin", tag = "v0.4.1" }
 hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
@@ -31,3 +31,4 @@ erisdb = { path = "../erisdb" }
 sqlx = { version = "0.9", features = ["runtime-tokio", "tls-rustls", "postgres", "migrate"] }
 testcontainers-modules = { version = "0.15", features = ["postgres"] }
 uuid = { version = "1", features = ["v4"] }
+tempfile = "3"

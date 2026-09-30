@@ -47,6 +47,16 @@ A copied QR can race to request enrollment, so compare fingerprints rather than
 trusting a device name. After another installation has redeemed it, possessing
 the QR alone cannot collect its approval.
 
+## Through ErisAuth
+
+On a device running [ErisAuth](https://github.com/Eriskii/ErisAuth), an app asks ErisAuth instead of
+showing a ticket. ErisAuth, an installation of its own holding `meta:pairing:create` and
+`meta:pairing:approve`, cuts the pairing and hands the app the ticket over a local socket. The app
+redeems it as above, with its own identity. ErisAuth checks that the redeemer is the app that asked,
+puts the request to the person on its own screen, and approves it within its own grants, as any
+approver's grants bound what it approves. The Rust client does this in one call,
+`pair_via_erisauth`. The core sees an ordinary pairing and an ordinary approval.
+
 ## Ticket format
 
 The ticket URI is:
