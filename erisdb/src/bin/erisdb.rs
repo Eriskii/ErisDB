@@ -155,10 +155,20 @@ async fn main() -> Result<()> {
                 .context("connecting to the store")?;
             erisdb::MIGRATOR.run(&pool).await.context("migrating the store")?;
             let secret = secret.into_bytes();
-            let app = erisdb::app_with_plugins(pool, secret.clone(), plugins);
-
             let listener = tokio::net::TcpListener::bind(&listen).await?;
             let bound = listener.local_addr()?;
+            // Plugins run beside the core, so they reach it on loopback when
+            // it listens everywhere.
+            let mut reachable = bound;
+            if reachable.ip().is_unspecified() {
+                reachable.set_ip(match bound {
+                    std::net::SocketAddr::V4(_) => std::net::Ipv4Addr::LOCALHOST.into(),
+                    std::net::SocketAddr::V6(_) => std::net::Ipv6Addr::LOCALHOST.into(),
+                });
+            }
+            let plugins = plugins.reachable_at(&format!("http://{reachable}"));
+            let app = erisdb::app_with_plugins(pool, secret.clone(), plugins);
+
             tracing::info!("tcp: http://{bound}");
             if !bound.ip().is_loopback() {
                 tracing::warn!(

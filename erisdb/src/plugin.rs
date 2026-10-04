@@ -4,6 +4,12 @@
 //! Each call starts a fresh process, writes one invocation to stdin, streams
 //! its stdout into the HTTP response, and waits for it to exit. No invocation
 //! is recorded in Postgres and no plugin process survives the request.
+//!
+//! A plugin acts in ErisDB only with the grants its manifest names. Each
+//! call hands it a capability for exactly those, expiring with the call's
+//! timeout, and the core's address to use it at. The operator who installs
+//! the manifest approves those grants; nothing else does, and the plugin
+//! keeps nothing between calls.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -50,6 +56,9 @@ struct PluginManifest {
     environment: BTreeMap<String, bool>,
     #[serde(default = "default_timeout_secs")]
     timeout_secs: u64,
+    /// What the plugin may do in ErisDB on every call, whoever calls.
+    #[serde(default)]
+    grants: Vec<String>,
     operations: BTreeMap<String, OperationManifest>,
 }
 
@@ -73,6 +82,7 @@ struct Plugin {
     args: Vec<String>,
     environment: BTreeMap<String, bool>,
     timeout: Duration,
+    grants: Vec<String>,
     operations: BTreeMap<String, Operation>,
 }
 
@@ -90,6 +100,9 @@ struct Operation {
 pub struct PluginRegistry {
     plugins: Arc<BTreeMap<String, Plugin>>,
     slots: Arc<Semaphore>,
+    /// Where a plugin reaches this core with its capability, once the
+    /// core is listening.
+    core_url: Option<Arc<str>>,
 }
 
 impl Default for PluginRegistry {
@@ -103,6 +116,7 @@ impl PluginRegistry {
         Self {
             plugins: Arc::new(BTreeMap::new()),
             slots: Arc::new(Semaphore::new(MAX_PLUGIN_PROCESSES)),
+            core_url: None,
         }
     }
 
@@ -137,7 +151,15 @@ impl PluginRegistry {
         Ok(Self {
             plugins: Arc::new(plugins),
             slots: Arc::new(Semaphore::new(MAX_PLUGIN_PROCESSES)),
+            core_url: None,
         })
+    }
+
+    /// Tell plugins where this core listens, for the grants their
+    /// manifests name.
+    pub fn reachable_at(mut self, url: &str) -> Self {
+        self.core_url = Some(Arc::from(url.trim_end_matches('/')));
+        self
     }
 
     pub fn len(&self) -> usize {
@@ -178,6 +200,7 @@ impl PluginRegistry {
     /// stdout.
     pub async fn invoke(
         &self,
+        secret: &[u8],
         cap: &Capability,
         plugin_name: &str,
         operation_name: &str,
@@ -209,6 +232,23 @@ impl PluginRegistry {
             .try_acquire_owned()
             .map_err(|_| Error::Unavailable)?;
 
+        let erisdb = if plugin.grants.is_empty() {
+            None
+        } else {
+            let exp = crate::auth::deadline_from_now(plugin.timeout.as_secs() as i64)?;
+            let own = Capability {
+                grants: plugin.grants.clone(),
+                exp: Some(exp),
+                user: Some(format!("plugin:{}", plugin.name)),
+                max_exp: Some(exp),
+                pair: None,
+                client: None,
+            };
+            let url = self.core_url.as_deref().ok_or_else(|| {
+                Error::PluginUnavailable(format!("plugin {plugin_name:?} has grants, but no address to use them at"))
+            })?;
+            Some(CoreAccess { url, token: crate::auth::mint_capability(secret, &own)? })
+        };
         let invocation = Invocation {
             protocol: PLUGIN_PROTOCOL,
             plugin: plugin_name,
@@ -217,6 +257,7 @@ impl PluginRegistry {
             context: InvocationContext {
                 user: cap.user.as_deref(),
                 installation: cap.client,
+                erisdb,
             },
         };
         let mut payload = serde_json::to_vec(&invocation)
@@ -259,6 +300,16 @@ struct InvocationContext<'a> {
     /// authenticated: a plugin may rely on it to say who is asking.
     #[serde(skip_serializing_if = "Option::is_none")]
     installation: Option<uuid::Uuid>,
+    /// For a plugin whose manifest names grants: this core, and a
+    /// capability for exactly those grants that lapses with the call.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    erisdb: Option<CoreAccess<'a>>,
+}
+
+#[derive(Serialize)]
+struct CoreAccess<'a> {
+    url: &'a str,
+    token: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -309,6 +360,11 @@ fn compile_manifest(manifest: PluginManifest, path: &Path) -> anyhow::Result<Plu
         }
     }
 
+    if !manifest.grants.is_empty() {
+        crate::auth::check_grants(&manifest.grants, None)
+            .map_err(|e| anyhow::anyhow!("{}: grants: {e}", path.display()))?;
+    }
+
     let mut operations = BTreeMap::new();
     for (name, operation) in manifest.operations {
         check_operation_name(&name)
@@ -349,6 +405,7 @@ fn compile_manifest(manifest: PluginManifest, path: &Path) -> anyhow::Result<Plu
         args: manifest.args,
         environment: manifest.environment,
         timeout: Duration::from_secs(manifest.timeout_secs),
+        grants: manifest.grants,
         operations,
     })
 }

@@ -2541,11 +2541,11 @@ async fn a_plugin_is_told_which_installation_called_it() {
         "environment": {}, "timeout_secs": 5,
         "operations": {"call": {"permission": "echo:call", "request_schema": {"type": "object"}}}
     })).unwrap()).unwrap();
-    let plugins = erisdb::PluginRegistry::load_dir(&directory).unwrap();
-    std::fs::remove_dir_all(&directory).unwrap();
-    let app = erisdb::app_with_plugins(pool, SECRET.to_vec(), plugins);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
+    let plugins = erisdb::PluginRegistry::load_dir(&directory).unwrap().reachable_at(&url);
+    std::fs::remove_dir_all(&directory).unwrap();
+    let app = erisdb::app_with_plugins(pool, SECRET.to_vec(), plugins);
     tokio::spawn(async move {
         axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>()).await.unwrap();
     });

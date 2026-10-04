@@ -9,7 +9,9 @@ stdout to the client, and waits for the process to exit.
 Plugin calls do **not** read or write Postgres. There is no job row, queue,
 conversation, retry, callback, or plugin-owned state in the core. If the
 core or connection dies, that invocation dies. The caller decides whether
-to make another request.
+to make another request. A plugin whose manifest names [grants](#acting-in-erisdb)
+reads and writes through the ordinary API, as any client does, with a
+capability that lasts one call.
 
 The core holds only deployment-derived configuration while it runs: the
 manifests loaded at startup and a semaphore bounding child processes. A
@@ -60,8 +62,8 @@ external `$ref` values are refused.
 The environment map is an allowlist over an otherwise empty child
 environment. `true` means the variable is required at invocation time;
 `false` means it is copied only when present. Values never belong in the
-manifest. A plugin receives no capability token and no undeclared core
-secret.
+manifest. A plugin receives no undeclared core secret, and no capability
+unless its manifest names grants.
 
 Manifests are machine configuration, not database content. Installing or
 changing one is an operator action followed by a core restart. This is
@@ -100,6 +102,35 @@ from the executable. A JSON plugin can return JSON. A streaming plugin can
 return `text/event-stream`; bytes are forwarded as they arrive rather than
 buffered until exit.
 
+## Acting in ErisDB
+
+A plugin that needs to read or change what ErisDB holds names the grants it
+needs in its manifest:
+
+```json
+{
+  "protocol": 1,
+  "name": "digest",
+  "executable": "/usr/local/libexec/erisdb/erisdb-plugin-digest",
+  "grants": ["notes:read", "digest:*"],
+  "operations": { … }
+}
+```
+
+Every call then hands the plugin, in `context.erisdb`, the core's own
+address and a capability holding exactly those grants. It expires when the
+call's `timeout_secs` would end and cannot be renewed past that, it is
+signed for the user `plugin:<name>`, so what the plugin writes says so,
+and it belongs to no installation. The plugin uses it over HTTP like any
+other token and keeps nothing between calls: there is no pairing, no stored
+credential and no setup step. Installing the manifest is the operator's
+approval of those grants, as installing the executable is of the code.
+
+The grants apply on every call, whoever calls. The operation's permission
+decides who may call; deciding whether to act for that caller is the
+plugin's job. The core tells plugins its address once it listens: loopback
+when it listens on every interface.
+
 ## Process protocol v1
 
 Stdin is one JSON line followed by EOF:
@@ -118,8 +149,10 @@ Stdin is one JSON line followed by EOF:
 one. `context.installation` is the registered installation that called, which
 the core has already authenticated, including through a token delegated from
 it; it is absent for manual tokens. The process does not receive the
-capability or its grants; the core has already enforced the operation
-permission.
+caller's capability or its grants; the core has already enforced the
+operation permission. A plugin whose manifest names grants also receives
+`"erisdb": {"url": "http://127.0.0.1:7700", "token": "erisdb1.…"}` in
+`context`: see [Acting in ErisDB](#acting-in-erisdb).
 
 Stdout begins with one JSON line:
 

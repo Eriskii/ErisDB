@@ -58,15 +58,20 @@ struct Server {
 impl Server {
     async fn start(script: &str, timeout: u64) -> Self {
         let directory = Directory::new();
-        directory.write(&directory.manifest(script, timeout));
-        let registry = erisdb::PluginRegistry::load_dir(&directory.0).unwrap();
+        let manifest = directory.manifest(script, timeout);
+        Self::start_with(directory, &manifest).await
+    }
+
+    async fn start_with(directory: Directory, manifest: &Value) -> Self {
+        directory.write(manifest);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let registry = erisdb::PluginRegistry::load_dir(&directory.0).unwrap().reachable_at(&base);
         let pool = PgPoolOptions::new()
             .acquire_timeout(Duration::from_millis(100))
             .connect_lazy("postgres://postgres:postgres@127.0.0.1:1/erisdb")
             .unwrap();
         let app = erisdb::app_with_plugins(pool, SECRET.to_vec(), registry);
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let base = format!("http://{}", listener.local_addr().unwrap());
         let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         Self { directory, base, http: reqwest::Client::new(), task }
     }
@@ -220,16 +225,47 @@ exit 9
     server.reaped().await;
 }
 
+/// A plugin's manifest names what it may do in ErisDB, and each call hands it
+/// a capability for exactly that, which lapses when the call may last no
+/// longer. Installing the manifest is the operator's approval.
+#[tokio::test]
+async fn a_plugin_with_grants_acts_in_erisdb_with_exactly_those_for_one_call() {
+    let directory = Directory::new();
+    let mut manifest = directory.manifest(ECHO, 5);
+    manifest["grants"] = json!(["notes:read", "meta:pairing:approve"]);
+    let server = Server::start_with(directory, &manifest).await;
+    let before = chrono::Utc::now().timestamp();
+    let invocation: Value = server.call().await.json().await.unwrap();
+    let erisdb = &invocation["context"]["erisdb"];
+    assert_eq!(erisdb["url"], server.base.as_str(), "the plugin is told where the core is");
+    let token = erisdb["token"].as_str().unwrap();
+
+    let cap = erisdb::auth::verify(SECRET, token).unwrap();
+    assert_eq!(cap.grants, ["notes:read", "meta:pairing:approve"]);
+    assert_eq!(cap.user.as_deref(), Some("plugin:echo"), "what it writes is the plugin's");
+    assert_eq!(cap.client, None, "it is no installation");
+    let exp = cap.exp.unwrap();
+    assert!(exp > before && exp <= before + 6, "it lasts as long as the call may: {exp} vs {before}");
+    assert_eq!(cap.max_exp, Some(exp), "and cannot be renewed past it");
+
+    let held: Value = server.http.get(format!("{}/v1/permissions", server.base))
+        .bearer_auth(token).send().await.unwrap().json().await.unwrap();
+    assert_eq!(held["grants"], json!(["notes:read", "meta:pairing:approve"]));
+    server.reaped().await;
+}
+
 #[tokio::test]
 async fn invalid_deployment_manifests_fail_the_real_server_startup() {
     let directory = Directory::new();
     let original = directory.manifest(ECHO, 5);
-    for (pointer, value) in [
-        ("/operations/call/permission", json!("other:call")),
-        ("/operations/call/request_schema", json!({"$ref": "https://example.com/schema.json"})),
+    for (field, value, complaint) in [
+        ("/operations/call/permission", json!("other:call"), "namespace"),
+        ("/operations/call/request_schema", json!({"$ref": "https://example.com/schema.json"}), "outside the document"),
+        ("/grants", json!(["Not A Grant"]), "grant"),
     ] {
         let mut manifest = original.clone();
-        *manifest.pointer_mut(pointer).unwrap() = value;
+        let (parent, key) = field.rsplit_once('/').unwrap();
+        manifest.pointer_mut(parent).unwrap()[key] = value;
         directory.write(&manifest);
         let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_erisdb"))
             .args(["serve", "--database-url", "postgres://postgres:postgres@127.0.0.1:1/erisdb",
@@ -237,6 +273,6 @@ async fn invalid_deployment_manifests_fail_the_real_server_startup() {
             .arg(&directory.0).output().await.unwrap();
         assert!(!output.status.success());
         let error = String::from_utf8_lossy(&output.stderr);
-        assert!(error.contains("namespace") || error.contains("outside the document"), "{error}");
+        assert!(error.contains(complaint), "{error}");
     }
 }

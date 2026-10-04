@@ -377,7 +377,7 @@ async fn call_plugin(
     cap: Capability,
     Json(call): Json<PluginCall>,
 ) -> Result<axum::response::Response> {
-    st.plugins.invoke(&cap, &call.plugin, &call.operation, call.input).await
+    st.plugins.invoke(&st.secret, &cap, &call.plugin, &call.operation, call.input).await
 }
 
 #[derive(Deserialize)]

@@ -1014,6 +1014,7 @@ loaded with `erisdb serve --plugin-dir DIR` has these fields:
 | `args` | Default empty array | String arguments passed to the executable |
 | `environment` | Default empty map | Environment-name → boolean; true required, false optional; values come from the service environment |
 | `timeout_secs` | Default 600 | Integer 1–3600 |
+| `grants` | Default empty array | What the plugin may do in ErisDB on every call; see below |
 | `operations` | Required nonempty object | Operation name → `{description?, permission, request_schema}` |
 
 Operation permissions must be concrete, under the plugin's namespace, with no
@@ -1031,7 +1032,11 @@ Stdin receives one JSON line then EOF:
 
 `context.user` is omitted when the caller has no signed user label.
 `context.installation` names the authenticated registered installation that
-called, and is omitted for manual tokens. Stdout starts
+called, and is omitted for manual tokens. For a manifest with `grants`,
+`context.erisdb` is `{"url": …, "token": …}`: the core's address and a
+capability holding exactly those grants, signed for user `plugin:<name>`,
+belonging to no installation, and expiring with the call's timeout, with no
+renewal past it. Stdout starts
 with one JSON header line, followed immediately by raw response bytes:
 
 ```text
