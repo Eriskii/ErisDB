@@ -6,6 +6,14 @@
     <!-- A due date passing is worth interrupting someone for. -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
+    <!-- ErisAuth signs this app in when it is installed. Android shows an
+         app only the services it says it looks for. -->
+    <queries>
+        <intent>
+            <action android:name="dev.eris.auth.SIGN_IN" />
+        </intent>
+    </queries>
+
     <!--
       allowBackup="false" — nothing this app holds belongs in Google's
       cloud or on a device-to-device transfer. The capability token and

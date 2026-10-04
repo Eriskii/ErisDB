@@ -18,6 +18,7 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.ContentPaste
 import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.ExpandMore
+import androidx.compose.material.icons.filled.Key
 import androidx.compose.material.icons.filled.QrCodeScanner
 import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material.icons.filled.VisibilityOff
@@ -46,7 +47,9 @@ import androidx.compose.ui.unit.dp
 /**
  * The front door: how this phone learns which erisdb it belongs to.
  *
- * Three ways in, in the order they are worth using. Scanning is first
+ * With ErisAuth on this phone, the first way in is asking it: the person
+ * approves in ErisAuth's notification and never handles a ticket. Then
+ * three ways in by ticket, in the order they are worth using. Scanning is first
  * because the phone already owns a camera app that reads QR codes and
  * opens the URI it finds — so `erisdb pair` shows a code and the scan lands
  * straight in here, with no scanner embedded, no camera permission asked
@@ -65,6 +68,7 @@ fun PairingScreen(
     connecting: Boolean,
     onTicket: (String) -> Unit,
     onManual: (String, String) -> Unit,
+    onErisAuth: (() -> Unit)?,
     onBack: (() -> Unit)?,
 ) {
     SecureWindow()
@@ -103,14 +107,16 @@ fun PairingScreen(
                 connecting = connecting,
                 onTicket = onTicket,
                 onManual = onManual,
+                onErisAuth = onErisAuth,
             )
         }
     }
 }
 
 /**
- * The three ways to pair, as one block — the same block on the front door
- * and in settings, because re-pairing is pairing.
+ * The ways to pair, as one block — the same block on the front door and in
+ * settings, because re-pairing is pairing. [onErisAuth] is null when
+ * ErisAuth is not installed here.
  */
 @Composable
 fun PairingPanel(
@@ -121,6 +127,7 @@ fun PairingPanel(
     connecting: Boolean,
     onTicket: (String) -> Unit,
     onManual: (String, String) -> Unit,
+    onErisAuth: (() -> Unit)?,
 ) {
     var codeField by remember { mutableStateOf("") }
     var manual by remember { mutableStateOf(false) }
@@ -133,6 +140,29 @@ fun PairingPanel(
             "Paired with ${coreName.ifBlank { server.take(12) + "…" }}",
             style = MaterialTheme.typography.bodyLarge,
         )
+    }
+
+    // ErisAuth, when it is here: no ticket to handle at all.
+    if (onErisAuth != null) {
+        Card(colors = CardDefaults.cardColors(MaterialTheme.colorScheme.primaryContainer)) {
+            Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Icons.Filled.Key, contentDescription = null)
+                    Text(
+                        "Sign in with ErisAuth",
+                        style = MaterialTheme.typography.titleSmall,
+                        modifier = Modifier.padding(start = 10.dp),
+                    )
+                }
+                Text(
+                    "ErisAuth on this phone asks you to approve this app, then signs it in " +
+                        "to the ErisDB it belongs to.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Button(onClick = onErisAuth, enabled = !connecting) { Text("Ask ErisAuth") }
+            }
+        }
     }
 
     // 1 — scan.

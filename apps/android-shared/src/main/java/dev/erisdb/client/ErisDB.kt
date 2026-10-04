@@ -22,6 +22,8 @@ object ErisDB {
 
     private external fun nativeRefreshCapability(ttlSecs: Long): String
 
+    private external fun nativeEndpointId(identityHex: String): String
+
     /** Returns null on success, an error message otherwise. */
     fun configure(server: String, token: String, clientName: String, identityHex: String): String? =
         nativeConfigure(server, token, clientName, identityHex).ifEmpty { null }
@@ -29,6 +31,10 @@ object ErisDB {
     /** Response envelope: {"status": n, "body": …} or {"status": 0, "error": …}. */
     fun request(method: String, path: String, body: String? = null): JSONObject =
         JSONObject(nativeRequest(method, path, body))
+
+    /** The endpoint id this identity dials as, in hex — the key an app names
+     * to ErisAuth — or null when the identity is not 64 hex characters. */
+    fun endpointId(identityHex: String): String? = nativeEndpointId(identityHex).ifEmpty { null }
 
     /** Trade the current token for one with the same scope and a fresh
      * expiry. Envelope: {"ok":true,"token":…} or {"ok":false,"error":…}.

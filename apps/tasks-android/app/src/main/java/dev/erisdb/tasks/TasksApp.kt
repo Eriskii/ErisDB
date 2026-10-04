@@ -19,6 +19,7 @@ import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -85,6 +86,8 @@ fun TasksApp(pairUri: String? = null, onPairHandled: () -> Unit = {}) {
     val ctx = LocalContext.current
     val store = remember { Store(ctx) }
     val gate = remember { SyncGate() }
+    // ErisAuth on this phone, when it is installed: a way past the front door.
+    val erisAuth = remember { ErisAuthSignIn(ctx) }
 
     var server by remember { mutableStateOf(store.server) }
     var token by remember { mutableStateOf(store.token) }
@@ -119,6 +122,8 @@ fun TasksApp(pairUri: String? = null, onPairHandled: () -> Unit = {}) {
     // Why the last ticket was refused. Loud, because a ticket that cannot
     // be read is a ticket that changed nothing.
     var refused by remember { mutableStateOf<String?>(null) }
+    // Whether the ticket being redeemed came from ErisAuth, where the person approves it.
+    var viaErisAuth by remember { mutableStateOf(false) }
     var syncTick by remember { mutableStateOf(0) }
     var connectTick by remember { mutableStateOf(0) }
     // Advances every poll so "today 14:00" and the overdue colouring stay
@@ -196,12 +201,39 @@ fun TasksApp(pairUri: String? = null, onPairHandled: () -> Unit = {}) {
      * that would replace a working config is asked about first; one that
      * cannot be read says what was wrong with it and changes nothing.
      */
-    fun takeTicket(text: String) {
+    fun takeTicket(text: String, fromErisAuth: Boolean = false) {
+        // A ticket the person brought supersedes asking ErisAuth.
+        if (!fromErisAuth) erisAuth.stop()
+        viaErisAuth = fromErisAuth
         when (val landed = arrival(text, store.server, store.token)) {
             is Arrival.Refused -> refused = landed.reason
             is Arrival.Pair -> beginPairing(landed.ticket)
             is Arrival.Confirm -> confirming = landed
         }
+    }
+
+    /**
+     * Ask ErisAuth on this phone to sign this app in. Its ticket is taken
+     * like a scanned one; a refusal is said on the pairing screen, where
+     * pairing by ticket is still there.
+     */
+    fun askErisAuth() {
+        val key = ErisDB.endpointId(store.identityHex())
+            ?: return run { status = "this app's key cannot be read · pair with a code" }
+        status = "asking ErisAuth…"
+        erisAuth.ask(CLIENT, MANIFEST, key) { event ->
+            when (event) {
+                is SignIn.Ticket -> takeTicket(event.text, fromErisAuth = true)
+                is SignIn.Declined -> if (redeeming == null) status = event.why
+            }
+        }
+    }
+
+    /** Stop waiting for a person and go back to the front door. */
+    fun leaveWaiting() {
+        erisAuth.stop()
+        redeeming = null
+        screen = Screen.Pairing
     }
 
     /** Durable-first mutation: commit to the outbox, show it, then sync. */
@@ -362,6 +394,7 @@ fun TasksApp(pairUri: String? = null, onPairHandled: () -> Unit = {}) {
         }
         if (approval is Approval.Approved) {
             redeeming = null
+            erisAuth.finish()
             take(moved)
         }
     }
@@ -375,7 +408,11 @@ fun TasksApp(pairUri: String? = null, onPairHandled: () -> Unit = {}) {
         ) {
             askToNotify.launch(Manifest.permission.POST_NOTIFICATIONS)
         }
-        if (launch(server, token) is Launch.Resume) connect()
+        when (launch(server, token)) {
+            is Launch.Resume -> connect()
+            // Unpaired, and not opened with a ticket: ErisAuth first, when it is here.
+            is Launch.Pair -> if (pairUri == null && erisAuth.installed) askErisAuth()
+        }
         while (true) {
             delay(10_000)
             nowMs = System.currentTimeMillis()
@@ -410,10 +447,8 @@ fun TasksApp(pairUri: String? = null, onPairHandled: () -> Unit = {}) {
 
     // Waiting is part of the front door, so back goes to it rather than
     // to a tasks screen this phone may not have earned yet.
-    BackHandler(enabled = screen == Screen.Waiting) {
-        redeeming = null
-        screen = Screen.Pairing
-    }
+    BackHandler(enabled = screen == Screen.Waiting) { leaveWaiting() }
+    DisposableEffect(Unit) { onDispose { erisAuth.stop() } }
 
     // Sub-screens slide in from the right; going back slides them out.
     fun depth(s: Screen) =
@@ -476,6 +511,7 @@ fun TasksApp(pairUri: String? = null, onPairHandled: () -> Unit = {}) {
             grants = grants,
             onTicket = { takeTicket(it) },
             onConnect = { newServer, newToken -> adopt(newServer, newToken, null) },
+            onErisAuth = if (erisAuth.installed) ::askErisAuth else null,
             onBack = { screen = Screen.Main },
         )
         is Screen.Pairing -> PairingScreen(
@@ -486,14 +522,16 @@ fun TasksApp(pairUri: String? = null, onPairHandled: () -> Unit = {}) {
             connecting = connecting,
             onTicket = { takeTicket(it) },
             onManual = { newServer, newToken -> adopt(newServer, newToken, null) },
+            onErisAuth = if (erisAuth.installed) ::askErisAuth else null,
             onBack = null,
         )
         is Screen.Waiting -> WaitingScreen(
             coreName = redeeming?.name ?: coreName,
             state = approval,
             requested = MANIFEST,
-            onCancel = { redeeming = null; screen = Screen.Pairing },
-            onBack = { redeeming = null; screen = Screen.Pairing },
+            viaErisAuth = viaErisAuth,
+            onCancel = ::leaveWaiting,
+            onBack = ::leaveWaiting,
         )
         }
     }
@@ -534,7 +572,7 @@ fun TasksApp(pairUri: String? = null, onPairHandled: () -> Unit = {}) {
                 }) { Text(if (pending.sameCore) "Pair again" else "Replace") }
             },
             dismissButton = {
-                TextButton(onClick = { confirming = null }) { Text("Keep $here") }
+                TextButton(onClick = { confirming = null; erisAuth.stop() }) { Text("Keep $here") }
             },
         )
     }

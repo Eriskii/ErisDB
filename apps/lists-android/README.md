@@ -204,6 +204,14 @@ screen, the first thing an unpaired phone sees, repeated in Settings for
 re-pairing. Settings names the core it is paired with, from the ticket's
 `name`.
 
+With [ErisAuth](https://github.com/Eriskii/ErisAuth) installed on the phone, an unpaired app asks it
+first, and the pairing screen and Settings offer **Ask ErisAuth**. The app binds ErisAuth's
+`dev.eris.auth.SIGN_IN` service, asks for its manifest under its own name and Iroh key, and takes
+the ticket ErisAuth hands back like a scanned one. The person approves in ErisAuth's notification,
+and the app collects its token from the core as above. Without ErisAuth, or when it says no, the
+app pairs by ticket. The app's half of ErisAuth's protocol is in `android-shared`
+(`dev.eris.auth.client`), and `SignIn.kt` is the conversation.
+
 A ticket is read all-or-nothing. No `erisdb://pair/` prefix, a payload
 that is not base64url, a `v` this app does not know, neither `eid` nor
 `url`, an `eid` that is not 64 hex characters, no token: each is refused

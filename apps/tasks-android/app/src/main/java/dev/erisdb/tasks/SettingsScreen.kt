@@ -40,6 +40,7 @@ fun SettingsScreen(
     grants: Grants,
     onTicket: (String) -> Unit,
     onConnect: (String, String) -> Unit,
+    onErisAuth: (() -> Unit)?,
     onBack: () -> Unit,
 ) {
     SecureWindow()
@@ -75,6 +76,7 @@ fun SettingsScreen(
                 connecting = connecting,
                 onTicket = onTicket,
                 onManual = onConnect,
+                onErisAuth = onErisAuth,
             )
         }
     }

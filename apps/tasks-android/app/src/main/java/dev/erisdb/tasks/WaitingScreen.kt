@@ -35,6 +35,7 @@ fun WaitingScreen(
     coreName: String,
     state: Approval,
     requested: List<String>,
+    viaErisAuth: Boolean,
     onCancel: () -> Unit,
     onBack: () -> Unit,
 ) {
@@ -58,12 +59,16 @@ fun WaitingScreen(
                 }
                 Text(
                     if (state is Approval.Pending) "Connecting to send this app’s permission request."
+                    else if (viaErisAuth) "This app has asked $there for permission through " +
+                        "ErisAuth. Approve it in ErisAuth's notification on this phone."
                     else "This app has asked $there for permission. Approve it there — in " +
                         "the erisdb pair terminal, or any app that can approve pairings.",
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
-                if (state is Approval.Waiting && state.fingerprint != null) {
+                // ErisAuth handed this ticket over on this phone and checks the key
+                // that redeems it, so there is no second screen to compare with.
+                if (state is Approval.Waiting && state.fingerprint != null && !viaErisAuth) {
                     Text("Compare ${state.fingerprint} with the terminal before approving.",
                         style = MaterialTheme.typography.titleMedium)
                 }
@@ -80,8 +85,9 @@ fun WaitingScreen(
 
             is Approval.Denied -> Ending(
                 title = "$there said no",
-                body = "Nothing was granted and nothing was stored. Cut another code " +
-                    "with erisdb pair when you want to try again.",
+                body = "Nothing was granted and nothing was stored. " +
+                    if (viaErisAuth) "Ask ErisAuth again, or pair with a code from erisdb pair."
+                    else "Cut another code with erisdb pair when you want to try again.",
                 onBack = onBack,
             )
 

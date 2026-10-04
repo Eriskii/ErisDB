@@ -60,6 +60,21 @@ pub extern "system" fn Java_dev_erisdb_client_ErisDB_nativeConfigure(
     out(&mut env, &message)
 }
 
+/// The endpoint id an identity dials as, in hex; "" when the identity is
+/// not 64 hex characters.
+#[no_mangle]
+pub extern "system" fn Java_dev_erisdb_client_ErisDB_nativeEndpointId(
+    mut env: JNIEnv,
+    _class: JClass,
+    identity_hex: JString,
+) -> jstring {
+    let id = guard(
+        || crate::blocking::endpoint_id(&jstr(&mut env, &identity_hex)).unwrap_or_default(),
+        |_| String::new(),
+    );
+    out(&mut env, &id)
+}
+
 /// One API call; returns the blocking facade's JSON envelope.
 #[no_mangle]
 pub extern "system" fn Java_dev_erisdb_client_ErisDB_nativeRequest(

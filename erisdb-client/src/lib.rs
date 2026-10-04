@@ -950,6 +950,13 @@ pub mod blocking {
         Some(out)
     }
 
+    /// The endpoint id an identity dials as, in hex: what an app names to
+    /// ErisAuth as the key it will redeem with. `None` for anything but
+    /// 64 hex characters.
+    pub fn endpoint_id(identity_hex: &str) -> Option<String> {
+        decode_identity_hex(identity_hex).map(|secret| SecretKey::from_bytes(&secret).public().to_string())
+    }
+
     /// The status of a refusal, or 0 when the failure was the transport's.
     fn status_of(error: &anyhow::Error) -> u16 {
         error.downcast_ref::<Refused>().map_or(0, |refused| refused.status)
@@ -1266,6 +1273,16 @@ pub mod blocking {
             assert_eq!(*lock(&m), vec!["before"]);
             lock(&m).push("after");
             assert_eq!(*lock(&m), vec!["before", "after"]);
+        }
+
+        /// What an app tells ErisAuth it will redeem with: the endpoint id
+        /// its identity dials as.
+        #[test]
+        fn an_identity_names_the_endpoint_it_dials_as() {
+            let secret = [7u8; 32];
+            let hex: String = secret.iter().map(|b| format!("{b:02x}")).collect();
+            assert_eq!(endpoint_id(&hex), Some(SecretKey::from_bytes(&secret).public().to_string()));
+            assert_eq!(endpoint_id("not hex"), None);
         }
     }
 }

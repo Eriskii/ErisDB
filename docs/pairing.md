@@ -55,7 +55,9 @@ showing a ticket. ErisAuth, an installation of its own holding `meta:pairing:cre
 redeems it as above, with its own identity. ErisAuth checks that the redeemer is the app that asked,
 puts the request to the person on its own screen, and approves it within its own grants, as any
 approver's grants bound what it approves. The Rust client does this in one call,
-`pair_via_erisauth`. The core sees an ordinary pairing and an ordinary approval.
+`pair_via_erisauth`. On Android, ErisAuth is a bound service instead of a socket, and the Tasks and
+Lists apps ask it before showing their pairing screen (`apps/android-shared`, `SignIn.kt`). The
+core sees an ordinary pairing and an ordinary approval.
 
 ## Ticket format
 
