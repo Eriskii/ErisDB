@@ -38,7 +38,7 @@ def containers(directory):
 
 
 class Session:
-    def __init__(self, directory, port, terminal=False, **env):
+    def __init__(self, directory, port, terminal=False, cwd=None, **env):
         self.port = port
         self.buffer = b""
         self.terminal = None
@@ -51,7 +51,7 @@ class Session:
                        "preexec_fn": lambda: fcntl.ioctl(0, termios.TIOCSCTTY, 0)}
         self.process = subprocess.Popen(
             [sys.executable, SCRIPT, "--data-dir", directory, "--port", str(port)],
-            stdin=incoming, stdout=outgoing, stderr=subprocess.STDOUT,
+            stdin=incoming, stdout=outgoing, stderr=subprocess.STDOUT, cwd=cwd,
             env={**os.environ, **env}, **options)
         if terminal:
             os.close(slave)
@@ -235,6 +235,35 @@ class LauncherTests(unittest.TestCase):
             session.write("exit\n")
             self.assertEqual(session.process.wait(timeout=90), 0)
             self.assertEqual(containers(base / "db"), [])
+
+    def test_inside_another_project_it_builds_as_locked_and_loads_its_plugins(self):
+        # A checkout inside a workspace whose Cargo configuration patches
+        # dependencies (here, to somewhere that does not exist) still builds
+        # exactly what its lockfile names.
+        with tempfile.TemporaryDirectory(prefix="erisdb-launcher-nested-") as temporary, ExitStack() as resources:
+            outer = Path(temporary)
+            resources.callback(subprocess.run, ["docker", "run", "--rm", "--volume", f"{outer}:/cleanup",
+                "--entrypoint", "chown", "postgres:17-alpine", "-R", f"{os.getuid()}:{os.getgid()}",
+                "/cleanup"], check=True, capture_output=True)
+            (outer / ".cargo").mkdir()
+            (outer / ".cargo/config.toml").write_text('[patch.crates-io]\nserde = { path = "nowhere" }\n')
+            directory = outer / "db"
+            (directory / "plugins").mkdir(parents=True)
+            (directory / "plugins/echo.json").write_text(json.dumps({
+                "protocol": 1, "name": "echo", "description": "Answers with what it was given",
+                "executable": "/bin/sh", "args": ["-c", "cat"], "environment": {}, "timeout_secs": 10,
+                "operations": {"say": {"description": "Say it back", "permission": "echo:say",
+                                       "request_schema": {"type": "object"}}}}))
+            session = Session(directory, unused_port(), cwd=outer)
+            resources.callback(session.close)
+            started = session.read_until("erisdb> ", timeout=600)
+            self.assertIn(f"Plugins: {directory / 'plugins'}", started)
+            token = re.search(r"erisdb1\.[\w-]+\.[\w-]+", session.cli("mint --grant '*' --ttl 3600")).group()
+            plugins = session.api("GET", "/v1/plugins", token)["plugins"]
+            self.assertEqual([plugin["name"] for plugin in plugins], ["echo"])
+            session.write("exit\n")
+            self.assertEqual(session.process.wait(timeout=90), 0)
+            self.assertEqual(containers(directory), [])
 
     def test_occupied_port_leaves_existing_listener_alone(self):
         with tempfile.TemporaryDirectory(prefix="erisdb-launcher-port-") as temporary, socket.socket() as listener:

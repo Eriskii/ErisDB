@@ -163,10 +163,16 @@ def launch(args, resources):
     except BlockingIOError:
         raise RuntimeError(f"Another launcher is already using {directory}") from None
     config = configuration(directory)
-    print(f"Data and keys: {directory}", flush=True)
-    # Build this checkout, retaining Cargo's incremental build cache across launches.
+    plugins = Path(os.environ.get("ERISDB_PLUGIN_DIR") or directory / "plugins")
+    if "ERISDB_PLUGIN_DIR" not in os.environ:
+        plugins.mkdir(exist_ok=True, mode=0o700)
+    print(f"Data and keys: {directory}\nPlugins: {plugins}", flush=True)
+    # Build this checkout as locked, retaining Cargo's incremental build cache across launches.
+    # Cargo reads configuration from every directory above the one it runs in, so it runs from
+    # the filesystem root: a workspace around this checkout that patches its dependencies
+    # would otherwise rewrite the lockfile.
     status = execute(["cargo", "build", "--locked", "--manifest-path", ROOT / "erisdb/Cargo.toml",
-                      "--bin", "erisdb", "--target-dir", ROOT / "erisdb/target"])
+                      "--bin", "erisdb", "--target-dir", ROOT / "erisdb/target"], cwd=ROOT.anchor)
     if status:
         raise RuntimeError("ErisDB build failed.")
     binary = ROOT / "erisdb/target/debug/erisdb"
@@ -190,7 +196,7 @@ def launch(args, resources):
     env = {**os.environ,
            "DATABASE_URL": f"postgres://erisdb:{config['database_password']}@127.0.0.1:{database_port}/erisdb",
            "ERISDB_SECRET": config["secret"], "ERISDB_IROH_SECRET": config["secret"],
-           "ERISDB_URL": url, "ERISDB_LISTEN": f"127.0.0.1:{args.port}"}
+           "ERISDB_URL": url, "ERISDB_LISTEN": f"127.0.0.1:{args.port}", "ERISDB_PLUGIN_DIR": str(plugins)}
     log_path = directory / "server.log"
     log = resources.enter_context(log_path.open("a"))
     server = subprocess.Popen([binary, "serve"], env=env, stdout=log, stderr=subprocess.STDOUT,

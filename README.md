@@ -30,8 +30,9 @@ Requires Python 3, Docker running, and a Rust/C build toolchain. The script buil
 this checkout and downloads the Postgres image if needed. At `erisdb>`, type
 `pair`, `clients list`, `endpoint-id`, or `help` directly. `exit`, Ctrl-D, or Ctrl-C
 stops both services. The database and keys stay in `~/.local/share/erisdb/local/`
-(under `$XDG_DATA_HOME` when set), ready for the next run. Use `--data-dir PATH`
-or `--port 7701` to choose another location or HTTP port.
+(under `$XDG_DATA_HOME` when set), ready for the next run. Plugin manifests placed in its
+`plugins/` folder load at start (`ERISDB_PLUGIN_DIR` names another folder). Use
+`--data-dir PATH` or `--port 7701` to choose another location or HTTP port.
 
 For a separate server installation, follow the instructions below.
 These instructions build the server from source and set up a local PostgreSQL

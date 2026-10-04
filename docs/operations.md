@@ -9,8 +9,10 @@ rate limits, and active connections belong to each running server process.
 
 ## Local launcher
 
-From the checkout, run `./scripts/run-local.py`. It builds ErisDB, starts a dedicated
-Postgres 17 Docker container, starts the server, and opens an `erisdb>` prompt.
+From the checkout, run `./scripts/run-local.py`. It builds ErisDB exactly as its lockfile
+names, whatever Cargo configuration surrounds the checkout, starts a dedicated Postgres 17
+Docker container, starts the server, and opens an `erisdb>` prompt. The server loads plugin
+manifests from `plugins/` in the data directory, or from `ERISDB_PLUGIN_DIR` when that is set.
 Python 3, Docker access, Cargo, and a C build toolchain are required on Linux.
 
 Type the existing CLI subcommands directly, for example:
