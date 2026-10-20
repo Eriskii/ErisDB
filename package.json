@@ -2,6 +2,7 @@
   "name": "erisdb-e2e",
   "private": true,
   "scripts": {
+    "build:web": "scripts/build-web.sh",
     "test:e2e": "playwright test"
   },
   "devDependencies": {

@@ -1,9 +1,10 @@
 //! Signed capability tokens and bounded delegation.
 //!
 //! A token is `erisdb1.<b64url(payload)>.<b64url(hmac_sha256(secret, payload))>`,
-//! sealed and opened by [`erislogin::token`].
-//! The payload carries an upper scope bound. Registered tokens also name an
-//! installation; installation.rs intersects that bound with its live authority.
+//! sealed and opened by [`erisoverlaynetwork::token`].
+//! The payload carries an upper scope bound. A token delegated by an
+//! installation also names it; installation.rs intersects that bound with
+//! the installation's live authority.
 //!
 //! Scope is a set of grants, matched against the permission each request
 //! requires. See permission.rs and docs/permissions.md.
@@ -11,9 +12,11 @@
 //! Lifetime runs on two clocks. `exp` is when this token stops working.
 //! `max_exp` is the end of its refresh chain: refresh moves `exp` forward,
 //! never past `max_exp`. Once `max_exp` passes, the line is dead and a human
-//! re-mints. Registered installations have a separate, revocable renewal proof.
-//! Only the CLI can mint a token with no `exp`; refreshing one gives it a
-//! bounded lifetime.
+//! re-mints. Only the CLI can mint a token with no `exp`; refreshing one gives
+//! it a bounded lifetime.
+//!
+//! An installation calling over Iroh carries no token at all: its key is its
+//! credential, and the core builds its capability from the registry.
 
 use serde::{Deserialize, Serialize};
 
@@ -29,7 +32,7 @@ pub const DEFAULT_CHAIN_SECS: i64 = 30 * 86_400;
 pub const MAX_CHAIN_SECS: i64 = 365 * 86_400;
 
 /// Cap on the signed user label, which is baked into a payload and then
-/// HMAC'd on every request. Grant sets are capped by [`erislogin::permission`].
+/// HMAC'd on every request. Grant sets are capped by [`erisoverlaynetwork::permission`].
 pub const MAX_USER_LEN: usize = 128;
 
 /// The scope a token grants: which permissions, until when — and
@@ -46,9 +49,6 @@ pub struct Capability {
     /// Unix seconds past which no refresh extends this line.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_exp: Option<i64>,
-    /// The pairing session this token redeems, when it is a pairing code.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pair: Option<String>,
     /// Registered installation; revocation and current grants live in Postgres.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client: Option<uuid::Uuid>,
@@ -65,7 +65,9 @@ impl Capability {
         if self.granted(required) {
             Ok(())
         } else {
-            Err(Error::Forbidden { permission: required.to_string() })
+            Err(Error::Forbidden {
+                permission: required.to_string(),
+            })
         }
     }
 
@@ -80,18 +82,21 @@ impl Capability {
     /// *and* in time. A short-lived parent cannot mint a longer-lived child,
     /// which is what keeps delegation from laundering a deadline away.
     pub fn encloses(&self, other: &Capability) -> bool {
-        crate::permission::encloses(&self.grants, &other.grants) && match self.deadline() {
-            None => true,
-            Some(mine) => matches!(other.deadline(), Some(theirs) if theirs <= mine),
-        }
+        crate::permission::encloses(&self.grants, &other.grants)
+            && match self.deadline() {
+                None => true,
+                Some(mine) => matches!(other.deadline(), Some(theirs) if theirs <= mine),
+            }
     }
 }
 
 /// Reject the unbounded strings a caller would otherwise get to sign.
 pub fn check_grants(grants: &[String], user: Option<&str>) -> Result<()> {
-    erislogin::permission::check_grants(grants)?;
+    erisoverlaynetwork::permission::check_grants(grants)?;
     if user.is_some_and(|u| u.len() > MAX_USER_LEN) {
-        return Err(Error::BadRequest(format!("user is longer than {MAX_USER_LEN}")));
+        return Err(Error::BadRequest(format!(
+            "user is longer than {MAX_USER_LEN}"
+        )));
     }
     Ok(())
 }
@@ -111,7 +116,12 @@ pub fn deadline_from_now(secs: i64) -> Result<i64> {
 /// An expiring token gets a refresh chain of `DEFAULT_CHAIN_SECS`
 /// (or its own lifetime, whichever is longer), so apps renew themselves for a
 /// bounded stretch and then a human re-mints.
-pub fn mint(secret: &[u8], grants: &[&str], ttl_secs: Option<i64>, user: Option<&str>) -> Result<String> {
+pub fn mint(
+    secret: &[u8],
+    grants: &[&str],
+    ttl_secs: Option<i64>,
+    user: Option<&str>,
+) -> Result<String> {
     mint_chain(secret, grants, ttl_secs, None, user)
 }
 
@@ -127,18 +137,26 @@ pub fn mint_chain(
     let grants: Vec<String> = grants.iter().map(|s| s.to_string()).collect();
     check_grants(&grants, user)?;
     let exp = ttl_secs.map(deadline_from_now).transpose()?;
-    let max_exp = ttl_secs.map(|ttl| deadline_from_now(max_ttl_secs.unwrap_or(DEFAULT_CHAIN_SECS).max(ttl))).transpose()?;
-    let cap = Capability { grants, exp, user: user.map(str::to_string), max_exp, pair: None, client: None };
+    let max_exp = ttl_secs
+        .map(|ttl| deadline_from_now(max_ttl_secs.unwrap_or(DEFAULT_CHAIN_SECS).max(ttl)))
+        .transpose()?;
+    let cap = Capability {
+        grants,
+        exp,
+        user: user.map(str::to_string),
+        max_exp,
+        client: None,
+    };
     mint_capability(secret, &cap)
 }
 
 pub fn mint_capability(secret: &[u8], cap: &Capability) -> Result<String> {
-    Ok(erislogin::token::seal(PREFIX, secret, cap)?)
+    Ok(erisoverlaynetwork::token::seal(PREFIX, secret, cap)?)
 }
 
 /// Verify a token's signature and expiry; return its scope.
 pub fn verify(secret: &[u8], token: &str) -> Result<Capability> {
-    let cap: Capability = erislogin::token::open(PREFIX, secret, token)?;
+    let cap: Capability = erisoverlaynetwork::token::open(PREFIX, secret, token)?;
     let now = chrono::Utc::now().timestamp();
     if cap.exp.is_some_and(|exp| now >= exp) {
         return Err(Error::Unauthorized);

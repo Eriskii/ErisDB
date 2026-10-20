@@ -3,43 +3,41 @@ package dev.erisdb.client
 import org.json.JSONObject
 
 /**
- * The native erisdb client: real Iroh QUIC, HTTP/1.1 per bi-stream.
- * All calls block — invoke from Dispatchers.IO only.
+ * The native erisdb client: real Iroh QUIC, HTTP/1.1 per bi-stream, the app's key its
+ * credential. All calls block — invoke from Dispatchers.IO only.
  */
 object ErisDB {
     init {
         System.loadLibrary("erisdb_client")
     }
 
-    private external fun nativeConfigure(
-        server: String,
-        token: String,
-        clientName: String,
-        identityHex: String,
-    ): String
+    private external fun nativeEndpointId(keyHex: String): String?
 
-    private external fun nativeRequest(method: String, path: String, body: String?): String
+    private external fun nativeLocate(snapshotJson: String): String?
 
-    private external fun nativeRefreshCapability(ttlSecs: Long): String
+    private external fun nativeDial(server: String, clientName: String, keyHex: String): String?
 
-    private external fun nativeEndpointId(identityHex: String): String
+    private external fun nativeRequest(method: String, path: String, body: String?): String?
 
-    /** Returns null on success, an error message otherwise. */
-    fun configure(server: String, token: String, clientName: String, identityHex: String): String? =
-        nativeConfigure(server, token, clientName, identityHex).ifEmpty { null }
+    /** The endpoint id the key dials as, in hex — the `app` this app asks ErisAuth to
+     * approve — or null when the key is not 64 hex characters. */
+    fun endpointId(keyHex: String): String? = nativeEndpointId(keyHex)?.ifEmpty { null }
+
+    /** Where the mesh's ErisDB is, from a snapshot of the mesh:
+     * `{"ok":true,"server":<address JSON>}` or `{"ok":false,"error":…}`. */
+    fun locate(snapshot: String): String = nativeLocate(snapshot) ?: ""
+
+    /** Dial ErisDB at [server] as the app holding [keyHex], replacing any client dialed
+     * before. Null on success, why not otherwise. */
+    fun dial(server: String, clientName: String, keyHex: String): String? {
+        val answer = nativeDial(server, clientName, keyHex) ?: return UNANSWERED
+        return answer.ifEmpty { null }
+    }
 
     /** Response envelope: {"status": n, "body": …} or {"status": 0, "error": …}. */
     fun request(method: String, path: String, body: String? = null): JSONObject =
-        JSONObject(nativeRequest(method, path, body))
+        nativeRequest(method, path, body)?.let(::JSONObject) ?: JSONObject().put("status", 0).put("error", UNANSWERED)
 
-    /** The endpoint id this identity dials as, in hex — the key an app names
-     * to ErisAuth — or null when the identity is not 64 hex characters. */
-    fun endpointId(identityHex: String): String? = nativeEndpointId(identityHex).ifEmpty { null }
-
-    /** Trade the current token for one with the same scope and a fresh
-     * expiry. Envelope: {"ok":true,"token":…} or {"ok":false,"error":…}.
-     * The native client swaps to the fresh token itself; persisting it is
-     * the caller's job. */
-    fun refreshCapability(ttlSecs: Long): JSONObject =
-        JSONObject(nativeRefreshCapability(ttlSecs))
+    /** What a call says when the JVM could not take its answer: out of memory. */
+    private const val UNANSWERED = "the native client could not answer"
 }

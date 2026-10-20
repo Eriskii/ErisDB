@@ -105,21 +105,40 @@ def await_database(name):
     raise RuntimeError("Postgres did not start; see postgres.log in the data directory.")
 
 
+# What `erisdb serve` says when it refuses to start before `erisdb join`.
+UNJOINED = "in no mesh yet"
+
+
 def await_server(process, url, log):
+    """True once the server answers; False when it refused to start for want of a mesh."""
     until = time.monotonic() + 60
     while process.poll() is None and time.monotonic() < until:
         try:
             with urllib.request.urlopen(url + "/v1/health", timeout=0.5) as response:
                 if response.status == 200 and process.poll() is None:
-                    return
+                    return True
         except (OSError, urllib.error.URLError):
             pass
         time.sleep(0.1)
+    if process.poll() is not None and UNJOINED in log.read_text():
+        return False
     raise RuntimeError(f"ErisDB did not start. See {log}")
 
 
+def join(binary, env):
+    """Take a new ErisDB into this machine's mesh, then set its passphrase."""
+    print("ErisDB is in no mesh yet. Asking this machine's ErisAuth to make it the mesh's ErisDB;"
+          " approve it on the device.", flush=True)
+    if execute([binary, "join"], env=env):
+        raise RuntimeError("ErisDB did not join a mesh. Run the launcher where ErisAuth runs.")
+    print("Choose ErisDB's passphrase. Devices type it to let apps in.", flush=True)
+    if execute([binary, "passphrase", "set"], env=env):
+        print("No passphrase was set; type passphrase set at the prompt before letting apps in.", flush=True)
+
+
 def prompt(binary, env, server):
-    print("Type a command: pair, clients list, mint, endpoint-id, or help. Exit with exit or Ctrl-D.")
+    print("Type a command: clients list, passphrase set, mint, endpoint-id, or help."
+          " Exit with exit or Ctrl-D.")
     while server.poll() is None:
         print("erisdb> ", end="", flush=True)
         while not select.select([sys.stdin], [], [], 0.25)[0]:
@@ -142,6 +161,9 @@ def prompt(binary, env, server):
             args = ["--help"]
         if args[0] == "serve":
             print("The server is already running. Type exit to stop it.")
+            continue
+        if args[0] == "join":
+            print("ErisDB is in its mesh already. To join another, stop the launcher and run erisdb join.")
             continue
         execute([binary, *args], env=env)
     raise RuntimeError("ErisDB stopped unexpectedly; see server.log in the data directory.")
@@ -199,10 +221,19 @@ def launch(args, resources):
            "ERISDB_URL": url, "ERISDB_LISTEN": f"127.0.0.1:{args.port}", "ERISDB_PLUGIN_DIR": str(plugins)}
     log_path = directory / "server.log"
     log = resources.enter_context(log_path.open("a"))
-    server = subprocess.Popen([binary, "serve"], env=env, stdout=log, stderr=subprocess.STDOUT,
-                              start_new_session=True)
-    resources.callback(stop_process, server)
-    await_server(server, url, log_path)
+
+    def serve():
+        server = subprocess.Popen([binary, "serve"], env=env, stdout=log, stderr=subprocess.STDOUT,
+                                  start_new_session=True)
+        resources.callback(stop_process, server)
+        return server
+
+    server = serve()
+    if not await_server(server, url, log_path):
+        join(binary, env)
+        server = serve()
+        if not await_server(server, url, log_path):
+            raise RuntimeError(f"ErisDB did not start after joining. See {log_path}")
     print(f"ErisDB is running at {url}\nServer log: {log_path}", flush=True)
     prompt(binary, env, server)
 

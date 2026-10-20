@@ -1,13 +1,14 @@
 # Permissions
 
-A capability token carries a set of **grants**. Every request names one
-**required permission**. The request succeeds when some grant covers it.
+An installation, or a capability token, holds a set of **grants**. Every
+request names one **required permission**. The request succeeds when some grant
+covers it.
 
 ```
 grant                required permission        covered
 tasks:*              tasks:create               yes
 tasks:read           tasks:create               no
-*                    meta:pairing:approve       yes
+*                    meta:clients:revoke        yes
 *:read               meta:facets:read           no
 ```
 
@@ -49,7 +50,7 @@ expressed with a write verb.
 permissions and never checks that a namespace exists. `newthing:read` is a
 legal grant the moment it is typed — it simply matches nothing until a facet
 called `newthing` is registered, and then it matches. This is what makes a
-new client cost zero backend changes: pair it, approve its namespace grants,
+new client cost zero backend changes: approve its namespace grants on a device,
 and let it initialize its missing schema using `newthing:create`. That grant
 cannot replace an existing definition or register another namespace. There is
 no deploy, no allowlist, and no core release in that path.
@@ -70,13 +71,9 @@ defines them all.
 | `meta:facets:write`      | register, change and remove facets |
 | `meta:server:read`       | server state: version, uptime, limits, live streams, feed head |
 | `meta:feed:read`         | the change feed across every facet |
-| `meta:clients:read` | list or inspect registered installations |
-| `meta:clients:write` | change installation permissions, within requested and acting grants |
+| `meta:clients:read` | list or inspect installations |
+| `meta:clients:write` | change installation permissions, within approved and acting grants |
 | `meta:clients:revoke` | revoke an installation |
-| `meta:pairing:read`      | list pairing requests |
-| `meta:pairing:create`    | cut a pairing code |
-| `meta:pairing:approve`   | approve or deny a pairing request |
-| `meta:pairing:redeem`    | held only by a pairing code itself; redeems it once |
 | `meta:capabilities:mint` | mint tokens directly |
 | `meta:system:read`       | read tick and lapse rows |
 | `meta:system:tick`       | `POST /v1/tick` — the poker's whole job |
@@ -107,38 +104,29 @@ It is deliberately conservative. A parent holding all four of `tasks:read`,
 being equivalent the moment a fifth action exists. Enclosure that depends on
 the current action list would silently widen on upgrade.
 
-## Pairing
+## Approval
 
-Pairing is where grants are decided, so an app asks and a human answers.
+Grants are decided on a device, so an app asks and a person answers.
 
-1. **Cut a code.** `erisdb pair`, or `POST /v1/pairings` with
-   `meta:pairing:create`. This creates a pairing session and a short-lived
-   secret. The secret is an ordinary token holding exactly
-   `meta:pairing:redeem`, naming its session, expiring in minutes. It is
-   what the QR carries — **not** a capability over your data.
-2. **Redeem it.** The client `POST`s `/v1/pair/redeem` with its manifest:
-   who it is, and the grants it wants. Over Iroh, the authenticated persistent
-   key supplies the installation identity:
-   ```json
-   { "client": "Tasks (Android) v0.3",
-     "requested": ["tasks:read", "tasks:create", "tasks:update"] }
-   ```
-   HTTP clients must also send an S256 `challenge` derived from their saved
-   installation secret. The [redemption example](api.md#post-v1pairredeem) shows
-   its exact encoding and the required authorization header.
-3. **Approve.** The operator sees the request — in the waiting `erisdb pair`
-   terminal, or any app holding `meta:pairing:approve` — and answers. They
-   may approve exactly what was asked, select a subset, or deny. Both screens must show the same comparison fingerprint.
-4. **Collect.** The client polls `GET /v1/pair/status` with the pairing code and installation proof,
-   and receives its token. Only that installation can recover the response.
+1. **Ask.** The app asks ErisAuth on its device to approve its key for
+   `erisdb`, naming the grants it wants:
+   `["tasks:read", "tasks:create", "tasks:update"]`.
+2. **Approve.** The person sees the app and its request on the device, and
+   approves all of it, some of it, or none. Approving takes ErisDB's
+   passphrase as well as the tap.
+3. **Enroll.** The device signs a note carrying the approved grants and
+   enrolls it at ErisDB, which creates the app's installation with exactly
+   those grants.
 
-A photographed QR is therefore worth nothing on its own: redeeming it
-raises a prompt on the operator's screen naming the client, and grants
-nothing until someone approves. The approval is the security boundary,
-which is where it belongs.
+The note is the ceiling. The operator can narrow an installation's grants and
+widen them again, never past its note's: `PUT /v1/clients/{id}` refuses
+anything the note does not enclose, as it refuses anything the acting operator
+does not hold. More takes a new note, which takes the person again. See
+[the mesh](mesh.md) for enrollment and [installations](clients.md) for
+administration.
 
-A facet registration may carry human descriptions so the prompt reads in
-sentences rather than permission strings:
+A facet registration may carry human descriptions, which an app can show when
+it explains what it asks for, in sentences rather than permission strings:
 
 ```json
 { "name": "tasks", "version": 1, "schema": { … },
@@ -151,12 +139,5 @@ sentences rather than permission strings:
 Descriptions are presentation only. A missing one shows the raw permission,
 and no grant depends on them.
 
-## Sessions are items
-
-A pairing session is an item in the `pair` facet, reachable through
-`meta:pairing:*`. Pairing survives a restart, is shared across cores through Postgres, and lands on the change feed
-like everything else — so a dashboard watching the feed sees a pairing
-request arrive live.
-
-Durable registrations live separately in `clients`; generic item permissions
-cannot edit or revert them. See [clients.md](clients.md).
+Installations live in `clients`, outside the items; generic item permissions
+cannot edit or revert them.

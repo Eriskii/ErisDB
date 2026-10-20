@@ -1,33 +1,35 @@
 # tasks-android
 
 The tasks client as an Android app, speaking erisdb's native transport:
-Iroh QUIC, HTTP/1.1 per bi-stream, no IP or port configured anywhere —
-just the server's endpoint id and a capability token.
+Iroh QUIC, HTTP/1.1 per bi-stream, no IP or port configured anywhere. It
+gets into ErisDB through [ErisAuth](https://github.com/Eriskii/ErisAuth) on
+the phone, and its own Iroh key is its credential from then on.
 
 ## Shape
 
-- **`../../erisdb-client/`** — the Rust core: dials by endpoint id (or a
-  full `EndpointAddr` JSON), holds one connection, one bi-stream per
-  request. Compiled as `liberisdb_client.so` via `cargo ndk` into
-  `app/src/main/jniLibs/`. Its schema is pinned by host-side tests
+- **`../../erisdb-client/`** — the Rust core: reads where the mesh's ErisDB
+  is from a snapshot of the mesh, dials it as the app's key, holds one
+  connection, one bi-stream per request. Compiled as `liberisdb_client.so`
+  into `app/src/main/jniLibs/`. Its schema is checked by host-side tests
   against a real core over real QUIC.
-- **Kotlin shell** — `ErisDB.kt` is the JNI surface (configure + request,
-  JSON in/out) and `Core.kt` wraps it in the `CoreApi` interface the rest
-  of the app is written against. `Sync.kt` is the read path, `Outbox.kt`
-  the write path, `Store.kt` the persistence, `Secrets.kt` the sealed
-  token and identity, `Notifications.kt` the due notices, `Capability.kt`
-  the token's own arithmetic, `Pairing.kt` the ticket a core cuts,
-  `Redeem.kt` the two-phase pairing conversation, `Grants.kt` the
-  permission grammar and what this app asks for; `TasksApp.kt` wires them
-  to the screens.
-  `Recurrence.kt` is the repeat rule as pure `java.time` and `Task.kt` is
-  the thin JSON skin over it.
+- **`../android-shared/`** — what Tasks and Lists share: `ErisDB.kt` is the
+  JNI surface (endpoint id, locate, dial, request; JSON in and out),
+  `Core.kt` wraps it in the `CoreApi` interface the rest of the app is
+  written against, `Sync.kt` is the read path, `Outbox.kt` the write path,
+  `Secrets.kt` the sealed key and the ErisDB it was let into, `SignIn.kt`
+  the conversation with ErisAuth and `SignInScreen.kt` its screen. ErisAuth's
+  client library is vendored there as it is, in `dev.eris.auth.client`.
+- **Kotlin shell** — `Store.kt` is the persistence, `Notifications.kt` the
+  due notices, `Grants.kt` the permission grammar and what this app asks
+  for, `Facet.kt` the registration; `TasksApp.kt` wires them to the
+  screens. `Recurrence.kt` is the repeat rule as pure `java.time` and
+  `Task.kt` is the thin JSON skin over it.
 
 The application ID is `dev.erisdb.tasks`.
 The source namespace is `dev.erisdb.tasks`. The phone mints a random 32-byte
-iroh identity on first launch and keeps it, so `source.addr` names this
-device stably across sessions. The client string is
-`Tasks (Android) v0.4` — what the operator reads on the approval prompt.
+Iroh key on first launch and keeps it: it is the key ErisAuth approves and
+ErisDB lets in, and `source.addr` names it. The client string is
+`Tasks (Android) v0.4` — the name the person reads on ErisAuth's prompt.
 
 ## The facet
 
@@ -46,8 +48,8 @@ The schema is strict — `additionalProperties: false` — so `due`, `notes`
 and `repeat` are absent rather than empty when unset. The facet body
 carries `lapse: {"due": "due", "done": "done"}`, which is how the core
 knows a task has gone overdue and emits a `lapsed` change. It also
-carries `version: 1` and a line of prose per permission, so the pairing
-prompt reads *add tasks* rather than `tasks:create`.
+carries `version: 1` and a line of prose per permission, so screens that
+name a permission read *add tasks* rather than `tasks:create`.
 
 The app initializes its missing schema automatically with `tasks:create`
 before sending queued creations. It cannot replace an existing schema or
@@ -70,7 +72,7 @@ it simply becomes done, like any one-off. Un-checking anything sets
 `done` back to false.
 
 The rule lives in `Recurrence.kt` as pure `java.time` — no `org.json`,
-no Android — and is pinned by `app/src/test/java/dev/erisdb/tasks/`:
+no Android — and is checked by `app/src/test/java/dev/erisdb/tasks/`:
 daily advance, catch-up over many missed periods, month-end clamping in
 common and leap years, weekly `n > 1` stepping in whole periods, and
 the always-advance-once guarantee.
@@ -90,16 +92,16 @@ describes complete initialization by replaying the existing change feed from zer
 
 After initialization, the app polls `GET /v1/changes?since=<cursor>&facet=tasks`
 and applies rows to its cache. Created and updated rows carry bodies and
-revisions; deleted rows remove items. The app saves the core ID, items, and their
-feed cursor together in one file using Android's `AtomicFile`. Memory also holds
+revisions; deleted rows remove items. The app saves the ErisDB's endpoint id, the
+items, and their feed cursor together in one file using Android's `AtomicFile`. Memory also holds
 the items and cursor together, so one activity cannot advance another activity's
 cursor past records it has not received.
 
-An absent, unreadable, or different-core snapshot triggers a full fetch instead
-of resuming from a cursor whose items are missing. This keeps existing pairing
-credentials and pending edits. A valid snapshot displays immediately, including
-when the app restarts offline; a failed save reports that the offline copy could
-not be saved.
+An absent, unreadable, or other ErisDB's snapshot triggers a full fetch instead
+of resuming from a cursor whose items are missing. This keeps the app's key, its
+ErisDB and pending edits. A valid snapshot displays immediately, including when
+the app restarts offline; a failed save reports that the offline copy could not
+be saved.
 
 ## Offline-first
 
@@ -137,44 +139,37 @@ editing it announces it again and polling ten times does not. Android 13
 and up asks for `POST_NOTIFICATIONS` on first launch; a task that came
 due before permission was granted is still announced once it is.
 
-## Token refresh
-
-Paired installations renew through `POST /v1/clients/{id}/refresh`, proving
-possession of the persistent Iroh key. The app saves the replacement token and
-can renew after access-token expiry. Current permissions and revocation are
-checked by the server. The app reads permissions again during sync.
-
-For a manually configured token, refresh uses `POST /v1/capabilities/refresh`
-and is bounded by the token's expiry and refresh-chain deadline. A token with
-no expiry is not refreshed.
-
 ## Secrets
 
-The capability token and the iroh private key are the two things on the
-phone worth stealing: one is write access to the store, the other is this
-device's identity on the network. Both are sealed with an AES-256-GCM key
-the Android keystore generates and never hands out; what sits on disk is
-ciphertext and the key that opens it cannot leave the device.
+The app's Iroh key is the one thing on the phone worth stealing: it is
+this app's way into the store. It is sealed, with the address of the
+ErisDB it was let into, by an AES-256-GCM key the Android keystore
+generates and never hands out; what sits on disk is ciphertext and the
+key that opens it cannot leave the device. Should the keystore lose that
+key, the app makes a new Iroh key, which no device has approved, and signs
+in again.
 
 `android:allowBackup="false"`. Nothing here belongs in Google's cloud or
-on a device-to-device transfer: the secrets would arrive elsewhere as
+on a device-to-device transfer: the sealed key would arrive elsewhere as
 noise, and everything else is a cache of the core that reseeds on first
 sync.
 
-The token is a password and every screen that shows it treats it as one:
-masked until asked for, with the window marked `FLAG_SECURE` so it stays
-out of screenshots and out of the recents-screen thumbnail.
-
 ## Build
 
+From the repository root:
+
 ```sh
-cd ../../erisdb-client
-cargo ndk -t arm64-v8a -o ../apps/tasks-android/app/src/main/jniLibs build --release
-cd ../apps/tasks-android
-./gradlew test                # the sync engine, the outbox, the recurrence rule
-./gradlew assembleDebug       # apk lands in app/build/outputs/apk/debug/
-adb install -r app/build/outputs/apk/debug/app-debug.apk
+scripts/build-android.sh
+adb install -r apps/tasks-android/app/build/outputs/apk/debug/app-debug.apk
 ```
+
+It builds `erisdb-client` as `liberisdb_client.so` for `arm64-v8a` and
+`x86_64` with the NDK's toolchain (through `cargo ndk-env`), copies it into
+both apps' `jniLibs/`, runs their unit tests (`./gradlew testDebugUnitTest`:
+signing in, the sealed credentials, the sync engine, the outbox, the
+recurrence rule) and assembles the debug APKs. It needs the Android SDK and
+NDK, `cargo-ndk`, and the `aarch64-linux-android` and `x86_64-linux-android`
+Rust targets.
 
 `java.time` runs back to minSdk 24 through core library desugaring.
 
@@ -188,72 +183,45 @@ org.gradle.java.installations.paths=/nix/store/<hash>-openjdk-17.../lib/openjdk
 android.aapt2FromMavenOverride=/path/to/patched/aapt2
 ```
 
-## Pairing
+## Signing in
 
-Pairing is the front door, and it takes two steps and a person.
+The app gets into ErisDB through ErisAuth on the phone, and only so. The
+phone is a device of its owner's mesh, the mesh has an ErisDB, and ErisAuth
+holds the phone's place in it. Without ErisAuth the app's first screen says
+to install it and add the phone to the mesh with it; there is no other way
+in.
 
-```sh
-erisdb pair --name my-laptop
-```
-
-No scope flags: the client says what it wants and you answer. That prints
-a QR code holding `erisdb://pair/<base64url-nopad(JSON)>`, which carries
-where the core is and a **pairing code** — a token holding exactly
-`meta:pairing:redeem`, naming one session, good for minutes. It is not a
-capability over any data.
-
-Point the phone's camera at it and tap the link it offers: Android routes
-the `erisdb` scheme to this app. There is no scanner in here. The camera
-app is already one, so this app asks for no camera permission and trusts
-no QR library — and a scan while the app is running lands on the same
-activity rather than a second copy of it.
-
-Then the app talks:
-
-1. `POST /v1/pair/redeem` with its name and its manifest. The request
-   appears in the waiting `erisdb pair` terminal.
-2. A screen that says *waiting for approval on my-laptop…*, listing
-   exactly what was asked for, with Cancel. It polls
-   `GET /v1/pair/status` every 1.5 seconds.
-3. Compare the fingerprint with the terminal. Collection is bound to this
-   installation’s persistent Iroh key and is repeatable while the ticket lives.
-   Save the access token in the sealed store before proceeding. Denied and
-   expired tickets return to pairing.
+1. The app binds ErisAuth's `dev.eris.auth.SIGN_IN` service and asks it to
+   approve its key — its endpoint id, from `nativeEndpointId` — for the
+   service `erisdb`, as a client (`serves` false), under its client string,
+   with its manifest. It asks on its first launch, and again whenever the
+   person taps **Sign in with ErisAuth**.
+2. ErisAuth shows the person a prompt naming the app as Android names it,
+   by its package and the SHA-256 of its signing certificate. They approve
+   all of the manifest or part of it, and type ErisDB's passphrase.
+   ErisAuth signs the app's note and enrolls it at the mesh's ErisDB, which
+   checks the passphrase.
+3. Once ErisDB has taken the note, ErisAuth answers with it and a snapshot
+   of the mesh. `nativeLocate` reads where ErisDB is from the snapshot; the
+   app seals that beside its key before anything else, then `nativeDial`s it.
 4. `GET /v1/permissions`, because the approval may be narrower than the
    request. See **Permissions**.
 
-A photographed QR is therefore worth nothing on its own: redeeming it
-raises a prompt on the operator's screen naming a client they did not
-install, asking for permissions they can refuse.
+Every later launch dials the ErisDB it kept, as its key, with nothing else.
+A denial, or a failure such as a phone in no mesh or a mesh with no ErisDB,
+is said on the sign-in screen, with **Ask again**. Settings names the ErisDB
+the app is signed in to and signs in again, to ask for what the person did
+not give the first time or to reach a new ErisDB; a new ErisDB drops the
+tasks cached from the old one.
 
-A ticket can also be pasted as text, and an endpoint id with a token from
-`erisdb mint` can be typed in by hand — that route skips the conversation,
-because a minted token is already a capability. All three sit on one
-screen, the first thing an unpaired phone sees, repeated in Settings for
-re-pairing. Settings names the core it is paired with, from the ticket's
-`name`.
+ErisDB lets the app in while its installation stands, its device is still in
+the mesh and its note is not revoked. When any of that ends the next request
+is refused with 401, the status line says ErisDB no longer lets the app in,
+and only signing in again brings it back.
 
-With [ErisAuth](https://github.com/Eriskii/ErisAuth) installed on the phone, an unpaired app asks it
-first, and the pairing screen and Settings offer **Ask ErisAuth**. The app binds ErisAuth's
-`dev.eris.auth.SIGN_IN` service, asks for its manifest under its own name and Iroh key, and takes
-the ticket ErisAuth hands back like a scanned one. The person approves in ErisAuth's notification,
-and the app collects its token from the core as above. Without ErisAuth, or when it says no, the
-app pairs by ticket. The app's half of ErisAuth's protocol is in `android-shared`
-(`dev.eris.auth.client`), and `SignIn.kt` is the conversation.
-
-A ticket is read all-or-nothing. No `erisdb://pair/` prefix, a payload
-that is not base64url, a `v` this app does not know, neither `eid` nor
-`url`, an `eid` that is not 64 hex characters, no token: each is refused
-by name rather than stored as half a config. A ticket carrying only `url`
-is refused too — that core answers plain HTTP on its LAN, which is a
-browser's transport, and this app dials over iroh. One carrying both is
-fine; the endpoint id wins. A ticket whose token is an ordinary
-capability rather than a pairing code is refused at redeem, where the
-core answers 403.
-
-A ticket arriving over a working config asks before replacing it —
-replacing drops the tasks cached from the old core — and the pairing
-screen is marked `FLAG_SECURE` like the token field on it.
+The app's half of ErisAuth's protocol is ErisAuth's client library,
+vendored in `android-shared` (`dev.eris.auth.client`); `SignIn.kt` is the
+conversation and what its answers come to.
 
 ## Permissions
 
@@ -262,10 +230,10 @@ a grant may wildcard. `Grants.kt` carries the same matcher the core runs,
 so a button this app shows is a request the core will take and a button
 it hides is one the core would refuse. `*` matches one segment and, as a
 grant's final segment, all remaining ones — which is why `*` means
-everything, `meta:*` reaches `meta:pairing:approve`, and `*:read` does
+everything, `meta:*` reaches `meta:clients:revoke`, and `*:read` does
 **not** reach `meta:facets:read`.
 
-The manifest is what this app asks for at pairing time:
+The manifest is what this app asks ErisAuth for when it signs in:
 
 | grant          | what it buys |
 |----------------|--------------|
@@ -291,18 +259,13 @@ Grants are unknown until `/v1/permissions` answers once, and unknown
 draws every button: a phone with no signal at launch is not a phone that
 lost its permissions. Saved permissions are refreshed on the next connection.
 
+## Tests on a device
+
+`tests/android/run.sh` drives both actual APKs on an isolated emulator through
+ADB, signing in through a real ErisAuth on the emulator to a real ErisDB in a
+real mesh. Unit fixtures do not establish transport or security guarantees; the
+device and Rust integration suites exercise those boundaries.
+
 ## Licence
 
 MIT. See [LICENSE](LICENSE).
-
-## Registered access and device verification
-
-Paired access renews using the persistent Iroh identity, even after an offline
-period outlasts token expiry. Permissions are re-read during sync. Revocation
-stops renewal and clears available write controls. See [installation authority](../../docs/clients.md).
-
-Build both apps and their native libraries with `scripts/build-android.sh` from
-the repository root. `tests/android/run.sh` drives both actual APKs on an isolated
-emulator through ADB, using a real ErisDB/Iroh endpoint and disposable Postgres.
-Unit fixtures do not establish transport or security guarantees; the device and
-Rust integration suites exercise those boundaries.

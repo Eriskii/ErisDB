@@ -2,7 +2,7 @@
 name = "erisdb-client"
 version = "0.1.0"
 edition = "2021"
-description = "Dials an ErisDB over Iroh: HTTP/1.1 per QUIC bi-stream, capability in hand."
+description = "Dials an ErisDB over Iroh as an app its mesh let in: HTTP/1.1 per QUIC bi-stream, the key its credential."
 license = "MIT"
 repository = "https://github.com/Eriskii/ErisDB"
 readme = "README.md"
@@ -14,8 +14,7 @@ crate-type = ["lib", "cdylib"]
 
 [dependencies]
 anyhow = "1"
-base64 = "0.22"
-erislogin = { git = "https://github.com/Eriskii/ErisLogin", tag = "v0.4.1" }
+erisoverlaynetwork = { git = "https://github.com/Eriskii/ErisOverlayNetwork", tag = "v0.2.0" }
 hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
@@ -26,9 +25,10 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "io-ut
 [target.'cfg(target_os = "android")'.dependencies]
 jni = "0.21"
 
+# The suite drives the real erisdb binary, built from ../erisdb on demand,
+# against Postgres in a container. Nothing here links the erisdb crate.
 [dev-dependencies]
-erisdb = { path = "../erisdb" }
-sqlx = { version = "0.9", features = ["runtime-tokio", "tls-rustls", "postgres", "migrate"] }
+hyper = { version = "1", features = ["client", "server", "http1"] }
 testcontainers-modules = { version = "0.15", features = ["postgres"] }
-uuid = { version = "1", features = ["v4"] }
 tempfile = "3"
+tokio = { version = "1", features = ["full"] }

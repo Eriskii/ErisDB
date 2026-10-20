@@ -122,7 +122,7 @@ address and a capability holding exactly those grants. It expires when the
 call's `timeout_secs` would end and cannot be renewed past that, it is
 signed for the user `plugin:<name>`, so what the plugin writes says so,
 and it belongs to no installation. The plugin uses it over HTTP like any
-other token and keeps nothing between calls: there is no pairing, no stored
+other token and keeps nothing between calls: there is no enrollment, no stored
 credential and no setup step. Installing the manifest is the operator's
 approval of those grants, as installing the executable is of the code.
 
@@ -146,9 +146,9 @@ Stdin is one JSON line followed by EOF:
 ```
 
 `context.user` is present only when the caller's signed capability carries
-one. `context.installation` is the registered installation that called, which
-the core has already authenticated, including through a token delegated from
-it; it is absent for manual tokens. The process does not receive the
+one. `context.installation` is the installation that called, which the core has
+already authenticated by its key or through a token delegated from it; it is
+absent for manual tokens. The process does not receive the
 caller's capability or its grants; the core has already enforced the
 operation permission. A plugin whose manifest names grants also receives
 `"erisdb": {"url": "http://127.0.0.1:7700", "token": "erisdb1.…"}` in
@@ -210,7 +210,7 @@ sudo install -m 0644 deploy/plugins/openai.json /etc/erisdb/plugins.d/
 Set `ERISDB_PLUGIN_DIR=/etc/erisdb/plugins.d` and `OPENAI_API_KEY` in the
 root-owned mode-0600 `/etc/erisdb/erisdb.env`, then restart the core. Optional
 `OPENAI_BASE_URL`, `OPENAI_ORGANIZATION`, and `OPENAI_PROJECT` values are
-passed when present. A client pairs for `openai:chat`.
+passed when present. An app asks a device for `openai:chat`.
 
 The OpenAI credential stays in the service environment, is copied only into
 the fresh OpenAI process, and is never sent to a client or stored in

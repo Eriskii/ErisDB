@@ -1,6 +1,6 @@
 ---
 name: erisdb-client-development
-description: Build or extend applications that use ErisDB as their backend. Use for new browser, Android, native, CLI, daemon, or MCP clients and their pairing, facet schemas, synchronization, offline writes, renewal, or plugin calls. Does not cover implementing server plugins or administering a deployment.
+description: Build or extend applications that use ErisDB as their backend. Use for new browser, Android, native, CLI, daemon, or MCP clients and their sign-in through the mesh, facet schemas, synchronization, offline writes, or plugin calls. Does not cover implementing server plugins or administering a deployment.
 ---
 
 # Develop an ErisDB client
@@ -23,8 +23,8 @@ and the [API contract](../../../docs/api.md). Read additional references as need
 
 | Work | Reference or implementation |
 |---|---|
-| Enrollment and credentials | [Pairing](../../../docs/pairing.md), [installations](../../../docs/clients.md), [permission matching](../../../docs/permissions.md) |
-| Browser client | [Shared authentication](../../../apps/shared/auth.js), [Tasks](../../../apps/tasks/index.html), [Lists](../../../apps/lists/index.html) |
+| Getting in and credentials | [The mesh](../../../docs/mesh.md), [installations](../../../docs/clients.md), [permission matching](../../../docs/permissions.md) |
+| Browser client | [Browser client (WebAssembly)](../../../clients/web/README.md), [Tasks](../../../apps/tasks/index.html), [Lists](../../../apps/lists/index.html) |
 | Rust or native client | [Rust SDK](../../../erisdb-client/README.md), [SDK implementation](../../../erisdb-client/src/lib.rs) |
 | Android client | [Shared Kotlin and JNI](../../../apps/android-shared/README.md), [Tasks app](../../../apps/tasks-android/README.md), [Lists app](../../../apps/lists-android/README.md) |
 | Schemas and due events | [Facets](../../../docs/facets.md) |
@@ -37,34 +37,29 @@ limits, and their outboxes can duplicate a create after an ambiguous failure.
 Use the protocol rules below when adapting them. If a reference disagrees with
 the target server, inspect its handler and existing integration tests.
 
-## Choose transport and preserve installation identity
+## Get in through a device, and keep the key
 
-- Browsers use HTTP on loopback or HTTPS remotely. Registered HTTP access requires
-  the core's actual TCP peer to be loopback; a remote HTTPS reverse proxy must be
-  on the core's machine. Forwarded headers do not replace that requirement.
-- Native clients can use the Rust Iroh SDK. Preserve the same 32-byte private
-  installation key across enrollment, collection, requests, renewal, and restarts.
-  The API uses HTTP/1.1 over QUIC streams with ALPN `erisdb/0`; prefer the SDK to
-  recreating the transport. Browser HTTP and native Iroh use the same API routes.
-- Treat server address, installation proof/key, registration ID, and access token
-  as one stored connection. Separate different cores' credentials and local data.
-  Use the platform's credential storage; never ship the server signing secret or
-  an operator-wide token in an ordinary app. `X-ErisDB-Client` is an optional
-  display label, not authentication. Do not forward credentials through redirects.
-
-For HTTP enrollment, generate and persist 32 random bytes encoded as unpadded
-base64url. That encoded string is the installation secret. The submitted
-challenge is unpadded base64url of SHA-256 over the ASCII secret string, not the
-original random bytes. Native Iroh enrollment uses its persistent key instead.
-
-Keep the pairing ticket separate from the access token. Redeem with the requested
-grants, show the returned fingerprint for comparison, then poll `/v1/pair/status`
-with the pairing bearer and the same installation proof. Save pending enrollment
-before transmission and save the collected credentials before entering the app.
-Handle denial, expiry, and cancellation. After an ambiguous redemption failure,
-poll first; only `pending` permits another redemption attempt. Collection can be
-repeated with the same proof while the ticket is live. Its successful response
-says `approved` even though the stored session becomes `collected`.
+- An app is let in by a device of its owner's mesh, never by the server. It asks
+  the device's ErisAuth to approve its Iroh key for service `erisdb`, not serving,
+  with the grants it wants: over the agent socket on a desktop
+  (`$XDG_RUNTIME_DIR/erisauth/agent.sock`), through ErisAuth's bound service on
+  Android, or by redeeming a device's `eris://pair/` ticket where no ErisAuth runs
+  beside it. The person approves on the device, possibly fewer grants, and types
+  ErisDB's passphrase; ErisAuth enrolls the app and then answers with its note and
+  a snapshot of the mesh.
+- ErisDB is the app the snapshot shows approved to serve `erisdb` (the most
+  recently approved, should there be more than one). Dial its endpoint id with ALPN
+  `erisdb/0` — HTTP/1.1 over QUIC streams — as the app's key, with no
+  `Authorization` header. Prefer the Rust SDK to recreating the transport:
+  `sign_in` does the whole of the above, `Client::dial` reconnects later, and
+  Android apps use its JNI surface (`nativeLocate`, `nativeDial`).
+- The key is the credential. Generate it once, keep the same 32 bytes across
+  restarts in the platform's credential storage, and store ErisDB's address
+  beside it. Never ship the server signing secret or an operator-wide token in an
+  ordinary app. `X-ErisDB-Client` is an optional display label, not
+  authentication.
+- A denial is an answer. A 401 means the app is out — revoked, its device removed
+  from the mesh, or its note revoked — and only a device can let it back in.
 
 ## Initialize a permitted facet
 
@@ -74,11 +69,11 @@ not private tables owned by an app package. Reuse an existing compatible facet
 when interoperability is intended. Read effective grants from `/v1/permissions`
 and make controls reflect what was granted, including read-only access.
 
-`bookmarks:create` permits registering a missing `bookmarks` definition:
+`bookmarks:create` permits registering a missing `bookmarks` definition (sent over
+Iroh as the app's key, with no `Authorization` header):
 
 ```http
 POST /v1/items
-Authorization: Bearer ACCESS_TOKEN
 Content-Type: application/json
 
 {"facet":"facet","body":{"name":"bookmarks","version":1,"strict":true,"schema":{"type":"object","required":["title","url"],"properties":{"title":{"type":"string"},"url":{"type":"string"}},"additionalProperties":false}}}
@@ -119,12 +114,12 @@ server snapshot and suppress historical notifications during initial replay.
 
 Polling is sufficient. For SSE, use `/v1/changes/stream?since=...&facet=...`, parse
 `event: change`, and reconnect from the last persisted cursor. There are no SSE
-event IDs or `Last-Event-ID` support. Browser streaming `fetch` can attach the
-bearer header; native `EventSource` cannot. Serialize polling and streaming cache
-updates. Handle expiry, revocation, disconnects, and 503 capacity limits; polling
-can continue while waiting to reconnect.
+event IDs or `Last-Event-ID` support. Serialize polling and streaming cache
+updates. Handle revocation, disconnects, and 503 capacity limits; polling can
+continue while waiting to reconnect. The core closes the stream of an app the
+mesh or the operator ends.
 
-## Preserve user intent through writes and renewal
+## Preserve user intent through writes
 
 `PUT /v1/items/{id}` replaces the whole body and requires its current revision.
 Preserve untouched fields. On 409, refetch and reconcile the intended edit with
@@ -139,16 +134,8 @@ client-chosen item ID. Do not blindly resend or promise exactly-once delivery;
 retain the operation for reconciliation. Check persistence failures and surface
 schema/permission rejection rather than retrying permanently invalid writes.
 
-Renew paired access through `POST /v1/clients/{client_id}/refresh` with `{}` and
-installation proof, even after the access token expires. HTTP sends the secret
-in `X-ErisDB-Client-Proof`; Iroh proves its key through the connection. This
-endpoint does not need a bearer. Serialize renewal, persist its returned token,
-and refresh effective permissions. An explicit core authorization 401 on a data
-request allows renewal and one retry; a renewal 401 ends automatic renewal and
-requires pairing. Back off on rate limits and temporary failures.
-
-Manual-token clients use the separate bounded `/v1/capabilities/refresh` flow;
-see the client guide. Do not apply its expiration rules to paired installations.
+An app calling by its key has nothing to renew. Daemons holding minted tokens
+use the bounded `/v1/capabilities/refresh` flow; see the client guide.
 
 For plugin features, discover permitted operations with `/v1/plugins` and invoke
 `POST /v1/call` under their operation grants. Check status and content type before
@@ -161,13 +148,15 @@ credentials belong in server configuration; the bundled OpenAI operation is
 Exercise the client against a real core and PostgreSQL with isolated test data.
 Use the browser, executable, or device runtime the app will actually use; retain
 useful pure tests without substituting mocked server responses for integration
-coverage. Existing fixtures live in `tests/browser/server.cjs`,
-`tests/browser/pairing.spec.cjs`, `tests/android/`, and the Rust integration suites.
-Use a disposable emulator for tests that clear app data, not the user's phone.
+coverage. The Rust integration suites (`erisdb/tests/mesh.rs`,
+`erisdb-client/tests/client.rs`, `clients/mcp/tests/e2e.rs`) run a real core with
+device nodes from the mesh library and a stand-in for ErisAuth's agent socket;
+copy that harness. Use a disposable emulator for tests that clear app data, not
+the user's phone.
 
-Cover the features implemented: pairing and restart recovery, granted subsets,
-CRUD and stale revisions, offline persistence, renewal after real expiry,
-permission narrowing and revocation. For synchronization, include more than one
+Cover the features implemented: signing in and restart recovery, granted subsets,
+CRUD and stale revisions, offline persistence, permission narrowing, revocation,
+and removal of the app's device from the mesh. For synchronization, include more than one
 page, timestamp ties, deletions across pages, missing/corrupt caches, and concurrent
 edits. If writes retry, lose a response after a real commit to verify uncertainty
 handling. Exercise external provider calls only within the user's authorization.

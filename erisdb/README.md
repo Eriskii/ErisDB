@@ -3,14 +3,15 @@
 Holds your facets.
 
 A stateless personal data core: one Postgres store, N interchangeable core
-replicas, capability-bearing clients for durable data, and one-shot
+replicas, apps its owner's mesh let in for durable data, and one-shot
 executables for non-durable calls into external systems.
 
 ## Vocabulary
 
 - **Store** — Postgres. `items` holds current truth, `changes` is a durable,
-  totally-ordered change feed that doubles as the event bus, and `clients`
-  holds installation identities, permissions and revocation.
+  totally-ordered change feed that doubles as the event bus, `clients` holds
+  installations, `mesh` the core's note and its copy of the device list, and
+  `passphrase` the enrollment passphrase's hash.
 - **Core** — this process. Verifies capabilities, validates writes against
   facet schemas, and serves the API. Durable state is stored in Postgres.
 - **Facet** — a named schema over the store (`tasks`), and the namespace
@@ -18,36 +19,43 @@ executables for non-durable calls into external systems.
   `facet`: registering one is a `POST /v1/items`, no deploy. Writes to a
   strict facet are validated against its JSON Schema, and the schema
   version lives in the body so a grant survives it moving.
-- **Client** — a separate application that calls the server with a capability token.
-- **Installation** — a registered app identity, bound to an Iroh key or an
-  HTTP renewal secret. Human pairing approval establishes its authority;
-  Postgres stores its current grants and revocation status.
+- **Mesh** — the owner's devices, each running ErisAuth, keeping one signed
+  list of who is in. ErisDB is an app in it, the one approved to serve
+  `erisdb`: a mesh has one, and approving another revokes this one's approval.
+  Its node keeps the list current. See [the mesh](../docs/mesh.md).
+- **Client** — a separate application that calls the server.
+- **Installation** — an app a device let in: its Iroh key, the device, and
+  the note the device approved it with. The person approves on the device and
+  types ErisDB's passphrase; the device enrolls the app here. Its key is its
+  only credential. Postgres stores its grants and revocation; the mesh decides
+  whether its device and note still count.
 - **Plugin** — an operator-installed executable described by a manifest. One
   call starts one fresh process and streams its stdout; it never listens,
   persists, retries, or touches Postgres. An operation declares its own JSON
   Schema and permission, such as `openai:chat`.
-- **Capability** — a signed, self-describing token carrying **grants**:
-  permission patterns like `tasks:read`, `tasks:*`, `*:read` or
-  `meta:facets:write`, with an expiry and optionally a `user` identity.
-  Registered tokens also identify their installation: the core verifies its
-  identity and intersects the token's grants with current registry grants.
+- **Capability** — what a request holds: **grants**, permission patterns like
+  `tasks:read`, `tasks:*`, `*:read` or `meta:facets:write`. An installation's
+  come from the registry. Operators, daemons and delegates carry theirs as a
+  signed, self-describing bearer token with an expiry and optionally a `user`
+  identity; a token an installation minted names it, and holds no more than it
+  does.
 - **Permission** — what a request requires, computed from the request:
-  `tasks:create`, `meta:pairing:approve`. Four actions per facet — `read`,
+  `tasks:create`, `meta:clients:revoke`. Four actions per facet — `read`,
   `create`, `update`, `delete` — so an append-only logger can hold
   `sensors:create` and nothing else. The core keeps **no registry** of
   valid permissions: a grant for a facet that does not exist yet is legal
   and inert until it does.
-- **Chain** — the second clock on a manual or delegated token. `exp` is when
-  this token stops working; `max_exp` is when its line does. Refresh moves `exp` forward and
+- **Chain** — the second clock on a token. `exp` is when this token stops
+  working; `max_exp` is when its line does. Refresh moves `exp` forward and
   never past `max_exp`, so a token renews itself for a bounded stretch and
-  then a human mints a new one. Registered installations renew independently
-  of access-token expiry until revoked.
+  then a human mints a new one. Installations have no clock: they last until
+  revoked, or until the mesh ends them.
 - **Source** — server-stamped attribution on every write:
   `{addr, user, client, installation}` with a trust gradient. `addr` is observed
   from the connection (peer IP over TCP, `iroh:<endpoint id>` over QUIC),
   `user` is signed into the capability, `client` is whatever the caller
-  claims via the `X-ErisDB-Client` header, and `installation` is the authenticated
-  registration ID when present. Items carry their last writer's
+  claims via the `X-ErisDB-Client` header, and `installation` is the
+  installation the caller's key or token belongs to. Items carry their last writer's
   source; every change row carries the source that produced it.
 - **History** — every change row snapshots the body and revision it
   produced. The feed is a full, append-only audit log: any past state can
@@ -71,37 +79,32 @@ GET    /v1/changes?since=&facet=    cursor-paged feed, bodies included {facet}:r
 GET    /v1/changes/stream           SSE, live via Postgres NOTIFY      as above
 POST   /v1/tick                                                        meta:system:tick
 POST   /v1/capabilities             {grants, ttl_secs, max_ttl_secs?, user?}  meta:capabilities:mint
-POST   /v1/capabilities/refresh     {ttl_secs} — same grants, fresh exp  any valid token
-GET    /v1/permissions              what this token holds              none
-GET    /v1/plugins                  callable operation schemas         valid token
+POST   /v1/capabilities/refresh     {ttl_secs} — same grants, fresh exp  a valid bearer token
+GET    /v1/permissions              what this caller holds             none
+GET    /v1/plugins                  callable operation schemas         any caller
 POST   /v1/call                     one fresh executable, streamed     manifest permission
 GET    /v1/server                   version, counts, live limits       meta:server:read
-POST   /v1/pairings                 cut a pairing code                 meta:pairing:create
-GET    /v1/pairings, /v1/pairings/{id}                                 meta:pairing:read
-POST   /v1/pairings/{id}/approve, /deny                                meta:pairing:approve
-POST   /v1/pair/redeem              {client, requested}                the code itself
-GET    /v1/pair/status              collect with installation proof    the code and identity
+POST   /v1/enroll                   {note, passphrase} — let an app in a device of the mesh
+POST   /v1/passphrase               {current, new}                     a device of the mesh
 GET    /v1/clients, /v1/clients/{id}                                  meta:clients:read
 PUT    /v1/clients/{id}             {grants, revision}                 meta:clients:write
 POST   /v1/clients/{id}/revoke                                        meta:clients:revoke
-POST   /v1/clients/{id}/refresh     renew independently of expiry      installation proof
 ```
 
 The core's own facets answer only to `meta:`: `facet` to
-`meta:facets:read` and `meta:facets:write`, `system` to `meta:system:*`,
-`pair` to `meta:pairing:*`. So `*:read` reads every facet of yours and
-reaches none of them.
+`meta:facets:read` and `meta:facets:write`, `system` to `meta:system:*`.
+So `*:read` reads every facet of yours and reaches none of them.
 
 ## Capability lifetime
 
-Registered access requires an active installation and current grants on every
-authorization check. Revoke one installation with `erisdb clients revoke ID`;
-this blocks subsequent access and renewal, including delegated tokens, and closes
-idle change streams across replicas. An installation remains authorized until
-revoked unless the operator explicitly chooses a temporary registration.
+An app calling by its key needs an active installation, its device in the mesh
+and its note unrevoked, checked on every request. Revoke one installation with
+`erisdb clients revoke ID`, or remove its device or revoke its note from any
+device; either blocks subsequent access, including delegated tokens, and closes
+its change streams across replicas.
 
-Manual tokens have no registry entry and carry expiry and
-refresh-chain limits. Two rules apply to token delegation and bounded refresh:
+Tokens carry expiry and refresh-chain limits. Two rules apply to token
+delegation and bounded refresh:
 
 - **Enclosure covers scope and time.** A minted token never grants what its
   minter lacks, and never outlives it, in expiry or in chain. A ten-minute
@@ -119,10 +122,10 @@ secret: `erisdb mint --no-expiry`. Do it for daemons that must not fail at
 `--ttl 0` is an error rather than a spelling of "forever", because it
 produces a token that is already expired.
 
-Rotating `ERISDB_SECRET` invalidates outstanding token signatures. Registered
-installations can still renew using their installation proof; revoke their
-registrations to remove that authority. Rotation also moves the Iroh endpoint
-unless `ERISDB_IROH_SECRET` is set separately. See [clients.md](../docs/clients.md).
+Rotating `ERISDB_SECRET` invalidates outstanding token signatures; apps hold no
+tokens and carry on. Rotation also changes the core's Iroh key unless
+`ERISDB_IROH_SECRET` is set separately, and the mesh approved the old one: the
+core joins again. See [clients.md](../docs/clients.md).
 
 ## Limits
 
@@ -140,59 +143,51 @@ not a way to find one.
 
 The same router is served over plain TCP and over Iroh (ALPN `erisdb/0`,
 HTTP/1.1 per QUIC bi-stream), so an ErisDB is dialable from anywhere without
-exposing a port. The iroh identity is derived from `ERISDB_IROH_SECRET`, or
-from `ERISDB_SECRET` when that is unset, so the endpoint id survives
-restarts: clients hold one address forever. Iroh authenticates the pipe; the
-capability token authorizes the request — anyone may connect, nobody reads
-or writes without a token.
+exposing a port; the mesh's protocol, `eris-mesh/0`, shares the endpoint. The
+iroh key is derived from `ERISDB_IROH_SECRET`, or from `ERISDB_SECRET` when that
+is unset, so it survives restarts and stays the key the mesh approved. Iroh
+authenticates the pipe, and the caller's key is an app's whole credential —
+anyone may connect, nobody reads or writes without an installation or a token.
 
-The TCP path has neither. It defaults to `127.0.0.1:7700`, and binding it
-anywhere else publishes every bearer token that crosses it — put TLS in
-front, or use iroh.
+The TCP path carries bearer tokens only. It defaults to `127.0.0.1:7700`, and
+binding it anywhere else publishes every bearer token that crosses it — put TLS
+in front, or use iroh.
 
 ## Run
 
 ```sh
 export DATABASE_URL=postgres://…
 export ERISDB_SECRET=$(openssl rand -hex 32)
-erisdb serve                  # migrates, serves TCP + Iroh
-erisdb pair --name my-laptop  # QR to scan; the client asks, you answer
+erisdb join                   # where ErisAuth runs: a device approves the core
+erisdb passphrase set         # what devices type to let apps in
+erisdb serve                  # migrates, joins the mesh's node, serves TCP + Iroh
 erisdb mint --grant tasks:read,tasks:create --ttl 86400 --user alice
 erisdb mint --grant meta:system:tick --no-expiry     # the poker
-erisdb endpoint-id            # the address clients dial
+erisdb endpoint-id            # the key a device approves
 ```
 
-## Pairing
+## Letting apps in
 
-`erisdb pair` cuts a **pairing code** against a running core and prints it
-as a QR code in block characters, with the endpoint id, url and code
-underneath for anyone who would rather type them, and `s` to save the code
-as a png. There is no pairing service anywhere: the ticket carries the
-address, and the core holds the conversation as an ordinary item.
+Apps are let in on a device, not on the server. An app asks ErisAuth on its
+device to approve its key for `erisdb` with the grants it wants; the person approves all
+of them or fewer, and types ErisDB's passphrase; ErisAuth enrolls the app here
+from the device's own endpoint (`POST /v1/enroll`), and ErisDB checks the device
+is in the mesh, the note is the device's own and counts, and the passphrase is
+right. Wrong guesses are counted per device: three free, then a minute's wait,
+doubling to a day.
 
-The code grants exactly `meta:pairing:redeem` on one session and expires in
-minutes. It is not a capability over any data. A client redeems it, says
-who it is and which permissions it wants, and the terminal shows the
-request:
-
-```
-Tasks (Android) v0.3 wants:
-  1. tasks:read
-  2. tasks:create
-  3. tasks:update
-
-[a] approve as asked   [s] select   [d] deny
-```
-
-So a photographed screen is not a leaked capability — it gets an attacker
-as far as a prompt on your screen. Approve the narrowest set that works;
-`s` takes a comma-separated list of numbers. Compare the fingerprint with the app. Approval cannot exceed the request or
-the approver. Registered clients renew until revoked: `erisdb clients list`,
-`erisdb clients permissions ID --grant tasks:read`, `erisdb clients revoke ID`.
-See [registered installations](../docs/clients.md). The ticket format is in [docs/pairing.md](../docs/pairing.md) and
-the flow is in [docs/permissions.md](../docs/permissions.md#pairing).
+From then on the app dials ErisDB as its key and nothing else. A device removed
+from the mesh, or a note revoked, ends the app here the moment the list reaches
+the core. The operator narrows or revokes installations with `erisdb clients
+list`, `erisdb clients permissions ID --grant tasks:read` and `erisdb clients
+revoke ID`, and clears a device's lockout with `erisdb passphrase unlock`. See
+[the mesh](../docs/mesh.md) and [installations](../docs/clients.md).
 
 ## Tests
 
-`cargo test` runs the e2e suite: real Postgres via testcontainers (Docker
-required), real HTTP over real sockets, real Iroh QUIC. No mocks.
+`cargo test` runs the suites: real Postgres via testcontainers (Docker
+required), real HTTP over real sockets, the real erisdb binary, and real Iroh
+QUIC. `tests/mesh.rs` builds device nodes from the mesh library in the test
+process, joins the binary to their mesh through a stand-in for ErisAuth's agent
+socket, and enrolls, cuts off and administers apps, all on loopback endpoints.
+No mocks.

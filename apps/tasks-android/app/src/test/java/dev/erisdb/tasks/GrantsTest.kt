@@ -38,10 +38,10 @@ class GrantsTest {
     @Test
     fun aTrailingStarTakesEveryRemainingSegment() {
         assertTrue(covers("tasks:*", "tasks:create"))
-        assertTrue(covers("meta:*", "meta:pairing:approve"))
-        assertTrue(covers("meta:pairing:*", "meta:pairing:approve"))
+        assertTrue(covers("meta:*", "meta:clients:revoke"))
+        assertTrue(covers("meta:clients:*", "meta:clients:revoke"))
         assertTrue(covers("*", "tasks:read"))
-        assertTrue(covers("*", "meta:pairing:approve"))
+        assertTrue(covers("*", "meta:clients:revoke"))
     }
 
     @Test
@@ -58,7 +58,7 @@ class GrantsTest {
         // three-segment meta permission.
         assertFalse(covers("*:read", "meta:facets:read"))
         assertFalse(covers("*:read", "meta:server:read"))
-        assertFalse(covers("*:read", "meta:pairing:approve"))
+        assertFalse(covers("*:read", "meta:clients:revoke"))
         assertTrue(covers("*:read", "tasks:read"))
         assertTrue(covers("*:read", "lists:read"))
     }
@@ -68,7 +68,7 @@ class GrantsTest {
         // Subsumption, not matching: the thing on the right is a pattern
         // too, and `read` is not `*`.
         assertFalse(covers("tasks:read", "tasks:*"))
-        assertFalse(covers("meta:pairing:read", "meta:*"))
+        assertFalse(covers("meta:clients:read", "meta:*"))
         assertTrue(covers("*", "tasks:*"))
         assertTrue(covers("tasks:*", "tasks:*"))
     }

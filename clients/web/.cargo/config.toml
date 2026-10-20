@@ -1,0 +1,7 @@
+# This crate runs in browsers only: it builds for wasm32-unknown-unknown, where randomness
+# comes from the Web Crypto API.
+[build]
+target = "wasm32-unknown-unknown"
+
+[target.wasm32-unknown-unknown]
+rustflags = ['--cfg', 'getrandom_backend="wasm_js"']

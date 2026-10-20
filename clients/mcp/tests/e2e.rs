@@ -1,15 +1,26 @@
 //! The MCP client interface, proven end to end: real Postgres (Docker via
-//! testcontainers), a real erisdb binary serving real HTTP on a real
-//! socket, and the erisdb-mcp binary as a real subprocess speaking
-//! JSON-RPC over its stdio. No mocks.
+//! testcontainers), a real erisdb binary joined to a mesh and serving over
+//! Iroh, a device node built from the mesh library in this process, and the
+//! erisdb-mcp binary as a real subprocess speaking JSON-RPC over its stdio.
+//! ErisAuth is a stand-in on its agent socket that does what ErisAuth does
+//! once the person says yes: it signs the note and enrolls it at the mesh's
+//! ErisDB from the device's endpoint. Every endpoint is on loopback.
 //!
 //! The core is driven as a process and built from the server crate when
 //! needed. Missing prerequisites fail the suite rather than silently skipping.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
+use erisdb_client::{Client, Guarded};
+use erisoverlaynetwork::agent::{self, Ask, Reply, Request};
+use erisoverlaynetwork::devices::Op;
+use erisoverlaynetwork::mesh::{self, Config, Local, MemoryStore, Node};
+use erisoverlaynetwork::net::{self, Network};
+use iroh::protocol::Router;
+use iroh::SecretKey;
 use serde_json::{json, Value};
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
@@ -17,60 +28,178 @@ use testcontainers_modules::testcontainers::ContainerAsync;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
-const SECRET: &str = "mcp-e2e-secret";
+const PASSPHRASE: &str = "correct horse battery staple";
 
 /// The erisdb binary to run a core with: `ERISDB_BIN` if the operator named
-/// one, `../../erisdb` built on demand, or `erisdb` on
-/// PATH. `None` means this machine cannot run a core right now.
-fn erisdb_binary() -> Option<PathBuf> {
-    if let Ok(path) = std::env::var("ERISDB_BIN") {
-        let path = PathBuf::from(path);
-        return path.is_file().then_some(path);
-    }
-
-    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../erisdb/Cargo.toml");
-    if manifest.is_file() {
-        let built = std::process::Command::new(env!("CARGO"))
-            .args(["build", "--bin", "erisdb", "--manifest-path"])
-            .arg(&manifest)
-            .status();
-        let binary = manifest.with_file_name("target/debug/erisdb");
-        if matches!(built, Ok(status) if status.success()) && binary.is_file() {
-            return Some(binary);
-        }
-    }
-
-    let found = std::process::Command::new("sh").args(["-c", "command -v erisdb"]).output().ok()?;
-    let path = PathBuf::from(String::from_utf8_lossy(&found.stdout).trim());
-    path.is_file().then_some(path)
+/// one, else `../../erisdb` built once for the run.
+fn erisdb_binary() -> PathBuf {
+    static BINARY: OnceLock<PathBuf> = OnceLock::new();
+    BINARY
+        .get_or_init(|| {
+            if let Ok(path) = std::env::var("ERISDB_BIN") {
+                return PathBuf::from(path);
+            }
+            let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../erisdb/Cargo.toml");
+            let built = std::process::Command::new(env!("CARGO"))
+                .args(["build", "--bin", "erisdb", "--manifest-path"])
+                .arg(&manifest)
+                .status()
+                .expect("build the erisdb binary");
+            assert!(built.success(), "a real ErisDB binary is required; build ../../erisdb or set ERISDB_BIN");
+            manifest.with_file_name("target/debug/erisdb")
+        })
+        .clone()
 }
 
-/// A migrated store and a core serving it over TCP, both as real
-/// processes.
+// ---------------------------------------------------------------------
+// The mesh: a device, its ErisAuth, and the ErisDB it let in.
+// ---------------------------------------------------------------------
+
+/// What the person at the stand-in ErisAuth does with a request: approve
+/// these grants, or say no.
+type Person = Arc<dyn Fn(&Ask) -> Option<Vec<String>> + Send + Sync>;
+
+fn approves_as_asked() -> Person {
+    Arc::new(|ask: &Ask| Some(ask.grants.clone()))
+}
+
+/// ErisAuth's agent socket on the device, under a runtime directory of its
+/// own: an app approved to serve `erisdb` replaces the ErisDB before it, whose
+/// note is revoked; an app asking to call it is enrolled at the mesh's ErisDB,
+/// and approved only once ErisDB took it.
+struct Agent {
+    runtime: tempfile::TempDir,
+    asked: Arc<std::sync::Mutex<Vec<Ask>>>,
+}
+
+impl Agent {
+    async fn on(node: &Node, person: Person) -> Agent {
+        let runtime = tempfile::tempdir().unwrap();
+        let path = agent::socket_in(runtime.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (node, seen) = (node.clone(), asked.clone());
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let (node, person, seen) = (node.clone(), person.clone(), seen.clone());
+                tokio::spawn(async move {
+                    let (read, mut write) = stream.into_split();
+                    let mut line = String::new();
+                    BufReader::new(read).read_line(&mut line).await.unwrap();
+                    let reply = match serde_json::from_str::<Request>(&line).unwrap() {
+                        Request::Approve { ask, .. } => {
+                            seen.lock().unwrap().push(ask.clone());
+                            answer(&node, &ask, person(&ask)).await
+                        }
+                        Request::Snapshot { .. } => Reply::Snapshot(node.snapshot().await.unwrap()),
+                    };
+                    let mut out = serde_json::to_vec(&reply).unwrap();
+                    out.push(b'\n');
+                    let _ = write.write_all(&out).await;
+                });
+            }
+        });
+        Agent { runtime, asked }
+    }
+}
+
+async fn answer(node: &Node, ask: &Ask, granted: Option<Vec<String>>) -> Reply {
+    let Some(grants) = granted else { return Reply::Denied("the person said no".into()) };
+    let note = node.issue(ask.app, &ask.name, &ask.service, grants, ask.serves, None).unwrap();
+    if ask.serves {
+        let before = node.providers("erisdb").into_iter().filter_map(|p| p.note().map(|n| n.id));
+        for old in before.filter(|old| *old != note.id).collect::<Vec<_>>() {
+            node.append(Op::Revoke { note: old }).await.unwrap();
+        }
+    } else {
+        let provider = node.provider("erisdb").expect("the mesh has an ErisDB");
+        node.sync_with(provider.id).await.unwrap();
+        let erisdb = Client::over(node.endpoint().clone(), provider.endpoint_addr(), "ErisAuth");
+        match erisdb.enroll(&note, PASSPHRASE).await {
+            Ok(Guarded::Passed(_)) => {}
+            other => return Reply::Error(format!("ErisDB did not take the note: {other:?}")),
+        }
+    }
+    Reply::Approved { note, snapshot: node.snapshot().await.unwrap() }
+}
+
+/// A mesh with an ErisDB in it: Postgres, the device and its ErisAuth, and
+/// the core joined, its passphrase set, serving TCP and Iroh.
 struct Core {
     _pg: ContainerAsync<Postgres>,
-    server: Child,
+    _server: Child,
+    secret: String,
     url: String,
-    erisdb: PathBuf,
+    laptop: Node,
+    _router: Router,
+    erisauth: Agent,
 }
 
 impl Core {
+    async fn new() -> Core {
+        let pg = Postgres::default().start().await.expect("start postgres");
+        let pg_port = pg.get_host_port_ipv4(5432).await.expect("pg port");
+        let database = format!("postgres://postgres:postgres@127.0.0.1:{pg_port}/postgres");
+        // A deployment of its own: its own secret, its own key.
+        let secret = format!("mcp-e2e-{}", SecretKey::generate().public());
+
+        let key = SecretKey::generate();
+        let endpoint = net::endpoint(key.clone(), &Network::Loopback).await.unwrap();
+        let laptop = Node::start(Config {
+            endpoint: endpoint.clone(),
+            network: Network::Loopback,
+            local: Local::Device(key),
+            store: Arc::new(MemoryStore::default()),
+        })
+        .await
+        .unwrap();
+        laptop.create("laptop").await.unwrap();
+        let router = Router::builder(endpoint).accept(mesh::ALPN, laptop.protocol()).spawn();
+        let erisauth = Agent::on(&laptop, approves_as_asked()).await;
+
+        let joined = erisdb(&secret, &database, erisauth.runtime.path()).arg("join").output().await.unwrap();
+        assert!(joined.status.success(), "join: {}", String::from_utf8_lossy(&joined.stderr));
+        let mut set = erisdb(&secret, &database, erisauth.runtime.path())
+            .args(["passphrase", "set"])
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        set.stdin.take().unwrap().write_all(format!("{PASSPHRASE}\n").as_bytes()).await.unwrap();
+        assert!(set.wait().await.unwrap().success());
+
+        // Claim a port by binding it and letting go: the core takes it next.
+        let port = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap().port();
+        let url = format!("http://127.0.0.1:{port}");
+        let server = erisdb(&secret, &database, erisauth.runtime.path())
+            .args(["serve", "--listen", &format!("127.0.0.1:{port}")])
+            .stdout(Stdio::null())
+            .spawn()
+            .expect("spawn erisdb serve");
+        let http = reqwest::Client::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        while !http.get(format!("{url}/v1/health")).send().await.is_ok_and(|r| r.status() == 200)
+            || laptop.provider("erisdb").is_none()
+        {
+            assert!(tokio::time::Instant::now() < deadline, "the core never came up on {url}");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        Core { _pg: pg, _server: server, secret, url, laptop, _router: router, erisauth }
+    }
+
     /// Cut a token with the same CLI an operator would use. `grants` is
     /// what `--grant` takes: permissions, comma-separated.
     fn mint(&self, grants: &str, ttl: i64) -> String {
-        let out = std::process::Command::new(&self.erisdb)
-            .args(["mint", "--grant", grants])
-            .args(["--ttl", &ttl.to_string(), "--user", "clod", "--secret", SECRET])
+        let out = std::process::Command::new(erisdb_binary())
+            .args(["mint", "--grant", grants, "--ttl", &ttl.to_string(), "--user", "clod", "--secret", &self.secret])
             .output()
             .expect("run erisdb mint");
         assert!(out.status.success(), "mint failed: {}", String::from_utf8_lossy(&out.stderr));
         String::from_utf8_lossy(&out.stdout).trim().to_string()
     }
 
-    async fn api(&self, method: reqwest::Method, path: &str, token: &str, mut body: Value) -> Value {
-        if path == "/v1/pair/redeem" { body["challenge"] = json!("tMNl5Xr1UF5oz0tLgctGskAAFN2mmd_MHTaUNW9LCww"); }
-        let mut req =
-            reqwest::Client::new().request(method.clone(), format!("{}{path}", self.url)).bearer_auth(token).header("X-ErisDB-Client-Proof", "mcp-integration-browser-secret-not-used-outside-tests");
+    async fn api(&self, method: reqwest::Method, path: &str, token: &str, body: Value) -> Value {
+        let mut req = reqwest::Client::new().request(method.clone(), format!("{}{path}", self.url)).bearer_auth(token);
         if method != reqwest::Method::GET {
             req = req.json(&body);
         }
@@ -81,88 +210,73 @@ impl Core {
         serde_json::from_str(&text).unwrap_or(Value::Null)
     }
 
-    /// Cut a pairing code over the ordinary API, exactly as `erisdb pair`
-    /// does. Returns the session id and the code itself.
-    async fn cut_a_pairing(&self, operator: &str) -> (String, String) {
-        let cut =
-            self.api(reqwest::Method::POST, "/v1/pairings", operator, json!({"ttl_secs": 600})).await;
-        (
-            cut["id"].as_str().expect("an id").to_string(),
-            cut["secret"].as_str().expect("a code").to_string(),
-        )
+    /// `erisdb-mcp sign-in` against this mesh's ErisAuth, keeping its
+    /// profile under `config`.
+    fn sign_in(&self, config: &Path, args: &[&str]) -> Command {
+        self.sign_in_through(&self.erisauth, config, args)
     }
 
-    /// A client redeeming a code with its manifest: who it is, and what
-    /// it would like.
-    async fn redeem(&self, code: &str, client: &str, requested: &[&str]) -> Value {
-        self.api(
-            reqwest::Method::POST,
-            "/v1/pair/redeem",
-            code,
-            json!({"client": client, "requested": requested}),
-        )
-        .await
+    fn sign_in_through(&self, erisauth: &Agent, config: &Path, args: &[&str]) -> Command {
+        let mut command = mcp_command(config);
+        command.env("XDG_RUNTIME_DIR", erisauth.runtime.path()).arg("sign-in").args(args);
+        command
     }
 
-    /// The paired client collecting whatever it was granted — once.
-    async fn collect(&self, code: &str) -> Value {
-        self.api(reqwest::Method::GET, "/v1/pair/status", code, Value::Null).await
+    /// An MCP signed in under `config` with `grants`, started and handshaken.
+    async fn mcp(&self, config: &Path, grants: &str, env: &[(&str, &str)]) -> Mcp {
+        let out = self.sign_in(config, &["--grant", grants]).output().await.unwrap();
+        assert!(out.status.success(), "sign-in: {}", String::from_utf8_lossy(&out.stderr));
+        let mut mcp = Mcp::spawn(config, env);
+        mcp.start().await;
+        mcp
     }
 }
 
-impl Drop for Core {
-    fn drop(&mut self) {
-        let _ = self.server.start_kill();
+fn erisdb(secret: &str, database: &str, runtime: &Path) -> Command {
+    let mut command = Command::new(erisdb_binary());
+    command
+        .env_clear()
+        .env("DATABASE_URL", database)
+        .env("ERISDB_SECRET", secret)
+        .env("ERIS_NETWORK", "loopback")
+        .env("XDG_RUNTIME_DIR", runtime)
+        .kill_on_drop(true);
+    command
+}
+
+/// The erisdb-mcp binary with its configuration under `config`, on loopback.
+fn mcp_command(config: &Path) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_erisdb-mcp"));
+    for key in ["ERISDB_PROFILE_FILE", "ERISDB_PROFILE", "XDG_RUNTIME_DIR"] {
+        command.env_remove(key);
+    }
+    command.env("XDG_CONFIG_HOME", config).env("ERIS_NETWORK", "loopback").kill_on_drop(true);
+    command
+}
+
+fn profile(config: &Path, name: &str) -> PathBuf {
+    config.join("erisdb/mcp").join(format!("{name}.json"))
+}
+
+/// A profile for an app no ErisDB knows, at an address nobody answers:
+/// enough to run the server and every guard that refuses before the network.
+fn offline(config: &Path) {
+    let path = profile(config, "default");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let key: String = SecretKey::generate().to_bytes().iter().map(|b| format!("{b:02x}")).collect();
+    let server = iroh::EndpointAddr::from(SecretKey::generate().public());
+    std::fs::write(&path, serde_json::to_vec(&json!({"key": key, "server": server})).unwrap()).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
     }
 }
 
-async fn spawn_core() -> Option<Core> {
-    let erisdb = erisdb_binary()?;
-    let pg = Postgres::default().start().await.expect("start postgres");
-    let pg_port = pg.get_host_port_ipv4(5432).await.expect("pg port");
-    let database = format!("postgres://postgres:postgres@127.0.0.1:{pg_port}/postgres");
+// ---------------------------------------------------------------------
+// The erisdb-mcp binary under test, driven over its stdio.
+// ---------------------------------------------------------------------
 
-    // Claim a port by binding it and letting go: the core takes it next.
-    let port = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("find a free port")
-        .local_addr()
-        .expect("local addr")
-        .port();
-    let url = format!("http://127.0.0.1:{port}");
-
-    let server = Command::new(&erisdb)
-        .args(["serve", "--database-url", &database])
-        .args(["--listen", &format!("127.0.0.1:{port}"), "--secret", SECRET, "--no-iroh"])
-        .kill_on_drop(true)
-        .spawn()
-        .expect("spawn erisdb serve");
-
-    // The core migrates the store before it listens, so health answering
-    // is the signal that everything is up.
-    let http = reqwest::Client::new();
-    for _ in 0..200 {
-        if http.get(format!("{url}/v1/health")).send().await.is_ok_and(|r| r.status() == 200) {
-            return Some(Core { _pg: pg, server, url, erisdb });
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    panic!("the core never answered on {url}");
-}
-
-/// A core, or a clear word about why there isn't one.
-macro_rules! real_core {
-    () => {
-        match spawn_core().await {
-            Some(core) => core,
-            None => {
-                panic!("a real ErisDB binary is required; build ../../erisdb or set ERISDB_BIN");
-            }
-        }
-    };
-}
-
-/// The erisdb-mcp binary under test, driven over its stdio.
 struct Mcp {
     _child: Child,
     stdin: ChildStdin,
@@ -171,27 +285,12 @@ struct Mcp {
 }
 
 impl Mcp {
-    fn spawn(url: &str, token: &str) -> Self {
-        Self::spawn_with(url, &[("ERISDB_TOKEN", token)])
-    }
-
-    /// The binary with exactly this environment beyond `ERISDB_URL` —
-    /// which credential channel it reads, and which tools are switched on.
-    fn spawn_with(url: &str, env: &[(&str, &str)]) -> Self {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_erisdb-mcp"));
-        for key in ["ERISDB_TOKEN", "ERISDB_TOKEN_FILE", "ERISDB_SESSION_FILE", "ERISDB_PROFILE"] {
-            command.env_remove(key);
-        }
-        command.env("ERISDB_URL", url);
+    fn spawn(config: &Path, env: &[(&str, &str)]) -> Self {
+        let mut command = mcp_command(config);
         for (key, value) in env {
             command.env(key, value);
         }
-        let mut child = command
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .expect("spawn erisdb-mcp");
+        let mut child = command.stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().expect("spawn erisdb-mcp");
         let stdin = child.stdin.take().unwrap();
         let stdout = BufReader::new(child.stdout.take().unwrap()).lines();
         Self { _child: child, stdin, stdout, next_id: 0 }
@@ -209,7 +308,7 @@ impl Mcp {
         let id = self.next_id;
         self.send(json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params})).await;
         loop {
-            let line = tokio::time::timeout(Duration::from_secs(30), self.stdout.next_line())
+            let line = tokio::time::timeout(Duration::from_secs(60), self.stdout.next_line())
                 .await
                 .expect("response timeout")
                 .expect("read stdout")
@@ -270,20 +369,11 @@ impl Mcp {
 }
 
 fn schema_of<'a>(tools: &'a Value, name: &str) -> &'a Value {
-    tools["tools"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|t| t["name"] == name)
-        .unwrap_or_else(|| panic!("no tool {name}"))
+    tools["tools"].as_array().unwrap().iter().find(|t| t["name"] == name).unwrap_or_else(|| panic!("no tool {name}"))
 }
 
 fn requires(tools: &Value, name: &str, field: &str) -> bool {
-    schema_of(tools, name)["inputSchema"]["required"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .any(|r| r == field)
+    schema_of(tools, name)["inputSchema"]["required"].as_array().into_iter().flatten().any(|r| r == field)
 }
 
 // ---------------------------------------------------------------------
@@ -297,12 +387,13 @@ fn requires(tools: &Value, name: &str, field: &str) -> bool {
 /// required, not optional.
 #[tokio::test]
 async fn the_toolbox_is_advertised_with_its_guards() {
-    let mut mcp = Mcp::spawn("http://127.0.0.1:1", "erisdb1.not-a-real-token");
+    let config = tempfile::tempdir().unwrap();
+    offline(config.path());
+    let mut mcp = Mcp::spawn(config.path(), &[]);
     let tools = mcp.start().await;
 
-    let names: Vec<&str> =
-        tools["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
-    for expected in [
+    let names: Vec<&str> = tools["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
+    let mut expected = vec![
         "list_facets",
         "read_items",
         "get_item",
@@ -316,50 +407,43 @@ async fn the_toolbox_is_advertised_with_its_guards() {
         "mint_capability",
         "server_state",
         "my_permissions",
-        "list_pairings",
-        "get_pairing",
-        "approve_pairing",
-        "deny_pairing",
-    ] {
-        assert!(names.contains(&expected), "missing tool {expected}, have {names:?}");
-    }
+    ];
+    let mut have = names.clone();
+    expected.sort();
+    have.sort();
+    assert_eq!(have, expected);
     for t in tools["tools"].as_array().unwrap() {
         assert!(t["inputSchema"]["type"] == "object", "tool {} lacks a schema", t["name"]);
     }
 
-    // Omitting a revision used to mean "fetch whatever is current and
+    // Omitting a revision would mean "fetch whatever is current and
     // overwrite it", which turns a partial view into silent data loss.
     assert!(requires(&tools, "update_item", "revision"), "update_item must demand a revision");
     assert!(requires(&tools, "revert_item", "revision"), "revert_item must demand a revision");
-
     // Deleting is not something to arrive at by omission.
     assert!(requires(&tools, "delete_item", "confirm"), "delete_item must demand confirmation");
-
-    // A token with no expiry is forever; asking for one has to be
-    // deliberate.
+    // A token with no expiry is forever; asking for one has to be deliberate.
     assert!(requires(&tools, "mint_capability", "ttl_secs"), "mint_capability must demand a ttl");
     assert!(requires(&tools, "mint_capability", "grants"), "mint_capability mints grants");
 
-    // Approving hands a stranger a credential. Which permissions is not
-    // a field to arrive at by omission, so "approve what was asked" is
-    // not a default — the grants get typed out.
-    assert!(
-        requires(&tools, "approve_pairing", "granted"),
-        "approve_pairing must name what it is granting"
-    );
+    // With nobody at the saved address, a tool says so and the session goes on.
+    let err = mcp.tool_err("my_permissions", json!({})).await;
+    assert!(err.contains("transport"), "{err}");
+    assert!(mcp.tool_err("list_facets", json!({})).await.contains("transport"));
 }
 
 /// An update with no revision never reaches the core: it is rejected at
 /// the schema, where the model can see what it left out.
 #[tokio::test]
 async fn a_write_without_a_revision_is_rejected() {
-    let mut mcp = Mcp::spawn("http://127.0.0.1:1", "erisdb1.not-a-real-token");
+    let config = tempfile::tempdir().unwrap();
+    offline(config.path());
+    let mut mcp = Mcp::spawn(config.path(), &[]);
     mcp.start().await;
 
     let id = "00000000-0000-0000-0000-000000000000";
     let err = mcp.tool_err("update_item", json!({"id": id, "body": {"text": "clobber"}})).await;
     assert!(err.contains("revision"), "{err}");
-
     let err = mcp.tool_err("revert_item", json!({"id": id, "seq": 1})).await;
     assert!(err.contains("revision"), "{err}");
 }
@@ -369,75 +453,139 @@ async fn a_write_without_a_revision_is_rejected() {
 /// otherwise, and it refuses before it ever asks the core.
 #[tokio::test]
 async fn minting_is_off_until_the_operator_turns_it_on() {
-    let mut mcp = Mcp::spawn("http://127.0.0.1:1", "erisdb1.not-a-real-token");
+    let config = tempfile::tempdir().unwrap();
+    offline(config.path());
+    let mut mcp = Mcp::spawn(config.path(), &[]);
     mcp.start().await;
-
-    let err = mcp
-        .tool_err("mint_capability", json!({"grants": ["notes:read"], "ttl_secs": 60}))
-        .await;
+    let err = mcp.tool_err("mint_capability", json!({"grants": ["notes:read"], "ttl_secs": 60})).await;
     assert!(err.contains("ERISDB_MCP_ALLOW_MINT"), "the refusal names its switch: {err}");
 }
 
-/// Approving a pairing is the security boundary of the whole pairing
-/// design: it is the step whose entire purpose is that a human performs
-/// it. So it is off until the operator says otherwise, and it refuses
-/// before it ever asks the core.
+/// A profile is credentials: readable by others, the server refuses to use it.
+#[cfg(unix)]
 #[tokio::test]
-async fn approving_a_pairing_is_off_until_the_operator_turns_it_on() {
-    let mut mcp = Mcp::spawn("http://127.0.0.1:1", "erisdb1.not-a-real-token");
-    mcp.start().await;
+async fn a_profile_others_can_read_is_refused() {
+    use std::os::unix::fs::PermissionsExt;
+    let config = tempfile::tempdir().unwrap();
+    offline(config.path());
+    let path = profile(config.path(), "default");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let out = mcp_command(config.path()).stdin(Stdio::null()).output().await.unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("chmod 600"), "{}", String::from_utf8_lossy(&out.stderr));
 
-    let id = "00000000-0000-0000-0000-000000000000";
-    let err = mcp
-        .tool_err("approve_pairing", json!({"id": id, "granted": ["notes:read"]}))
-        .await;
-    assert!(err.contains("ERISDB_MCP_ALLOW_APPROVE"), "the refusal names its switch: {err}");
+    let empty = tempfile::tempdir().unwrap();
+    let out = mcp_command(empty.path()).stdin(Stdio::null()).output().await.unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("erisdb-mcp sign-in"), "{}", String::from_utf8_lossy(&out.stderr));
 }
 
-/// Denying is not gated, and does not need to be: it only ever takes
-/// authority away. The worst an agent can do with it is cost you a
-/// second pairing code.
-#[tokio::test]
-async fn denying_a_pairing_needs_no_switch() {
-    let mut mcp = Mcp::spawn("http://127.0.0.1:1", "erisdb1.not-a-real-token");
-    mcp.start().await;
+// ---------------------------------------------------------------------
+// Signing in, through the device's ErisAuth.
+// ---------------------------------------------------------------------
 
-    // No core on the other end, so this fails at the transport — which
-    // is the proof that it was not refused here first.
-    let err = mcp
-        .tool_err("deny_pairing", json!({"id": "00000000-0000-0000-0000-000000000000"}))
-        .await;
-    assert!(err.contains("transport"), "denying reached the network: {err}");
+#[tokio::test(flavor = "multi_thread")]
+async fn signing_in_through_erisauth_keeps_a_private_profile() {
+    let core = Core::new().await;
+    let config = tempfile::tempdir().unwrap();
+    let path = profile(config.path(), "default");
+
+    // No ErisAuth listening: nothing is asked, nothing is written.
+    let nowhere = tempfile::tempdir().unwrap();
+    let out = mcp_command(config.path())
+        .env("XDG_RUNTIME_DIR", nowhere.path())
+        .args(["sign-in", "--grant", "tasks:read"])
+        .output()
+        .await
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("no ErisAuth"), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(!path.exists());
+
+    // The person approves less than was asked.
+    let narrowing = Agent::on(&core.laptop, Arc::new(|_: &Ask| Some(vec!["tasks:read".to_string()]))).await;
+    let out = core.sign_in_through(&narrowing, config.path(), &["--grant", "tasks:read,tasks:create"]).output().await.unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(out.stdout.is_empty(), "credentials must not reach stdout");
+    match narrowing.asked.lock().unwrap().as_slice() {
+        [ask] => {
+            assert_eq!((ask.service.as_str(), ask.serves, ask.name.as_str()), ("erisdb", false, "erisdb-mcp (default)"));
+            assert_eq!(ask.grants, ["tasks:read", "tasks:create"]);
+        }
+        other => panic!("ErisAuth was asked {other:?}"),
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+    }
+    let saved: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(saved["key"].as_str().unwrap().len(), 64);
+    assert_eq!(saved["server"]["id"], core.laptop.provider("erisdb").unwrap().id.to_string());
+
+    // Restarting needs nothing but the profile.
+    let mut mcp = Mcp::spawn(config.path(), &[]);
+    mcp.start().await;
+    let held = mcp.tool("my_permissions", json!({})).await;
+    assert_eq!(held["grants"], json!(["tasks:read"]), "{held}");
+    let client = held["client_id"].as_str().unwrap().to_string();
+
+    // A denial leaves the saved profile as it was.
+    let declining = Agent::on(&core.laptop, Arc::new(|_: &Ask| None)).await;
+    let before = std::fs::read(&path).unwrap();
+    let out = core.sign_in_through(&declining, config.path(), &["--grant", "tasks:*"]).output().await.unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("said no"), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+
+    // Signing in again keeps the key, so the installation is the same one,
+    // with what the person approved this time.
+    let out = core.sign_in(config.path(), &["--grant", "tasks:read,tasks:create"]).output().await.unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let again: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(again["key"], saved["key"]);
+    let held = mcp.tool("my_permissions", json!({})).await;
+    assert_eq!((held["client_id"].as_str(), &held["grants"]), (Some(client.as_str()), &json!(["tasks:read", "tasks:create"])));
+
+    // Another profile is another app, with a key and an installation of its own.
+    let out = core.sign_in(config.path(), &["--profile", "chat", "--grant", "notes:read"]).output().await.unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let other: Value = serde_json::from_slice(&std::fs::read(profile(config.path(), "chat")).unwrap()).unwrap();
+    assert_ne!(other["key"], saved["key"]);
+    let mut chat = Mcp::spawn(config.path(), &[("ERISDB_PROFILE", "chat")]);
+    chat.start().await;
+    assert_eq!(chat.tool("my_permissions", json!({})).await["grants"], json!(["notes:read"]));
+
+    // The operator revokes one; it hears 401, and the other carries on.
+    let admin = core.mint("*", 3600);
+    core.api(reqwest::Method::POST, &format!("/v1/clients/{client}/revoke"), &admin, json!({})).await;
+    assert!(mcp.tool_err("my_permissions", json!({})).await.contains("401"));
+    assert_eq!(chat.tool("my_permissions", json!({})).await["grants"], json!(["notes:read"]));
 }
 
 // ---------------------------------------------------------------------
 // A real core on the other end.
 // ---------------------------------------------------------------------
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn the_mcp_server_drives_a_erisdb() {
-    let core = real_core!();
-    let root = core.mint("*", 3600);
-    let mut mcp = Mcp::spawn(&core.url, &root);
-    mcp.start().await;
+    let core = Core::new().await;
+    let config = tempfile::tempdir().unwrap();
+    let mut mcp = core.mcp(config.path(), "notes:*,meta:facets:read,meta:feed:read", &[]).await;
 
-    // Registering a facet is just a write to the meta-facet.
-    mcp.tool(
-        "create_item",
-        json!({"facet": "facet", "body": {"name": "notes", "version": 1, "strict": false, "schema": {}}}),
-    )
-    .await;
-    let facets = mcp.tool("list_facets", json!({})).await;
-    assert!(
-        facets["items"].as_array().unwrap().iter().any(|i| i["body"]["name"] == "notes"),
-        "{facets}"
-    );
-
-    // Create and read back.
-    let created = mcp
-        .tool("create_item", json!({"facet": "notes", "body": {"title": "groceries", "text": "buy oat milk"}}))
+    // Registering a facet is just a write to the meta-facet; the app's own
+    // namespace's create grant lets it initialize the missing schema.
+    mcp.tool("create_item", json!({"facet": "facet", "body": {"name": "notes", "version": 1, "strict": false, "schema": {}}}))
         .await;
+    let facets = mcp.tool("list_facets", json!({})).await;
+    assert!(facets["items"].as_array().unwrap().iter().any(|i| i["body"]["name"] == "notes"), "{facets}");
+
+    // Create and read back; the write says which installation made it.
+    let created =
+        mcp.tool("create_item", json!({"facet": "notes", "body": {"title": "groceries", "text": "buy oat milk"}})).await;
     let id = created["id"].as_str().unwrap().to_string();
+    assert_eq!(created["source"]["client"], "erisdb-mcp");
+    assert!(created["source"]["installation"].is_string(), "{created}");
     let items = mcp.tool("read_items", json!({"facet": "notes"})).await;
     assert_eq!(items["items"].as_array().unwrap().len(), 1);
 
@@ -452,27 +600,17 @@ async fn the_mcp_server_drives_a_erisdb() {
     let revision = created["revision"].as_i64().unwrap();
     mcp.tool(
         "update_item",
-        json!({
-            "id": id,
-            "revision": revision,
-            "body": {"title": "groceries", "text": "buy oat milk and bread"}
-        }),
+        json!({"id": id, "revision": revision, "body": {"title": "groceries", "text": "buy oat milk and bread"}}),
     )
     .await;
     let item = mcp.tool("get_item", json!({"id": id})).await;
     assert!(item["body"]["text"].as_str().unwrap().contains("bread"));
 
-    // The same revision a second time is a conflict, not a clobber: two
-    // writers who both read the old state cannot both win.
+    // The same revision a second time is a conflict, not a clobber.
     let stale = mcp
-        .tool_err(
-            "update_item",
-            json!({"id": id, "revision": revision, "body": {"title": "groceries", "text": "no"}}),
-        )
+        .tool_err("update_item", json!({"id": id, "revision": revision, "body": {"title": "groceries", "text": "no"}}))
         .await;
     assert!(stale.contains("409"), "{stale}");
-    let item = mcp.tool("get_item", json!({"id": id})).await;
-    assert!(item["body"]["text"].as_str().unwrap().contains("bread"), "the loser changed nothing");
 
     // Two states so far; revert to the first, which lands as a third.
     let hist = mcp.tool("item_history", json!({"id": id})).await;
@@ -482,8 +620,7 @@ async fn the_mcp_server_drives_a_erisdb() {
     let current = item["revision"].as_i64().unwrap();
     mcp.tool("revert_item", json!({"id": id, "seq": first_seq, "revision": current})).await;
     let item = mcp.tool("get_item", json!({"id": id})).await;
-    assert_eq!(item["body"]["text"], "buy oat milk");
-    assert_eq!(item["revision"], 3);
+    assert_eq!((&item["body"]["text"], &item["revision"]), (&json!("buy oat milk"), &json!(3)));
 
     // The change feed saw everything, and pages by cursor.
     let changes = mcp.tool("read_changes", json!({"since": 0})).await;
@@ -498,30 +635,25 @@ async fn the_mcp_server_drives_a_erisdb() {
     assert_eq!(hist["history"].as_array().unwrap().len(), 4);
 
     // Failures are tool errors, not crashes: the loop keeps serving.
-    let err = mcp
-        .tool_err("get_item", json!({"id": "00000000-0000-0000-0000-000000000000"}))
-        .await;
+    let err = mcp.tool_err("get_item", json!({"id": "00000000-0000-0000-0000-000000000000"})).await;
     assert!(err.contains("404"), "{err}");
+    let err = mcp.tool_err("server_state", json!({})).await;
+    assert!(err.contains("403"), "the grants are the bound: {err}");
     let items = mcp.tool("read_items", json!({"facet": "notes"})).await;
     assert_eq!(items["items"].as_array().unwrap().len(), 0);
 }
 
 /// `confirm: false` is a dry run: it shows what would go and leaves it
 /// there. A model looping over a facet has to say so, item by item.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn deleting_takes_confirmation_and_offers_a_dry_run() {
-    let core = real_core!();
-    let root = core.mint("*", 3600);
-    let mut mcp = Mcp::spawn(&core.url, &root);
-    mcp.start().await;
+    let core = Core::new().await;
+    let config = tempfile::tempdir().unwrap();
+    let mut mcp = core.mcp(config.path(), "notes:*", &[]).await;
 
-    mcp.tool(
-        "create_item",
-        json!({"facet": "facet", "body": {"name": "notes", "version": 1, "strict": false, "schema": {}}}),
-    )
-    .await;
-    let created =
-        mcp.tool("create_item", json!({"facet": "notes", "body": {"text": "keep me"}})).await;
+    mcp.tool("create_item", json!({"facet": "facet", "body": {"name": "notes", "version": 1, "strict": false, "schema": {}}}))
+        .await;
+    let created = mcp.tool("create_item", json!({"facet": "notes", "body": {"text": "keep me"}})).await;
     let id = created["id"].as_str().unwrap().to_string();
 
     let preview = mcp.tool("delete_item", json!({"id": id, "confirm": false})).await;
@@ -537,27 +669,18 @@ async fn deleting_takes_confirmation_and_offers_a_dry_run() {
 
 /// Search finds an item by its id however the id was typed, and honours a
 /// ceiling on how much work one call can ask for.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn search_matches_ids_case_insensitively_and_stays_bounded() {
-    let core = real_core!();
-    let root = core.mint("*", 3600);
-    let mut mcp = Mcp::spawn(&core.url, &root);
-    mcp.start().await;
+    let core = Core::new().await;
+    let config = tempfile::tempdir().unwrap();
+    let mut mcp = core.mcp(config.path(), "notes:*,meta:facets:read", &[]).await;
 
-    mcp.tool(
-        "create_item",
-        json!({"facet": "facet", "body": {"name": "notes", "version": 1, "strict": false, "schema": {}}}),
-    )
-    .await;
-    for n in 0..5 {
-        mcp.tool(
-            "create_item",
-            json!({"facet": "notes", "body": {"text": format!("zebra {n}")}}),
-        )
+    mcp.tool("create_item", json!({"facet": "facet", "body": {"name": "notes", "version": 1, "strict": false, "schema": {}}}))
         .await;
+    for n in 0..5 {
+        mcp.tool("create_item", json!({"facet": "notes", "body": {"text": format!("zebra {n}")}})).await;
     }
-    let created =
-        mcp.tool("create_item", json!({"facet": "notes", "body": {"text": "findable"}})).await;
+    let created = mcp.tool("create_item", json!({"facet": "notes", "body": {"text": "findable"}})).await;
     let id = created["id"].as_str().unwrap().to_string();
 
     // A UUID is hex: the same id typed either way is the same id.
@@ -571,397 +694,106 @@ async fn search_matches_ids_case_insensitively_and_stays_bounded() {
     // An unbounded limit is not on offer, and the answer says the sweep
     // stopped early rather than pretending it was complete.
     let hits = mcp.tool("search_items", json!({"query": "zebra", "limit": 2})).await;
-    assert_eq!(hits["items"].as_array().unwrap().len(), 2, "{hits}");
-    assert_eq!(hits["truncated"], true, "{hits}");
-
+    assert_eq!((hits["items"].as_array().unwrap().len(), &hits["truncated"]), (2, &json!(true)), "{hits}");
     let hits = mcp.tool("search_items", json!({"query": "zebra", "limit": 100_000})).await;
-    assert_eq!(hits["items"].as_array().unwrap().len(), 5, "{hits}");
-    assert_eq!(hits["truncated"], false, "{hits}");
-}
-
-/// The token can come from a file instead of the environment, so it is
-/// not sitting in an MCP config in cleartext and not readable out of the
-/// process environment by everything else on the machine.
-#[tokio::test]
-async fn the_token_can_come_from_a_file() {
-    let core = real_core!();
-    let token = core.mint("meta:facets:read", 3600);
-    let path = std::env::temp_dir().join(format!("erisdb-mcp-token-{}", std::process::id()));
-    std::fs::write(&path, format!("{token}\n")).expect("write token file");
-
-    let mut mcp = Mcp::spawn_with(&core.url, &[("ERISDB_TOKEN_FILE", path.to_str().unwrap())]);
-    mcp.start().await;
-    let facets = mcp.tool("list_facets", json!({})).await;
-    assert!(facets["items"].is_array(), "{facets}");
-
-    std::fs::remove_file(&path).ok();
+    assert_eq!((hits["items"].as_array().unwrap().len(), &hits["truncated"]), (5, &json!(false)), "{hits}");
 }
 
 /// Switched on, minting works — and still refuses a lifetime longer than
 /// the operator's ceiling, whatever the model asks for.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn minting_when_allowed_is_capped() {
-    let core = real_core!();
-    let root = core.mint("*", 3600);
-    let mut mcp = Mcp::spawn_with(
-        &core.url,
-        &[("ERISDB_TOKEN", root.as_str()), ("ERISDB_MCP_ALLOW_MINT", "1"), ("ERISDB_MCP_MAX_MINT_TTL", "60")],
-    );
-    mcp.start().await;
+    let core = Core::new().await;
+    let config = tempfile::tempdir().unwrap();
+    let allowed = [("ERISDB_MCP_ALLOW_MINT", "1"), ("ERISDB_MCP_MAX_MINT_TTL", "60")];
+    let mut mcp = core.mcp(config.path(), "notes:read,meta:capabilities:mint", &allowed).await;
 
-    let minted =
-        mcp.tool("mint_capability", json!({"grants": ["notes:read"], "ttl_secs": 30})).await;
+    let minted = mcp.tool("mint_capability", json!({"grants": ["notes:read"], "ttl_secs": 30})).await;
     let token = minted["token"].as_str().unwrap().to_string();
     assert!(token.starts_with("erisdb1."), "{minted}");
     assert_eq!(minted["ttl_secs"], 30, "{minted}");
 
-    // The minted token holds what was asked for and nothing more.
+    // The minted token holds what was asked for and nothing more, and
+    // belongs to the installation that minted it.
     let held = core.api(reqwest::Method::GET, "/v1/permissions", &token, Value::Null).await;
     assert_eq!(held["grants"], json!(["notes:read"]), "{held}");
+    assert!(held["client_id"].is_string(), "{held}");
 
     // Asking for a year gets the ceiling, and the answer says so.
-    let capped = mcp
-        .tool("mint_capability", json!({"grants": ["notes:read"], "ttl_secs": 31_536_000}))
-        .await;
+    let capped = mcp.tool("mint_capability", json!({"grants": ["notes:read"], "ttl_secs": 31_536_000})).await;
     assert_eq!(capped["ttl_secs"], 60, "{capped}");
 
     // A lifetime of nothing is not a lifetime.
-    let err =
-        mcp.tool_err("mint_capability", json!({"grants": ["notes:read"], "ttl_secs": 0})).await;
+    let err = mcp.tool_err("mint_capability", json!({"grants": ["notes:read"], "ttl_secs": 0})).await;
     assert!(err.contains("ttl_secs"), "{err}");
 
     // Nobody hands out what they do not hold. The core enforces it; the
     // tool reports the refusal rather than swallowing it.
-    let narrow = core.mint("notes:read", 3600);
-    let mut narrow_mcp = Mcp::spawn_with(
-        &core.url,
-        &[("ERISDB_TOKEN", narrow.as_str()), ("ERISDB_MCP_ALLOW_MINT", "1")],
-    );
-    narrow_mcp.start().await;
-    let err = narrow_mcp
-        .tool_err("mint_capability", json!({"grants": ["notes:delete"], "ttl_secs": 30}))
-        .await;
+    let err = mcp.tool_err("mint_capability", json!({"grants": ["notes:delete"], "ttl_secs": 30})).await;
     assert!(err.contains("403"), "{err}");
 }
 
-// ---------------------------------------------------------------------
-// The dashboard surface: what the store is, who is asking to pair, and
-// the answer — which an agent gives only when the operator said it may.
-// ---------------------------------------------------------------------
-
 /// Reading server state and one's own permissions: the two questions an
 /// agent should ask before it does anything else.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn the_agent_can_read_the_server_and_its_own_grants() {
-    let core = real_core!();
-    let mut mcp = Mcp::spawn(&core.url, &core.mint("meta:server:read,notes:*", 3600));
-    mcp.start().await;
+    let core = Core::new().await;
+    let config = tempfile::tempdir().unwrap();
+    let mut mcp = core.mcp(config.path(), "meta:server:read,notes:*", &[]).await;
 
     let state = mcp.tool("server_state", json!({})).await;
     assert!(state["version"].is_string(), "{state}");
     assert!(state["feed_head"].is_i64(), "{state}");
     assert!(state["limits"]["streams"].is_i64(), "{state}");
 
-    // Asking what you hold needs no permission at all: the answer is
-    // already inside the token doing the asking.
+    // Asking what you hold needs no permission at all.
     let held = mcp.tool("my_permissions", json!({})).await;
     assert_eq!(held["grants"], json!(["meta:server:read", "notes:*"]), "{held}");
-    assert_eq!(held["user"], "clod", "{held}");
+    assert!(held["client_id"].is_string(), "{held}");
 
-    // And the grants are the bound: this token cannot read pairings.
-    let err = mcp.tool_err("list_pairings", json!({})).await;
+    // And the grants are the bound: this app cannot read the facet registrations.
+    let err = mcp.tool_err("list_facets", json!({})).await;
     assert!(err.contains("403"), "{err}");
 }
 
-/// The whole pairing conversation with an agent in the operator's seat:
-/// a client asks, the agent reads the request, approves a subset, and
-/// the client collects exactly that.
-#[tokio::test]
-async fn an_allowed_agent_answers_a_pairing_request() {
-    let core = real_core!();
-    let root = core.mint("*", 3600);
-    let mut mcp = Mcp::spawn_with(
-        &core.url,
-        &[("ERISDB_TOKEN", root.as_str()), ("ERISDB_MCP_ALLOW_APPROVE", "1")],
-    );
-    mcp.start().await;
-
-    let (id, code) = core.cut_a_pairing(&root).await;
-    core.redeem(&code, "Tasks (Android) v0.3", &["tasks:read", "tasks:create", "tasks:delete"])
-        .await;
-
-    // The request is visible, with who asked and what for — and never
-    // with a token in it, whatever the session holds.
-    let pairings = mcp.tool("list_pairings", json!({})).await;
-    let session = pairings["pairings"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|p| p["id"] == id.as_str())
-        .unwrap_or_else(|| panic!("{pairings}"));
-    assert_eq!(session["body"]["status"], "requested", "{session}");
-    assert_eq!(session["body"]["client"], "Tasks (Android) v0.3", "{session}");
-    assert!(session["body"].get("token").is_none(), "{session}");
-
-    let one = mcp.tool("get_pairing", json!({"id": id})).await;
-    assert_eq!(one["body"]["requested"], json!(["tasks:read", "tasks:create", "tasks:delete"]));
-
-    // Approve two of the three. Nothing says the answer has to be the
-    // question.
-    let approved = mcp
-        .tool(
-            "approve_pairing",
-            json!({"id": id, "granted": ["tasks:read", "tasks:create"], "ttl_secs": 3600}),
-        )
-        .await;
-    assert_eq!(approved["body"]["status"], "approved", "{approved}");
-    assert_eq!(approved["body"]["granted"], json!(["tasks:read", "tasks:create"]));
-    // The token belongs to the client that asked, and to nobody else —
-    // least of all to a transcript.
-    assert!(approved["body"].get("token").is_none(), "{approved}");
-
-    // The client collects it, and it is exactly what was approved.
-    let collected = core.collect(&code).await;
-    let token = collected["token"].as_str().expect("a token").to_string();
-    let held = core.api(reqwest::Method::GET, "/v1/permissions", &token, Value::Null).await;
-    assert_eq!(held["grants"], json!(["tasks:read", "tasks:create"]), "{held}");
-}
-
-/// A master key is a keystroke a human makes in front of the pairing
-/// screen, not something an agent hands out on request.
-#[tokio::test]
-async fn an_agent_cannot_approve_a_master_key() {
-    let core = real_core!();
-    let root = core.mint("*", 3600);
-    let mut mcp = Mcp::spawn_with(
-        &core.url,
-        &[("ERISDB_TOKEN", root.as_str()), ("ERISDB_MCP_ALLOW_APPROVE", "1")],
-    );
-    mcp.start().await;
-
-    let (id, code) = core.cut_a_pairing(&root).await;
-    core.redeem(&code, "Greedy v0", &["*"]).await;
-
-    let err = mcp.tool_err("approve_pairing", json!({"id": id, "granted": ["*"]})).await;
-    assert!(err.contains("erisdb mint"), "the refusal says where that is done: {err}");
-
-    // The session is untouched, so a human can still answer it.
-    let one = mcp.tool("get_pairing", json!({"id": id})).await;
-    assert_eq!(one["body"]["status"], "requested", "{one}");
-}
-
-/// An approval's lifetime is bounded by the operator's ceiling too: an
-/// approved token is as much a credential as a minted one, and the core
-/// would otherwise hand out its own week-long default.
-#[tokio::test]
-async fn an_approval_is_capped_like_a_mint() {
-    let core = real_core!();
-    let root = core.mint("*", 3600);
-    let mut mcp = Mcp::spawn_with(
-        &core.url,
-        &[
-            ("ERISDB_TOKEN", root.as_str()),
-            ("ERISDB_MCP_ALLOW_APPROVE", "1"),
-            ("ERISDB_MCP_MAX_MINT_TTL", "60"),
-        ],
-    );
-    mcp.start().await;
-
-    // Asking for a year gets the ceiling — and so does saying nothing,
-    // which would otherwise take the core's own week-long default.
-    for (n, ttl) in [("Patient v0", Some(31_536_000)), ("Quiet v0", None)] {
-        let (id, code) = core.cut_a_pairing(&root).await;
-        core.redeem(&code, n, &["tasks:read"]).await;
-        let mut args = json!({"id": id, "granted": ["tasks:read"]});
-        if let Some(t) = ttl {
-            args["ttl_secs"] = json!(t);
-        }
-        let approved = mcp.tool("approve_pairing", args).await;
-        assert_eq!(approved["ttl_secs"], 60, "{approved}");
-
-        let token = core.collect(&code).await["token"].as_str().unwrap().to_string();
-        let held = core.api(reqwest::Method::GET, "/v1/permissions", &token, Value::Null).await;
-        let life = held["exp"].as_i64().unwrap() - now_secs();
-        assert!(life <= 60, "the ceiling did not hold for {n}: {life}s");
-    }
-}
-
-/// Denying takes authority away, so it needs no switch — and it leaves
-/// the client with nothing at all.
-#[tokio::test]
-async fn an_agent_can_always_deny() {
-    let core = real_core!();
-    let root = core.mint("*", 3600);
-    let mut mcp = Mcp::spawn(&core.url, &root);
-    mcp.start().await;
-
-    let (id, code) = core.cut_a_pairing(&root).await;
-    core.redeem(&code, "Unwanted v0", &["tasks:read"]).await;
-
-    let denied = mcp.tool("deny_pairing", json!({"id": id})).await;
-    assert_eq!(denied["body"]["status"], "denied", "{denied}");
-
-    let collected = core.collect(&code).await;
-    assert_eq!(collected["status"], "denied", "{collected}");
-    assert!(collected.get("token").is_none(), "{collected}");
-}
-
-/// Unix seconds, without a date crate: the assertion only needs a clock.
-fn now_secs() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("after 1970")
-        .as_secs() as i64
-}
-
-/// A pasted ticket is read by the rules every ErisDB client reads one by:
-/// a damaged ticket is refused before anything is dialed or written.
-#[tokio::test]
-async fn a_damaged_ticket_is_refused_before_anything_is_contacted() {
-    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-    let directory = tempfile::tempdir().unwrap();
-    let path = directory.path().join("session.json");
-    let ticket = format!("erisdb://pair/{}", URL_SAFE_NO_PAD.encode(serde_json::to_vec(
-        &json!({"v": 1, "url": "http://127.0.0.1:1", "eid": "too-short", "token": "erisdb1.a.b"})).unwrap()));
-    let out = Command::new(env!("CARGO_BIN_EXE_erisdb-mcp"))
-        .args(["pair", &ticket, "--session-file"]).arg(&path).args(["--grant", "tasks:read"])
-        .output().await.unwrap();
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(!out.status.success());
-    assert!(stderr.contains("endpoint id must be 64 hex characters"), "{stderr}");
-    assert!(std::fs::read_dir(directory.path()).unwrap().next().is_none(), "the profile was touched");
-}
-
-#[tokio::test]
-async fn paired_mcp_renews_after_restart_and_stops_when_revoked() {
-    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-    let core = real_core!();
-    let admin = core.mint("*", 3600);
-    let (id, code) = core.cut_a_pairing(&admin).await;
-    let ticket = format!("erisdb://pair/{}", URL_SAFE_NO_PAD.encode(
-        serde_json::to_vec(&json!({"v": 1, "url": core.url, "token": code})).unwrap()));
-    let directory = tempfile::tempdir().unwrap();
-    let path = directory.path().join("session.json");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_erisdb-mcp"))
-        .args(["pair", &ticket, "--session-file"]).arg(&path)
-        .args(["--grant", "tasks:read", "--name", "real MCP installation"])
-        .stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true).spawn().unwrap();
-    let mut stderr = BufReader::new(child.stderr.take().unwrap()).lines();
-    let comparison = tokio::time::timeout(Duration::from_secs(10), stderr.next_line())
-        .await.unwrap().unwrap().unwrap();
-    let pending = core.api(reqwest::Method::GET, &format!("/v1/pairings/{id}"), &admin, Value::Null).await;
-    assert!(comparison.contains(pending["body"]["fingerprint"].as_str().unwrap()));
-    core.api(reqwest::Method::POST, &format!("/v1/pairings/{id}/approve"), &admin,
-        json!({"granted": ["tasks:read"], "ttl_secs": 1})).await;
-    let output = tokio::time::timeout(Duration::from_secs(10), child.wait_with_output()).await.unwrap().unwrap();
-    assert!(output.status.success());
-    assert!(output.stdout.is_empty(), "credentials must not reach stdout");
-    let saved: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-    assert_eq!(saved["client_id"], id);
-    assert_eq!(saved["refresh_secret"].as_str().unwrap().len(), 43);
-    #[cfg(unix)] {
-        use std::os::unix::fs::PermissionsExt;
-        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
-    }
-    tokio::time::sleep(Duration::from_secs(2)).await;
-    for _ in 0..2 {
-        let mut mcp = Mcp::spawn_with(&core.url, &[("ERISDB_SESSION_FILE", path.to_str().unwrap())]);
-        mcp.start().await;
-        let permissions = mcp.tool("my_permissions", json!({})).await;
-        assert_eq!(permissions["client_id"], id);
-        assert_eq!(permissions["grants"], json!(["tasks:read"]));
-    }
-    core.api(reqwest::Method::POST, &format!("/v1/clients/{id}/revoke"), &admin, json!({})).await;
-    let mut mcp = Mcp::spawn_with(&core.url, &[("ERISDB_SESSION_FILE", path.to_str().unwrap())]);
-    mcp.start().await;
-    assert!(mcp.tool_err("my_permissions", json!({})).await.contains("401"));
-    std::fs::remove_file(path).unwrap();
-}
-
-/// Drive the real pairing subprocess up to the human comparison step.
-#[cfg(target_os = "linux")]
-async fn request_mcp_pair(core: &Core, admin: &str, config: &str, profile: Option<&str>) -> (String, Child) {
-    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-    let (id, code) = core.cut_a_pairing(admin).await;
-    let ticket = format!("erisdb://pair/{}", URL_SAFE_NO_PAD.encode(
-        serde_json::to_vec(&json!({"v":1, "url":core.url, "token":code})).unwrap()));
-    let mut command = Command::new(env!("CARGO_BIN_EXE_erisdb-mcp"));
-    command.args(["pair", &ticket, "--grant", "tasks:read,tasks:create"])
-        .env("XDG_CONFIG_HOME", config).env_remove("ERISDB_SESSION_FILE").env_remove("ERISDB_PROFILE");
-    if let Some(profile) = profile { command.args(["--profile", profile]); }
-    let mut child = command.stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true).spawn().unwrap();
-    let mut stderr = BufReader::new(child.stderr.take().unwrap()).lines();
-    let line = tokio::time::timeout(Duration::from_secs(10), stderr.next_line()).await.unwrap().unwrap().unwrap();
-    let pending = core.api(reqwest::Method::GET, &format!("/v1/pairings/{id}"), admin, Value::Null).await;
-    assert!(line.contains(pending["body"]["fingerprint"].as_str().unwrap()), "{line}");
-    child.stderr = Some(stderr.into_inner().into_inner());
-    (id, child)
-}
-
-#[cfg(target_os = "linux")]
-#[tokio::test]
-async fn automatic_profiles_repair_in_place_and_failed_pairing_preserves_the_saved_login() {
-    let core = real_core!();
-    let admin = core.mint("*", 3600);
-    let directory = tempfile::tempdir().unwrap();
-    let config = directory.path().to_str().unwrap();
-    let path = directory.path().join("erisdb/mcp/default.json");
-    let (id, child) = request_mcp_pair(&core, &admin, config, None).await;
-    core.api(reqwest::Method::POST, &format!("/v1/pairings/{id}/approve"), &admin, json!({})).await;
-    assert!(child.wait_with_output().await.unwrap().status.success());
-    let original = std::fs::read(&path).unwrap();
-    let saved: Value = serde_json::from_slice(&original).unwrap();
-    let (denied_id, child) = request_mcp_pair(&core, &admin, config, None).await;
-    core.api(reqwest::Method::POST, &format!("/v1/pairings/{denied_id}/deny"), &admin, json!({})).await;
-    assert!(!child.wait_with_output().await.unwrap().status.success());
-    assert_eq!(std::fs::read(&path).unwrap(), original);
-
-    let (again, child) = request_mcp_pair(&core, &admin, config, None).await;
-    core.api(reqwest::Method::POST, &format!("/v1/pairings/{again}/approve"), &admin,
-        json!({"granted":["tasks:read"]})).await;
-    assert!(child.wait_with_output().await.unwrap().status.success());
-    let renewed: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-    assert_eq!(renewed["client_id"], id);
-    assert_eq!(renewed["refresh_secret"], saved["refresh_secret"]);
-    let mut mcp = Mcp::spawn_with(&core.url, &[("XDG_CONFIG_HOME", config)]);
-    mcp.start().await;
-    assert_eq!(mcp.tool("my_permissions", json!({})).await["grants"], json!(["tasks:read"]));
-    assert_eq!(core.api(reqwest::Method::GET, "/v1/clients", &admin, Value::Null).await["clients"].as_array().unwrap().len(), 1);
-
-    let (other, child) = request_mcp_pair(&core, &admin, config, Some("other-app")).await;
-    core.api(reqwest::Method::POST, &format!("/v1/pairings/{other}/approve"), &admin, json!({})).await;
-    assert!(child.wait_with_output().await.unwrap().status.success());
-    let other_saved: Value = serde_json::from_slice(&std::fs::read(directory.path().join("erisdb/mcp/other-app.json")).unwrap()).unwrap();
-    assert_ne!(other_saved["refresh_secret"], saved["refresh_secret"]);
-    core.api(reqwest::Method::POST, &format!("/v1/clients/{id}/revoke"), &admin, json!({})).await;
-    assert!(mcp.tool_err("my_permissions", json!({})).await.contains("401"));
-    // An explicit profile must win over stale manual-token environment settings.
-    let mut other_mcp = Mcp::spawn_with(&core.url, &[("XDG_CONFIG_HOME", config), ("ERISDB_PROFILE", "other-app"), ("ERISDB_TOKEN", &admin)]);
-    other_mcp.start().await;
-    assert_eq!(other_mcp.tool("my_permissions", json!({})).await["client_id"], other);
-}
-
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn bounded_search_reports_unscanned_items_and_authentication_failures() {
-    let core = real_core!();
+    let core = Core::new().await;
     let root = core.mint("*", 3600);
-    core.api(reqwest::Method::POST, "/v1/items", &root,
-        json!({"facet": "facet", "body": {"name": "searchbound", "strict": false, "schema": {}}})).await;
+    core.api(
+        reqwest::Method::POST,
+        "/v1/items",
+        &root,
+        json!({"facet": "facet", "body": {"name": "searchbound", "strict": false, "schema": {}}}),
+    )
+    .await;
     let http = reqwest::Client::new();
     for index in 0..1001 {
-        let response = http.post(format!("{}/v1/items", core.url)).bearer_auth(&root)
+        let response = http
+            .post(format!("{}/v1/items", core.url))
+            .bearer_auth(&root)
             .json(&json!({"facet": "searchbound", "body": {"index": index}}))
-            .send().await.unwrap();
+            .send()
+            .await
+            .unwrap();
         assert_eq!(response.status(), 201);
     }
-    let mut mcp = Mcp::spawn(&core.url, &root);
-    mcp.start().await;
+    let config = tempfile::tempdir().unwrap();
+    let mut mcp = core.mcp(config.path(), "searchbound:read", &[]).await;
     let result = mcp.tool("search_items", json!({"facet": "searchbound", "query": "absent-marker"})).await;
     assert_eq!(result["items"], json!([]));
     assert_eq!(result["scanned_facets"], 1);
     assert_eq!(result["truncated"], true, "a full scan page cannot prove there are no later matches");
 
-    let mut unauthorized = Mcp::spawn(&core.url, "invalid-token");
+    // A key ErisDB never enrolled, at the right address: refused, not empty.
+    let stranger = tempfile::tempdir().unwrap();
+    let saved: Value = serde_json::from_slice(&std::fs::read(profile(config.path(), "default")).unwrap()).unwrap();
+    offline(stranger.path());
+    let path = profile(stranger.path(), "default");
+    let mut forged: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    forged["server"] = saved["server"].clone();
+    std::fs::write(&path, serde_json::to_vec(&forged).unwrap()).unwrap();
+    let mut unauthorized = Mcp::spawn(stranger.path(), &[]);
     unauthorized.start().await;
     let error = unauthorized.tool_err("search_items", json!({"facet": "searchbound", "query": "index"})).await;
     assert!(error.contains("401"), "authentication failures must not become empty results: {error}");

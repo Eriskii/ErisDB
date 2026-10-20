@@ -1,18 +1,22 @@
-//! HTTP over Iroh: the same axum router, served over QUIC bi-streams.
+//! The core's Iroh endpoint: the API over QUIC, and the mesh beside it.
 //!
-//! Each accepted bi-stream carries one HTTP/1.1 connection. Clients open a
-//! stream per request (or keep one open and pipeline); either works.
+//! One endpoint speaks two protocols. `erisdb/0` carries the same axum
+//! router the TCP listener serves, one HTTP/1.1 connection per accepted
+//! bi-stream. `eris-mesh/0` is the core's [node](erisoverlaynetwork::mesh),
+//! keeping its copy of the device list current. The accept loop tells them
+//! apart by ALPN.
 
 use std::sync::Arc;
 
 use anyhow::Result;
 use axum::body::Body;
-use tokio::sync::Semaphore;
 use axum::Router;
+use erisoverlaynetwork::mesh::{self, MeshProtocol};
 use hyper_util::rt::TokioIo;
 use hyper_util::service::TowerToHyperService;
-use iroh::endpoint::{presets, Connection};
-use iroh::{Endpoint, EndpointAddr};
+use iroh::endpoint::Connection;
+use iroh::Endpoint;
+use tokio::sync::Semaphore;
 use tower::ServiceExt;
 
 /// The erisdb wire protocol: HTTP/1.1 inside QUIC bi-streams.
@@ -23,53 +27,44 @@ pub const ALPN: &[u8] = b"erisdb/0";
 const IROH_KEY_TAG: &[u8] = b"erisdb/iroh-endpoint-key/0";
 
 /// The endpoint's ed25519 key, derived deterministically from the
-/// deployment secret. Same secret → same endpoint id across restarts:
-/// clients hold one address forever, and the core stays stateless — no key
+/// deployment secret. Same secret → same endpoint id across restarts: the
+/// key a device approved stays this core's key, and the core keeps no key
 /// file to lose.
-fn derive_key(secret: &[u8]) -> iroh::SecretKey {
-    erislogin::key::derive(secret, IROH_KEY_TAG)
+pub fn key(secret: &[u8]) -> iroh::SecretKey {
+    erisoverlaynetwork::key::derive(secret, IROH_KEY_TAG)
 }
 
-/// The endpoint id a core with this secret serves under — the address
-/// clients dial. Pure derivation, no socket: answerable any time.
+/// The endpoint id a core with this secret serves under. Pure derivation,
+/// no socket: answerable any time.
 pub fn endpoint_id(secret: &[u8]) -> iroh::EndpointId {
-    derive_key(secret).public()
-}
-
-/// Bind an Iroh endpoint speaking the erisdb ALPN, with an identity
-/// derived from `secret`.
-pub async fn endpoint(secret: &[u8]) -> Result<Endpoint> {
-    let ep = Endpoint::builder(presets::N0)
-        .secret_key(derive_key(secret))
-        .alpns(vec![ALPN.to_vec()])
-        .bind()
-        .await?;
-    Ok(ep)
-}
-
-/// The address other endpoints dial to reach this one.
-pub async fn advertised_addr(ep: &Endpoint) -> Result<EndpointAddr> {
-    Ok(ep.addr())
+    key(secret).public()
 }
 
 /// Connections served at once. The endpoint id is public and stable by
 /// design, so anyone who knows it can dial: the accept loop is bounded
-/// before authentication, because a capability check costs more than a
+/// before authentication, because an authorization check costs more than a
 /// refusal.
 pub const MAX_CONNECTIONS: usize = 64;
 
 /// Concurrent request streams per connection.
 pub const MAX_STREAMS_PER_CONNECTION: usize = 32;
 
-/// Accept connections forever, serving `app` on every bi-stream.
-pub async fn serve(ep: Endpoint, app: Router) -> Result<()> {
+/// The caller's Iroh key, verified by the QUIC handshake, inserted into
+/// every request that arrives over Iroh.
+#[derive(Clone, Copy, Debug)]
+pub struct IrohPeer(pub iroh::EndpointId);
+
+/// Accept connections until the endpoint closes: the API on `erisdb/0`,
+/// the mesh on `eris-mesh/0`.
+pub async fn serve(ep: Endpoint, app: Router, mesh: MeshProtocol) -> Result<()> {
+    ep.set_alpns(vec![ALPN.to_vec(), mesh::ALPN.to_vec()]);
     let slots = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     while let Some(incoming) = ep.accept().await {
-        let app = app.clone();
         let Ok(slot) = slots.clone().try_acquire_owned() else {
             tracing::warn!("refusing an iroh connection: {MAX_CONNECTIONS} already open");
             continue;
         };
+        let (app, mesh) = (app.clone(), mesh.clone());
         tokio::spawn(async move {
             let conn = match incoming.await {
                 Ok(conn) => conn,
@@ -78,7 +73,13 @@ pub async fn serve(ep: Endpoint, app: Router) -> Result<()> {
                     return;
                 }
             };
-            serve_connection(conn, app).await;
+            match conn.alpn() {
+                ALPN => serve_connection(conn, app).await,
+                mesh::ALPN => mesh.serve(conn).await,
+                other => {
+                    tracing::debug!(alpn = %String::from_utf8_lossy(other), "unknown protocol")
+                }
+            }
             drop(slot);
         });
     }
@@ -87,9 +88,10 @@ pub async fn serve(ep: Endpoint, app: Router) -> Result<()> {
 
 async fn serve_connection(conn: Connection, app: Router) {
     // The remote endpoint id is a cryptographic identity, verified by the
-    // QUIC handshake; it becomes source.addr for every write on this
-    // connection.
-    let peer = crate::api::PeerAddr(format!("iroh:{}", conn.remote_id()));
+    // QUIC handshake: it is the credential of an installation calling with
+    // no token, and source.addr for every write on this connection.
+    let id = conn.remote_id();
+    let peer = crate::api::PeerAddr(format!("iroh:{id}"));
     let slots = Arc::new(Semaphore::new(MAX_STREAMS_PER_CONNECTION));
     // Streams stop arriving when the connection closes.
     while let Ok((send, recv)) = conn.accept_bi().await {
@@ -102,11 +104,14 @@ async fn serve_connection(conn: Connection, app: Router) {
         let svc = TowerToHyperService::new(app.clone().map_request(
             move |mut req: axum::http::Request<hyper::body::Incoming>| {
                 req.extensions_mut().insert(peer.clone());
+                req.extensions_mut().insert(IrohPeer(id));
                 req.map(Body::new)
             },
         ));
         tokio::spawn(async move {
-            let _ = hyper::server::conn::http1::Builder::new().serve_connection(io, svc).await;
+            let _ = hyper::server::conn::http1::Builder::new()
+                .serve_connection(io, svc)
+                .await;
             drop(slot);
         });
     }

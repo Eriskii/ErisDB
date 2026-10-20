@@ -17,13 +17,13 @@ import java.net.URLEncoder
  * `{"status": n, "body": …}`, or `{"status": 0, "error": …}` when the
  * transport never got an answer.
  *
- * Pairing, synchronization, and the outbox share this request boundary.
+ * Permissions, synchronization, and the outbox share this request boundary.
  */
 interface CoreApi {
     suspend fun request(method: String, path: String, body: String? = null): JSONObject
 }
 
-/** The real one: erisdb-client over Iroh QUIC. Every call blocks. */
+/** The real one: erisdb-client over Iroh QUIC, as the app's key. Every call blocks. */
 object ErisDBApi : CoreApi {
     override suspend fun request(method: String, path: String, body: String?): JSONObject =
         withContext(Dispatchers.IO) { ErisDB.request(method, path, body) }

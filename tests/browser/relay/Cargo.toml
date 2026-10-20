@@ -1,0 +1,11 @@
+[package]
+name = "erisdb-test-relay"
+version = "0.1.0"
+edition = "2024"
+description = "An Iroh relay for the browser suite: plain HTTP on loopback."
+license = "MIT"
+publish = false
+
+[dependencies]
+iroh-relay = { version = "1", features = ["server"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }

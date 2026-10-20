@@ -169,7 +169,7 @@ fun MainScreen(
 
             if (grants.readOnly) {
                 Text(
-                    "read-only · this pairing was granted ${describeGrant("$FACET:read")} " +
+                    "read-only · this app was granted ${describeGrant("$FACET:read")} " +
                         "and nothing more",
                     Modifier.padding(horizontal = 24.dp, vertical = 2.dp),
                     style = MaterialTheme.typography.labelSmall,

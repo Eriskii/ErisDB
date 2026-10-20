@@ -1,51 +1,234 @@
-// Real core process and disposable PostgreSQL; no intercepted API requests.
+// The browser suite's world, as real processes: an Iroh relay in plain-HTTP mode, a device
+// running ErisAuth that starts a mesh, ErisDB's core on PostgreSQL in Docker, joined to the
+// mesh through that device with its passphrase set, and the static apps. Every participant
+// reaches the others through the relay alone (ERIS_NETWORK), as a browser must.
+//
+// Beside the apps, under /harness/, the tests act as the person at the device and as ErisDB's
+// operator: they speak to ErisAuth's socket, stop and start the core, and read where things are.
+"use strict";
 const { execFileSync, spawn } = require("node:child_process");
 const { createServer } = require("node:http");
-const { readFile } = require("node:fs/promises");
+const { readFile, mkdtemp, rm } = require("node:fs/promises");
+const fs = require("node:fs");
+const net = require("node:net");
+const os = require("node:os");
 const path = require("node:path");
+
 const root = path.resolve(__dirname, "../..");
-const secret = "erisdb-browser-e2e-only";
-const binary = process.env.ERISDB_BIN || path.join(root, "erisdb/target/debug/erisdb");
-let postgres, core, http;
+const apps = path.join(root, "apps");
+const PORT = 18770;
+const CORE = "127.0.0.1:18771";
+const SECRET = "erisdb-browser-e2e-only";
+const PASSPHRASE = "correct horse battery";
+const erisauthSource = path.resolve(root, process.env.ERISAUTH_SOURCE || "../ErisAuth");
+const target = path.join(__dirname, "target");
+
+const children = new Set();
+let postgres, scratch, http, core;
 let stopping = false;
+
+function log(...what) { console.error("[harness]", ...what); }
 
 function stop() {
   if (stopping) return;
   stopping = true;
   http?.close();
-  core?.kill("SIGTERM");
-  if (postgres) execFileSync("docker", ["rm", "-f", postgres], { stdio: "ignore" });
+  for (const child of children) child.kill("SIGTERM");
+  if (postgres) { try { execFileSync("docker", ["rm", "-f", postgres], { stdio: "ignore" }); } catch {} }
+  if (scratch) fs.rmSync(scratch, { recursive: true, force: true });
 }
 process.once("SIGTERM", () => { stop(); process.exit(0); });
 process.once("SIGINT", () => { stop(); process.exit(0); });
 process.once("exit", stop);
 
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+async function until(what, check, ms = 120_000) {
+  const deadline = Date.now() + ms;
+  for (;;) {
+    let last;
+    try { last = await check(); if (last) return last; } catch (error) { last = error; }
+    if (Date.now() > deadline) throw new Error(`never: ${what} (${last?.message ?? JSON.stringify(last)})`);
+    await sleep(100);
+  }
+}
+
+function cargo(args, env = {}) {
+  execFileSync("cargo", args, { cwd: root, stdio: "inherit", env: { ...process.env, ...env } });
+}
+
+/** A child that lives as long as the harness, its output on ours. */
+function run(binary, args, env, options = {}) {
+  const child = spawn(binary, args, { env: { ...process.env, ...env }, stdio: options.stdio ?? ["ignore", "inherit", "inherit"] });
+  children.add(child);
+  child.once("exit", () => children.delete(child));
+  return child;
+}
+
+/** Run to completion, `input` on stdin; throws with its output when it fails. */
+function finish(child, input) {
+  return new Promise((resolve, reject) => {
+    let output = "";
+    child.stdout?.on("data", chunk => { output += chunk; });
+    child.stderr?.on("data", chunk => { output += chunk; });
+    if (input !== undefined) child.stdin.end(input);
+    child.once("exit", code => code === 0 ? resolve(output) : reject(new Error(`exited ${code}: ${output}`)));
+  });
+}
+
+// ---------------------------------------------------------------- ErisAuth
+// The person's device. Its socket takes the same commands its approval page sends.
+
+let erisauth;
+
+function say(line) {
+  return new Promise((resolve, reject) => {
+    const socket = net.createConnection(erisauth.socket);
+    let answer = "";
+    socket.once("connect", () => socket.write(JSON.stringify(line) + "\n"));
+    socket.on("data", chunk => {
+      answer += chunk;
+      const end = answer.indexOf("\n");
+      if (end >= 0) { socket.destroy(); resolve(JSON.parse(answer.slice(0, end))); }
+    });
+    socket.once("error", reject);
+  });
+}
+
+async function startErisAuth(binary, relay) {
+  const data = path.join(scratch, "erisauth-data");
+  const runtime = path.join(scratch, "erisauth-runtime");
+  fs.mkdirSync(data, { mode: 0o700 });
+  fs.mkdirSync(runtime, { mode: 0o700 });
+  erisauth = { binary, env: { XDG_DATA_HOME: data, XDG_RUNTIME_DIR: runtime, ERIS_NETWORK: relay }, runtime, socket: path.join(runtime, "erisauth/agent.sock") };
+  run(binary, ["serve", "--no-notify"], erisauth.env);
+  await until("ErisAuth listens", () => fs.existsSync(path.join(runtime, "erisauth/page")) && say({ op: "state" }));
+  const made = await say({ op: "init", name: "laptop" });
+  if (!made.ok) throw new Error("erisauth init: " + JSON.stringify(made));
+}
+
+// ---------------------------------------------------------------- ErisDB
+
+let erisdb;
+
+function coreEnv(relay, database) {
+  return { DATABASE_URL: database, ERISDB_SECRET: SECRET, ERISDB_LISTEN: CORE, ERIS_NETWORK: relay, XDG_RUNTIME_DIR: erisauth.runtime };
+}
+
+/** `erisdb join`, approved by the person at the device. */
+async function join() {
+  const joining = run(erisdb.binary, ["join"], erisdb.env, { stdio: ["ignore", "pipe", "pipe"] });
+  const done = finish(joining);
+  const prompt = await until("ErisAuth asks the person about ErisDB", async () =>
+    (await say({ op: "state" })).approvals.find(a => a.service === "erisdb" && a.serves));
+  const decided = await say({ op: "decide", id: prompt.id });
+  if (!decided.ok) throw new Error("approving ErisDB: " + JSON.stringify(decided));
+  await done;
+}
+
+async function setPassphrase() {
+  const setting = run(erisdb.binary, ["passphrase", "set"], erisdb.env, { stdio: ["pipe", "pipe", "pipe"] });
+  await finish(setting, PASSPHRASE + "\n");
+}
+
+async function startCore() {
+  core = run(erisdb.binary, ["serve"], erisdb.env);
+  await until("ErisDB answers over HTTP", async () => (await fetch(`http://${CORE}/v1/health`)).ok);
+  await until("the device reaches ErisDB", async () => (await say({ op: "state" })).mesh?.erisdb?.reachable === true);
+}
+
+async function stopCore() {
+  if (!core) return;
+  const stopped = new Promise(resolve => core.once("exit", resolve));
+  core.kill("SIGTERM");
+  await stopped;
+  core = null;
+}
+
+// ---------------------------------------------------------------- the apps
+
+const TYPES = { ".html": "text/html; charset=utf-8", ".js": "text/javascript", ".wasm": "application/wasm" };
+
+async function body(request) {
+  let text = "";
+  for await (const chunk of request) text += chunk;
+  return text ? JSON.parse(text) : null;
+}
+
+async function harness(request, response, route) {
+  const reply = (value, status = 200) => {
+    response.writeHead(status, { "Content-Type": "application/json" }).end(JSON.stringify(value));
+  };
+  if (route === "/harness" && request.method === "GET") {
+    return reply({ core: `http://${CORE}`, token: erisdb.token, passphrase: PASSPHRASE, relay: erisdb.env.ERIS_NETWORK });
+  }
+  if (route === "/harness/erisauth" && request.method === "POST") return reply(await say(await body(request)));
+  if (route === "/harness/erisdb/stop" && request.method === "POST") { await stopCore(); return reply({ ok: true }); }
+  if (route === "/harness/erisdb/start" && request.method === "POST") { await startCore(); return reply({ ok: true }); }
+  reply({ error: "no such harness route" }, 404);
+}
+
+async function serve(request, response) {
+  const route = new URL(request.url, "http://localhost").pathname;
+  if (route === "/ready") { response.end("ready"); return; }
+  if (route === "/harness" || route.startsWith("/harness/")) {
+    try { await harness(request, response, route); }
+    catch (error) { response.writeHead(500).end(String(error?.stack ?? error)); }
+    return;
+  }
+  let resource = path.resolve(apps, "." + route);
+  if (!resource.startsWith(apps + path.sep)) { response.writeHead(404).end(); return; }
+  if (route.endsWith("/")) resource = path.join(resource, "index.html");
+  try {
+    const bytes = await readFile(resource);
+    response.writeHead(200, { "Content-Type": TYPES[path.extname(resource)] ?? "application/octet-stream" }).end(bytes);
+  } catch { response.writeHead(404).end(); }
+}
+
+// ---------------------------------------------------------------- start
+
 (async () => {
-  if (!process.env.ERISDB_BIN) execFileSync("cargo", ["build", "--locked", "--manifest-path", "erisdb/Cargo.toml", "--bin", "erisdb"], { cwd: root, stdio: "inherit" });
-  postgres = execFileSync("docker", ["run", "--rm", "-d", "-e", "POSTGRES_PASSWORD=erisdb-e2e", "-p", "127.0.0.1::5432", "postgres:17-alpine"], { encoding: "utf8" }).trim();
-  const address = execFileSync("docker", ["port", postgres, "5432/tcp"], { encoding: "utf8" }).trim();
+  scratch = await mkdtemp(path.join(os.tmpdir(), "erisdb-browser-"));
+
+  const relayBinary = process.env.ERISDB_RELAY_BIN || path.join(target, "debug/erisdb-test-relay");
+  if (!process.env.ERISDB_RELAY_BIN) cargo(["build", "--manifest-path", path.join(__dirname, "relay/Cargo.toml")], { CARGO_TARGET_DIR: target });
+  const coreBinary = process.env.ERISDB_BIN || path.join(root, "erisdb/target/debug/erisdb");
+  if (!process.env.ERISDB_BIN) cargo(["build", "--manifest-path", "erisdb/Cargo.toml", "--bin", "erisdb"]);
+  const erisauthBinary = process.env.ERISAUTH_BIN || path.join(target, "debug/erisauth");
+  if (!process.env.ERISAUTH_BIN) {
+    if (!fs.existsSync(path.join(erisauthSource, "Cargo.toml"))) {
+      throw new Error("the suite runs ErisAuth: set ERISAUTH_SOURCE to its checkout or ERISAUTH_BIN to a built erisauth");
+    }
+    cargo(["build", "--manifest-path", path.join(erisauthSource, "Cargo.toml"), "--bin", "erisauth"], { CARGO_TARGET_DIR: target });
+  }
+
+  const relayProcess = run(relayBinary, [], {}, { stdio: ["ignore", "pipe", "inherit"] });
+  const relay = await new Promise((resolve, reject) => {
+    let said = "";
+    relayProcess.stdout.on("data", chunk => {
+      said += chunk;
+      const line = said.split("\n")[0];
+      if (said.includes("\n")) resolve(line.trim());
+    });
+    relayProcess.once("exit", code => reject(new Error(`the relay exited ${code}`)));
+  });
+  log("relay at", relay);
+
+  postgres = execFileSync("docker", ["run", "--rm", "-d", "--label", "dev.erisdb.browser-suite=1", "-e", "POSTGRES_PASSWORD=erisdb-e2e", "-p", "127.0.0.1::5432", "postgres:17-alpine"], { encoding: "utf8" }).trim();
+  const address = execFileSync("docker", ["port", postgres, "5432/tcp"], { encoding: "utf8" }).trim().split("\n")[0];
   const database = `postgres://postgres:erisdb-e2e@${address}/postgres`;
-  for (let tries = 0; ; tries++) {
-    try { execFileSync("docker", ["exec", postgres, "pg_isready", "-h", "127.0.0.1", "-U", "postgres"], { stdio: "ignore" }); break; }
-    catch (error) { if (tries === 100) throw error; await new Promise(resolve => setTimeout(resolve, 100)); }
-  }
-  core = spawn(binary, ["serve", "--database-url", database, "--secret", secret, "--listen", "127.0.0.1:18771", ...(process.env.ERISDB_TEST_IROH ? [] : ["--no-iroh"])], { stdio: "inherit" });
-  for (let tries = 0; ; tries++) {
-    try { if ((await fetch("http://127.0.0.1:18771/v1/health")).ok) break; }
-    catch {}
-    if (tries === 600 || core.exitCode !== null) throw new Error("real core did not start");
-    await new Promise(resolve => setTimeout(resolve, 100));
-  }
-  http = createServer(async (request, response) => {
-    if (request.url === "/ready") { response.end("ready"); return; }
-    let resource = path.resolve(root, "." + new URL(request.url, "http://localhost").pathname);
-    if (!resource.startsWith(path.join(root, "apps") + path.sep)) { response.writeHead(404).end(); return; }
-    if (resource.endsWith(path.sep)) resource += "index.html";
-    if (!path.extname(resource)) resource = path.join(resource, "index.html");
-    try {
-      const type = resource.endsWith(".js") ? "text/javascript" : "text/html";
-      response.setHeader("Content-Type", type);
-      response.end(await readFile(resource));
-    } catch { response.writeHead(404).end(); }
-  }).listen(18770, "127.0.0.1");
+  await until("PostgreSQL is ready", () => {
+    execFileSync("docker", ["exec", postgres, "pg_isready", "-h", "127.0.0.1", "-U", "postgres"], { stdio: "ignore" });
+    return true;
+  });
+
+  await startErisAuth(erisauthBinary, relay);
+  erisdb = { binary: coreBinary, env: coreEnv(relay, database) };
+  await join();
+  await setPassphrase();
+  await startCore();
+  erisdb.token = execFileSync(coreBinary, ["mint", "--grant", "*", "--ttl", "86400", "--secret", SECRET], { encoding: "utf8" }).trim();
+  log("ErisDB serves, joined to the mesh");
+
+  http = createServer((request, response) => { serve(request, response); }).listen(PORT, "127.0.0.1");
 })().catch(error => { console.error(error); stop(); process.exit(1); });

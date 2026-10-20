@@ -1,7 +1,7 @@
 //! Local JSON schemas shared by stored facets and executable plugins.
 
-use serde_json::Value;
 use crate::error::{Error, Result};
+use serde_json::Value;
 
 pub(crate) fn compile(schema: &Value) -> Result<jsonschema::Validator> {
     guard_schema(schema)?;

@@ -27,7 +27,10 @@ chrono = { version = "0.4", features = ["serde"] }
 # the rest at registration.
 jsonschema = { version = "0.49", default-features = false }
 thiserror = "2"
-erislogin = { git = "https://github.com/Eriskii/ErisLogin", tag = "v0.4.1" }
+erisoverlaynetwork = { git = "https://github.com/Eriskii/ErisOverlayNetwork", tag = "v0.2.0" }
+argon2 = "0.5"
+password-hash = { version = "0.5", features = ["getrandom"] }
+rpassword = "7"
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
 tracing = "0.1"
@@ -39,12 +42,20 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "str
 hyper = { version = "1", features = ["client", "http1"] }
 http-body-util = "0.1"
 testcontainers-modules = { version = "0.15", features = ["postgres"] }
+# Its tests keep one Postgres and use it again on the next run.
+testcontainers = { version = "0.27", features = ["reusable-containers"] }
 anyhow = "1"
-rqrr = "0.10.1"
-png = "0.18.1"
-sha2 = "0.10"
 base64 = "0.22"
+tempfile = "3"
 
 [[bin]]
 name = "erisdb"
 path = "src/bin/erisdb.rs"
+
+# Checking a passphrase hashes it with Argon2id, which is slow on purpose and
+# unbearably slow unoptimized: debug builds and their tests optimize it alone.
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
+opt-level = 3

@@ -23,8 +23,8 @@ That has consequences for what a name may be:
 - One segment of `[a-z0-9][a-z0-9._-]*`. No uppercase, no spaces, no `:`
   and no `*` — a name containing either would be a way to write a
   permission by registering something.
-- Not `meta`, `facet`, `system` or `pair`. The first is the core's own
-  namespace; the other three are its own facets.
+- Not `meta`, `facet` or `system`. The first is the core's own namespace; the
+  other two are its own facets.
 - Unique across the store, enforced by an index rather than a check.
 
 A registration that breaks the first two is **400 `bad_request`** naming
@@ -57,7 +57,7 @@ A definition is a body with six fields:
 | `version` | no | — | An integer ≥ 1. Documentation: the core stores it and never reads it. |
 | `strict` | no | `true` | When false, item bodies are not checked against the schema. The schema itself must still be valid. |
 | `lapse` | no | — | `{"due": field, "done": field}`. Makes the tick sweep watch this facet. |
-| `permissions` | no | — | Human sentences for the pairing prompt, keyed by action. Presentation only. |
+| `permissions` | no | — | Human sentences for each action, for an app to show when it explains what it asks for. Presentation only. |
 
 `additionalProperties` is false: a definition carrying anything else is a
 422. So is one missing `name` or `schema`. The schema runs before the name
@@ -101,8 +101,8 @@ curl -fsS http://127.0.0.1:7700/v1/items \
 `exercise` is validated against that schema, and `exercise:create` starts
 meaning something to every token that already held it.
 
-**That is the whole path to a new client.** The client pairs and asks for
-`exercise:read` and `exercise:create`; a human approves. The client initializes
+**That is the whole path to a new client.** The client asks a device for
+`exercise:read` and `exercise:create`; a person approves. The client initializes
 its missing schema with `exercise:create`, then saves data. No deploy,
 allowlist, core release, or restart is needed. An administrator can also
 register schemas with `meta:facets:write`.
@@ -128,25 +128,19 @@ time.
 Writing to a facet nobody has registered is the same 422. There is no
 implicit creation — a typo in a facet name is an error, not a new facet.
 
-## The other two meta-facets
+## The other meta-facet
 
-`system` and `pair` are the core's own, and each has exactly one name:
+`system` is the core's own, and has exactly one name:
 
 | facet | holds | permission |
 |-------|-------|------------|
-| `system` | nothing; the tick's change rows are filed under it | `meta:system:read` for every action; `meta:system:tick` fires the tick |
-| `pair` | pairing sessions | `meta:pairing:read` to look, `meta:pairing:create` to cut, `meta:pairing:approve` to change |
+| `system` | nothing; the tick's and the installations' change rows are filed under it | `meta:system:read` for every action; `meta:system:tick` fires the tick |
 
-Neither has a registration in the store — `system` has none at all, so a
-write naming it is a 422 whatever the token holds. `pair` has one, and its
-schema is what the pairing routes write through.
-
-Neither is writable through the item routes at all. `POST`, `PUT` and
-`DELETE` naming `system` or `pair` are refused with a 400 pointing at the
-endpoints that own them, whatever the token holds — a hand-written session
-could otherwise claim an approval nobody gave, and the state machine is the
-only thing that should be able to produce one. Reading them as items is
-ordinary and still works.
+It has no registration in the store and is not writable through the item routes
+at all: `POST`, `PUT` and `DELETE` naming `system` are refused with a 400,
+whatever the token holds. The core writes its events itself, so no grant is a
+way to forge a tick or an installation's audit row. Its rows are read on the
+feed, with `meta:system:read`.
 
 ## Validation and `strict`
 
@@ -213,7 +207,7 @@ guess.
 
 ## Permission descriptions
 
-A registration may carry human sentences for the approval prompt. Add this
+A registration may carry human sentences for its actions. Add this
 `permissions` member to its body:
 
 ```json
@@ -230,8 +224,8 @@ A registration may carry human sentences for the approval prompt. Add this
 Keys are actions, values are strings; the meta-facet schema requires
 nothing more, so a facet defining `sync` may describe `sync` too. They are
 presentation only: no grant depends on them, a missing one shows the raw
-permission, and authorization does not use these descriptions. They exist so that the
-person deciding whether to approve `tasks:delete` reads "delete tasks"
+permission, and authorization does not use these descriptions. They exist so that
+an app explaining why it asks for `tasks:delete` can say "delete tasks"
 instead.
 
 ## Lapse rules and the tick sweep

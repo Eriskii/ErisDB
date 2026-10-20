@@ -28,7 +28,7 @@ commit order the same order, which is exactly what lets a cursor be a
 single number. Writers take it after whatever item lock they need, so the
 order is always item-then-feed and there is no cycle to deadlock on.
 
-The e2e suite pins the property — forty concurrent writers, one cursor
+The e2e suite checks the property — forty concurrent writers, one cursor
 walking the feed while they commit, and every write observed.
 
 `seq` is unique and increasing. It is not dense: an aborted transaction
@@ -95,10 +95,10 @@ authorization check reads the facet from the item's *first* change row, so
 it works even after the facet's definition is gone.
 
 And it returns **404 for an item with no change rows**, which is not quite
-the same as "no such item". The rows this actually catches are the two
-bootstrap registrations, `facet` and `pair`: both were inserted during
-initialization, never written through the API, and so have no history at all
-despite being perfectly real items.
+the same as "no such item". The row this actually catches is the bootstrap
+registration of `facet` itself: it was inserted during initialization, never
+written through the API, and so has no history at all despite being a perfectly
+real item.
 
 `POST /v1/items/{id}/revert` takes a `seq` from that history and writes
 that body back as a **new** revision. It is git-revert, not time travel:
@@ -137,24 +137,19 @@ The other half of the same fact: **restoring `items` without `changes` is
 not a restore.** Every sync client holds a cursor into the feed, and a feed
 that has lost its tail leaves those cursors pointing at a history that no
 longer exists. Back up and restore the whole database, including the `clients`
-registry, together; see [signing keys and backups](clients.md#signing-keys-and-backups).
+registry, together; see [keys and backups](clients.md#keys-and-backups).
 
 If a body should never be in the store, it must never be written. There is
 no route that removes a row from `changes` — deleting the item does not,
 and reverting past it does not.
 
-## Everything lands on it, pairing included
+## Everything lands on it, installations included
 
-A pairing session is an ordinary item in the `pair` facet, which is what
-lets a dashboard watch a request arrive live: `created` when a code is cut,
-`updated` when a client redeems it, `updated` again when a human answers.
-That is the point of holding the conversation in the store rather than in
-the process — it survives a restart and it replicates.
-
-Pairing snapshots contain requested and approved grants, the identity commitment,
-fingerprint, access lifetime, optional installation deadline, and user label.
-They never contain the pairing token, issued access token, or raw installation
-secret. Collection creates or updates the installation and records the session
-as collected. While the ticket remains live, the same installation proof can
-repeat collection to recover a lost response; the access token is generated for
-the response and never written into the session or its history.
+Every change to an installation is a `system` row: `created` when a device
+enrolls an app, `updated` when it enrolls it again, when the operator changes
+its grants or revokes it, and when the mesh ends it. That is what lets a
+dashboard watch apps arrive and leave live, on any replica. Each row carries the
+whole installation as it stood — its app key, device, note and grants — and the
+source that changed it: the enrolling device's `iroh:` address, the operator's
+token, or `{"mesh": "device removed"}` and `{"mesh": "note revoked"}`. No row
+holds a passphrase or a key's secret half; installations have neither.

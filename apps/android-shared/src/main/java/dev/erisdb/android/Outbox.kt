@@ -54,9 +54,9 @@ sealed class Sent {
 /**
  * Why an op is leaving the queue for good.
  *
- * A 403 is the human's answer arriving late: the pairing granted less
- * than this app asked for, and no number of retries turns that into a
- * yes, so the op goes and the permission is named. Missing schema is
+ * A 403 is the person's answer arriving late: they let this app in with
+ * less than it asked for, or took some back, and no number of retries
+ * turns that into a yes, so the op goes and the permission is named. Missing schema is
  * retryable: sync initializes it before the next attempt.
  */
 fun rejected(action: String, facet: String, r: JSONObject): Sent.Dropped {
@@ -64,7 +64,7 @@ fun rejected(action: String, facet: String, r: JSONObject): Sent.Dropped {
     return Sent.Dropped(
         when {
             status == 403 ->
-                "dropped $action: this pairing does not grant $facet:$action"
+                "dropped $action: this app was not granted $facet:$action"
             else -> "dropped $action: " + why(r)
         }
     )

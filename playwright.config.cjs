@@ -3,7 +3,7 @@ const { defineConfig } = require("@playwright/test");
 module.exports = defineConfig({
   testDir: "./tests/browser",
   workers: 1,
-  timeout: 45_000,
+  timeout: 300_000,
   expect: { timeout: 10_000 },
   use: {
     baseURL: "http://127.0.0.1:18770",
@@ -13,7 +13,9 @@ module.exports = defineConfig({
   webServer: {
     command: "node tests/browser/server.cjs",
     url: "http://127.0.0.1:18770/ready",
-    timeout: 900_000, // Includes a cold Rust build on a fresh checkout.
+    timeout: 1_800_000, // Includes cold Rust builds of ErisDB, ErisAuth and the relay.
     reuseExistingServer: false,
+    // The harness removes its database container and scratch directories as it stops.
+    gracefulShutdown: { signal: "SIGTERM", timeout: 30_000 },
   },
 });

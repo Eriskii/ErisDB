@@ -5,88 +5,118 @@ import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
 import android.os.IBinder
+import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
 import org.json.JSONArray
 import org.json.JSONObject
 
 /**
- * Signing an app in through ErisAuth on this phone, instead of showing the person a ticket.
+ * Asking ErisAuth on this phone to approve an app, as an app beside ErisAuth on a computer asks
+ * over its agent socket. Vendor this file and [Wire] as they are.
  *
  * ```
  * ErisAuth.connect(context) { erisAuth ->
- *     if (erisAuth == null) { showScanOrPaste(); return@connect }
- *     erisAuth.ask("erisdb", "Notes", listOf("notes:read"), ErisAuth.Identity.iroh(myKeyHex), object : ErisAuth.Listener {
- *         override fun onTicket(ticket: String) = redeemWithMyKey(ticket)
- *         override fun onAnswer(answer: ErisAuth.Answer) = if (answer is ErisAuth.Answer.Approved) collect() else …
- *     })
+ *     if (erisAuth == null) return@connect askByTicket()          // no ErisAuth on this phone
+ *     erisAuth.approve("erisdb", "Tasks", listOf("tasks:read"), serves = false, app = myEndpointIdHex) { answer ->
+ *         when (answer) {
+ *             is ErisAuth.Answer.Approved -> keep(answer.note, answer.snapshot)
+ *             is ErisAuth.Answer.Denied -> tellThePerson(answer.why)
+ *             is ErisAuth.Answer.Failed -> tellThePerson(answer.why)
+ *         }
+ *     }
  * }
  * ```
  *
- * The app redeems the ticket itself, with the key it named, exactly as it would a scanned one, and
- * collects its own credential from the service once approved: nothing it does later passes
- * through ErisAuth. Callbacks arrive on a binder thread.
+ * The person sees the app as Android names it, by its package and the SHA-256 of its signing
+ * certificate, and approves it as asked, approves part of its grants, or denies it. An app for
+ * ErisDB is approved only once the person has typed the ErisDB passphrase and ErisDB has accepted
+ * the app's note. The note names [approve]'s `app`, the app's own Iroh key as its endpoint id in
+ * hex, and only that key can use it. Answers arrive on a binder thread.
  */
 class ErisAuth private constructor(
     private val context: Context,
     private val connection: ServiceConnection,
     private val service: IBinder,
 ) {
-    /** The key an app redeems its ticket with. */
-    data class Identity(val kind: String, val key: String) {
-        companion object {
-            /** An Iroh key, as its endpoint id in hex. */
-            fun iroh(endpointId: String) = Identity("iroh", endpointId)
-        }
-    }
-
     sealed class Answer {
-        data class Approved(val granted: List<String>) : Answer()
+        /** The app's note and a snapshot of the mesh, each as its JSON text. */
+        data class Approved(val note: String, val snapshot: String) : Answer()
         data class Denied(val why: String) : Answer()
         data class Failed(val why: String) : Answer()
 
         companion object {
+            /** An agent reply line as an answer. */
             fun parse(json: String): Answer = runCatching {
-                val answer = JSONObject(json)
+                val reply = JSONObject(json)
                 when {
-                    answer.has("approved") -> answer.getJSONArray("approved").let { granted ->
-                        Approved(List(granted.length()) { granted.getString(it) })
+                    reply.has("approved") -> reply.getJSONObject("approved").let {
+                        Approved(it.getJSONObject("note").toString(), it.getJSONObject("snapshot").toString())
                     }
-                    answer.has("denied") -> Denied(answer.getString("denied"))
-                    else -> Failed(answer.optString("error", "ErisAuth sent no answer"))
+                    reply.has("denied") -> Denied(reply.getString("denied"))
+                    reply.has("error") -> Failed(reply.getString("error"))
+                    else -> Failed("ErisAuth answered something else: $json")
                 }
             }.getOrElse { Failed("ErisAuth sent something unreadable") }
         }
     }
 
-    interface Listener {
-        fun onTicket(ticket: String)
-        fun onAnswer(answer: Answer)
-    }
-
-    /** One request; [withdraw] takes it back. */
-    inner class Request internal constructor() {
-        @Volatile internal var id: String? = null
+    /** One request to ErisAuth; [withdraw] takes it back. */
+    inner class Request internal constructor(val id: String) {
         fun withdraw() {
-            id?.let { runCatching { Wire.withdraw(service, it) } }
+            if (open.remove(id) != null) runCatching { Wire.withdraw(service, id) }
         }
     }
 
-    /** Ask for [requested] at [service] as [client], to be redeemed with [identity]. */
-    fun ask(service: String, client: String, requested: List<String>, identity: Identity, listener: Listener): Request {
-        val request = Request()
+    /** The requests waiting for an answer, each with what to do with it. */
+    private val open = ConcurrentHashMap<String, (String) -> Unit>()
+
+    /** Should ErisAuth go away, every open request fails. */
+    private val gone = IBinder.DeathRecipient {
+        val failed = """{"error":"ErisAuth went away"}"""
+        open.keys.toList().forEach { id -> open.remove(id)?.invoke(failed) }
+    }
+
+    init {
+        runCatching { service.linkToDeath(gone, 0) }
+    }
+
+    private fun ask(line: String, answered: (String) -> Unit): Request {
+        val id = UUID.randomUUID().toString()
+        open[id] = answered
         val callback = object : Wire.Callback() {
-            override fun onTicket(id: String, ticket: String) {
-                request.id = id
-                listener.onTicket(ticket)
+            override fun onAnswer(json: String) {
+                open.remove(id)?.invoke(json)
             }
-
-            override fun onAnswer(answer: String) = listener.onAnswer(Answer.parse(answer))
         }
-        Wire.ask(this.service, askJson(service, client, requested, identity), callback)
-        return request
+        runCatching { Wire.ask(service, id, line, callback) }.onFailure {
+            open.remove(id)?.invoke(JSONObject().put("error", "could not reach ErisAuth: ${it.message}").toString())
+        }
+        return Request(id)
     }
 
-    /** Let ErisAuth go. A request still open is withdrawn with the connection. */
+    /**
+     * Ask to approve the app holding the key [app] (its endpoint id, in hex) for [service], under
+     * [name], with [grants], serving the service to other apps when [serves]. [listener] hears the
+     * answer once.
+     */
+    fun approve(
+        service: String,
+        name: String,
+        grants: List<String>,
+        serves: Boolean,
+        app: String,
+        listener: (Answer) -> Unit,
+    ): Request = ask(approveJson(service, name, grants, serves, app)) { listener(Answer.parse(it)) }
+
+    /** The mesh as this phone's ErisAuth has it, as a snapshot's JSON text; null when it has none. */
+    fun snapshot(ready: (String?) -> Unit) {
+        ask(SNAPSHOT) { reply -> ready(runCatching { JSONObject(reply).getJSONObject("snapshot").toString() }.getOrNull()) }
+    }
+
+    /** Let ErisAuth go. Requests still open are withdrawn. */
     fun close() {
+        open.keys.toList().forEach { Request(it).withdraw() }
+        runCatching { service.unlinkToDeath(gone, 0) }
         runCatching { context.unbindService(connection) }
     }
 
@@ -94,25 +124,32 @@ class ErisAuth private constructor(
         const val PACKAGE = "dev.eris.auth"
         const val ACTION = "dev.eris.auth.SIGN_IN"
 
-        fun askJson(service: String, client: String, requested: List<String>, identity: Identity): String =
+        /** The version of the agent protocol these requests speak. */
+        const val VERSION = 2
+
+        /** The agent socket's snapshot request line. */
+        val SNAPSHOT: String get() = JSONObject().put("op", "snapshot").put("v", VERSION).toString()
+
+        /** The agent socket's approve request line. */
+        fun approveJson(service: String, name: String, grants: List<String>, serves: Boolean, app: String): String =
             JSONObject()
-                .put("v", 1)
-                .put("op", "pair")
+                .put("op", "approve")
+                .put("v", VERSION)
                 .put("service", service)
-                .put("client", client)
-                .put("requested", JSONArray(requested))
-                .put("identity", JSONObject().put("kind", identity.kind).put("key", identity.key))
+                .put("name", name)
+                .put("grants", JSONArray(grants))
+                .put("serves", serves)
+                .put("app", app)
                 .toString()
 
         private fun intent() = Intent(ACTION).setPackage(PACKAGE)
 
         /** Whether ErisAuth is installed here. */
-        fun isInstalled(context: Context): Boolean =
-            context.packageManager.resolveService(intent(), 0) != null
+        fun isInstalled(context: Context): Boolean = context.packageManager.resolveService(intent(), 0) != null
 
         /**
          * Connect to ErisAuth. [ready] hears it, or null when it is not installed or will not
-         * connect, in which case the app pairs by ticket as it always can.
+         * connect, in which case the app asks a device by ticket instead.
          */
         fun connect(context: Context, ready: (ErisAuth?) -> Unit) {
             val app = context.applicationContext

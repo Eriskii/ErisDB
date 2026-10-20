@@ -1,778 +1,647 @@
-//! The erisdb-client interface, proven against a real core: real Postgres
-//! (Docker via testcontainers), a real erisdb serving over real Iroh QUIC,
-//! and this client dialing it. No mocks.
+//! The erisdb-client interface, proven against a real core in a real mesh:
+//! Postgres in a container, the erisdb binary joined to a mesh and serving
+//! over Iroh, a device node built from the mesh library in this process,
+//! and this client dialing as apps the device let in. ErisAuth is a stand-in
+//! on its agent socket that does what ErisAuth does once the person says
+//! yes, through this crate: it signs the note and enrolls it at the mesh's
+//! ErisDB from the device's own endpoint. Every endpoint is on loopback.
 
 // The facade lock is held across awaits on purpose: it serializes whole
 // tests against a process-wide client, which is exactly the span it has
 // to cover.
 #![allow(clippy::await_holding_lock)]
 
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
-use erisdb_client::{Cancel, Client, Pairing};
+use erisdb_client::{Client, Enrolled, Guarded, SignIn};
+use erisoverlaynetwork::agent::{self, Ask, Reply, Request};
+use erisoverlaynetwork::devices::Op;
+use erisoverlaynetwork::mesh::{self, Config, Local, MemoryStore, Node};
+use erisoverlaynetwork::net::{self, Network};
+use erisoverlaynetwork::NoteId;
+use iroh::protocol::Router;
+use iroh::{EndpointAddr, EndpointId, SecretKey};
 use serde_json::{json, Value};
-use sqlx::postgres::PgPoolOptions;
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
+use testcontainers_modules::testcontainers::ContainerAsync;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-const SECRET: &[u8] = b"client-e2e-secret";
+const PASSPHRASE: &str = "correct horse battery staple";
 
 /// The blocking facade is process-wide by design — one runtime, one
 /// client slot — so the tests that drive it take turns.
 fn facade() -> std::sync::MutexGuard<'static, ()> {
-    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static LOCK: Mutex<()> = Mutex::new(());
     LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// A migrated store, a core serving over Iroh, and the addr to dial.
-async fn spawn_core() -> (
-    testcontainers_modules::testcontainers::ContainerAsync<Postgres>,
-    iroh::EndpointAddr,
-) {
-    let container = Postgres::default().start().await.expect("start postgres");
-    let port = container.get_host_port_ipv4(5432).await.expect("pg port");
-    let pool = PgPoolOptions::new()
-        .max_connections(8)
-        .connect(&format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres"))
-        .await
-        .expect("db connect");
-    erisdb::MIGRATOR.run(&pool).await.expect("migrate");
-    let app = erisdb::app(pool, SECRET.to_vec());
-    let ep = erisdb::net::endpoint(SECRET).await.expect("endpoint");
-    let addr = erisdb::net::advertised_addr(&ep).await.expect("addr");
-    tokio::spawn(erisdb::net::serve(ep, app));
-    (container, addr)
+/// The erisdb binary: `ERISDB_BIN`, or `../erisdb` built once for the run.
+fn erisdb_binary() -> PathBuf {
+    static BINARY: OnceLock<PathBuf> = OnceLock::new();
+    BINARY
+        .get_or_init(|| {
+            if let Ok(path) = std::env::var("ERISDB_BIN") {
+                return PathBuf::from(path);
+            }
+            let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../erisdb/Cargo.toml");
+            let built = std::process::Command::new(env!("CARGO"))
+                .args(["build", "--bin", "erisdb", "--manifest-path"])
+                .arg(&manifest)
+                .status()
+                .expect("build the erisdb binary");
+            assert!(built.success(), "a real ErisDB binary is required; build ../erisdb or set ERISDB_BIN");
+            manifest.with_file_name("target/debug/erisdb")
+        })
+        .clone()
 }
 
-#[tokio::test]
-async fn the_client_speaks_erisdb_over_iroh() {
-    let (_pg, addr) = spawn_core().await;
-    let token = erisdb::auth::mint(SECRET, &["*"], Some(3600), Some("droid")).unwrap();
+/// A device as ErisAuth runs one.
+struct Device {
+    node: Node,
+    _router: Router,
+}
 
-    // A deterministic client identity: the same secret dials as the same
-    // endpoint id every time, so source.addr is stable per device.
-    let identity = [7u8; 32];
-    let client = Client::dial_addr(addr, &token, "Lists (Android) v0.1", Some(identity))
-        .await
-        .expect("dial");
-
-    // Health, unauthenticated path shape.
-    let (status, body) = client.request("GET", "/v1/health", None).await.expect("health");
-    assert_eq!(status, 200);
-    assert_eq!(body["ok"], true);
-
-    // Register the lists facet and write through the client. The facet's
-    // name is its permission namespace; the schema version rides in the
-    // body, so `lists:read` survives a v2.
-    let (status, _) = client
-        .request(
-            "POST",
-            "/v1/items",
-            Some(json!({"facet": "facet", "body": {
-                "name": "lists",
-                "version": 1,
-                "schema": {"type": "object", "required": ["list", "name"]}
-            }})),
-        )
+impl Device {
+    async fn founder(name: &str) -> Device {
+        let key = SecretKey::generate();
+        let endpoint = net::endpoint(key.clone(), &Network::Loopback).await.unwrap();
+        let node = Node::start(Config {
+            endpoint: endpoint.clone(),
+            network: Network::Loopback,
+            local: Local::Device(key),
+            store: Arc::new(MemoryStore::default()),
+        })
         .await
         .unwrap();
-    assert_eq!(status, 201);
-    let (status, item) = client
-        .request(
-            "POST",
-            "/v1/items",
-            Some(json!({"facet": "lists", "body": {"list": "books", "name": "Piranesi"}})),
-        )
-        .await
-        .unwrap();
-    assert_eq!(status, 201, "{item}");
-    // The full source pipeline holds over QUIC: signed user, claimed
-    // client, and the DERIVED device identity as the observed addr.
-    assert_eq!(item["source"]["user"], "droid");
-    assert_eq!(item["source"]["client"], "Lists (Android) v0.1");
-    let device_id = iroh::SecretKey::from_bytes(&identity).public().to_string();
-    assert_eq!(item["source"]["addr"], format!("iroh:{device_id}"));
+        node.create(name).await.unwrap();
+        let router = Router::builder(endpoint).accept(mesh::ALPN, node.protocol()).spawn();
+        Device { node, _router: router }
+    }
 
-    // Reads round-trip.
-    let (status, listed) = client.request("GET", "/v1/items?facet=lists", None).await.unwrap();
-    assert_eq!(status, 200);
-    assert_eq!(listed["items"].as_array().unwrap().len(), 1);
-
-    // Several requests share one connection (one bi-stream each); the
-    // client survives sequential use without redialing.
-    for _ in 0..3 {
-        let (status, _) = client.request("GET", "/v1/health", None).await.unwrap();
-        assert_eq!(status, 200);
+    /// ErisDB as ErisAuth reaches it: from the device's own endpoint, synced first.
+    async fn erisdb(&self) -> Client {
+        erisauth_client(&self.node).await
     }
 }
 
-/// A token can always be asked what it holds — no permission required,
-/// since the answer is already inside the token the caller is carrying.
-#[tokio::test]
-async fn the_client_reads_its_own_permissions() {
-    let (_pg, addr) = spawn_core().await;
-    let token =
-        erisdb::auth::mint(SECRET, &["tasks:read", "lists:*"], Some(3600), Some("droid")).unwrap();
-    let client = Client::dial_addr(addr, &token, "Curious v0", Some([16u8; 32])).await.expect("dial");
-
-    let held = client.permissions().await.expect("permissions");
-    assert_eq!(held.grants, ["tasks:read", "lists:*"]);
-    assert_eq!(held.user.as_deref(), Some("droid"));
-    assert!(held.exp.is_some(), "an expiring token says when");
+async fn erisauth_client(node: &Node) -> Client {
+    let erisdb = node.provider("erisdb").expect("the mesh has an ErisDB");
+    node.sync_with(erisdb.id).await.unwrap();
+    Client::over(node.endpoint().clone(), erisdb.endpoint_addr(), "ErisAuth")
 }
 
-#[tokio::test]
-async fn the_client_refreshes_its_capability() {
-    let (_pg, addr) = spawn_core().await;
-    // A short-lived token, the shape a device holds between refreshes.
-    let old = erisdb::auth::mint(SECRET, &["*"], Some(30), Some("droid")).unwrap();
+/// What the person at the stand-in ErisAuth does with a request: approve
+/// these grants, or say no.
+type Person = Arc<dyn Fn(&Ask) -> Option<Vec<String>> + Send + Sync>;
 
-    let client = Client::dial_addr(addr.clone(), &old, "Refresher v0", Some([8u8; 32]))
+fn approves_as_asked() -> Person {
+    Arc::new(|ask: &Ask| Some(ask.grants.clone()))
+}
+
+/// ErisAuth's agent socket on `device`, answering as ErisAuth does once the
+/// person has: an app approved to serve `erisdb` replaces every ErisDB before
+/// it, whose notes are revoked; an app asking to call it is enrolled at the
+/// mesh's ErisDB with the passphrase, and approved only once ErisDB took it.
+struct Agent {
+    runtime: tempfile::TempDir,
+}
+
+impl Agent {
+    async fn on(device: &Device, person: Person) -> Agent {
+        let runtime = tempfile::tempdir().unwrap();
+        let path = agent::socket_in(runtime.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let node = device.node.clone();
+        let erisdbs: Arc<tokio::sync::Mutex<Vec<NoteId>>> = Arc::default();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let (node, person, erisdbs) = (node.clone(), person.clone(), erisdbs.clone());
+                tokio::spawn(async move {
+                    let (read, mut write) = stream.into_split();
+                    let mut line = String::new();
+                    BufReader::new(read).read_line(&mut line).await.unwrap();
+                    let reply = match serde_json::from_str::<Request>(&line).unwrap() {
+                        Request::Approve { ask, .. } => answer(&node, &erisdbs, &ask, person(&ask)).await,
+                        Request::Snapshot { .. } => Reply::Snapshot(node.snapshot().await.unwrap()),
+                    };
+                    let mut out = serde_json::to_vec(&reply).unwrap();
+                    out.push(b'\n');
+                    let _ = write.write_all(&out).await;
+                });
+            }
+        });
+        Agent { runtime }
+    }
+
+    fn socket(&self) -> PathBuf {
+        agent::socket_in(self.runtime.path())
+    }
+}
+
+async fn answer(
+    node: &Node,
+    erisdbs: &tokio::sync::Mutex<Vec<NoteId>>,
+    ask: &Ask,
+    granted: Option<Vec<String>>,
+) -> Reply {
+    let Some(grants) = granted else { return Reply::Denied("the person said no".into()) };
+    let note = node.issue(ask.app, &ask.name, &ask.service, grants, ask.serves, None).unwrap();
+    if ask.serves {
+        let mut approved = erisdbs.lock().await;
+        let known = node.providers("erisdb").into_iter().filter_map(|p| p.note().map(|n| n.id));
+        let before: Vec<NoteId> = approved.drain(..).chain(known).collect();
+        for old in before.into_iter().filter(|old| *old != note.id) {
+            node.append(Op::Revoke { note: old }).await.unwrap();
+        }
+        approved.push(note.id);
+    } else {
+        match erisauth_client(node).await.enroll(&note, PASSPHRASE).await {
+            Ok(Guarded::Passed(_)) => {}
+            other => return Reply::Error(format!("ErisDB did not take the note: {other:?}")),
+        }
+    }
+    Reply::Approved { note, snapshot: node.snapshot().await.unwrap() }
+}
+
+/// An ErisDB deployment: its store, its secret, and the core serving it.
+struct Core {
+    _pg: ContainerAsync<Postgres>,
+    secret: String,
+    database: String,
+    id: EndpointId,
+    _process: tokio::process::Child,
+}
+
+impl Core {
+    /// A deployment of its own, joined to `laptop`'s mesh through `erisauth`,
+    /// its passphrase set, serving, and found by the laptop as the mesh's ErisDB.
+    async fn join(laptop: &Device, erisauth: &Agent) -> Core {
+        let pg = Postgres::default().start().await.expect("start postgres");
+        let port = pg.get_host_port_ipv4(5432).await.expect("pg port");
+        let database = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
+        let secret = format!("client-e2e-{}", SecretKey::generate().public());
+        let core_cli = |args: &[&str]| cli(&secret, &database, erisauth.runtime.path(), args);
+        let joined = core_cli(&["join"]).output().await.unwrap();
+        assert!(joined.status.success(), "{}", String::from_utf8_lossy(&joined.stderr));
+        let mut set = core_cli(&["passphrase", "set"]).stdin(Stdio::piped()).spawn().unwrap();
+        set.stdin.take().unwrap().write_all(format!("{PASSPHRASE}\n").as_bytes()).await.unwrap();
+        assert!(set.wait().await.unwrap().success());
+        let process = core_cli(&["serve", "--listen", "127.0.0.1:0"]).stdout(Stdio::null()).spawn().unwrap();
+        let printed = core_cli(&["endpoint-id"]).output().await.unwrap();
+        let id: EndpointId = String::from_utf8_lossy(&printed.stdout).trim().parse().unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        while laptop.node.provider("erisdb").is_none_or(|p| p.id != id) {
+            assert!(tokio::time::Instant::now() < deadline, "the laptop never found ErisDB");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        Core { _pg: pg, secret, database, id, _process: process }
+    }
+
+    fn cli(&self, runtime: &Path, args: &[&str]) -> tokio::process::Command {
+        cli(&self.secret, &self.database, runtime, args)
+    }
+}
+
+/// A mesh with an ErisDB in it: the device that let it in, its ErisAuth, and
+/// the core.
+struct World {
+    laptop: Device,
+    erisauth: Agent,
+    core: Core,
+    id: EndpointId,
+}
+
+impl World {
+    async fn new() -> World {
+        let laptop = Device::founder("laptop").await;
+        let erisauth = Agent::on(&laptop, approves_as_asked()).await;
+        let core = Core::join(&laptop, &erisauth).await;
+        World { id: core.id, laptop, erisauth, core }
+    }
+
+    /// Where ErisDB is, as the device's snapshot says: what ErisAuth hands an app.
+    async fn addr(&self) -> EndpointAddr {
+        erisdb_client::locate(&self.laptop.node.snapshot().await.unwrap()).unwrap()
+    }
+
+    /// Let the app holding `key` in, as the laptop does.
+    async fn enroll(&self, key: &SecretKey, grants: &[&str]) -> Enrolled {
+        let note = self.laptop.node.issue(key.public(), "Tasks", "erisdb", strings(grants), false, None).unwrap();
+        match self.laptop.erisdb().await.enroll(&note, PASSPHRASE).await.unwrap() {
+            Guarded::Passed(enrolled) => enrolled,
+            other => panic!("enrollment refused: {other:?}"),
+        }
+    }
+
+    /// An app the laptop let in with `grants`, dialing as `name`.
+    async fn app(&self, seed: u8, grants: &[&str], name: &str) -> Client {
+        let key = SecretKey::from_bytes(&[seed; 32]);
+        self.enroll(&key, grants).await;
+        Client::dial_on(self.addr().await, key, name, &Network::Loopback).await.unwrap()
+    }
+}
+
+fn cli(secret: &str, database: &str, runtime: &Path, args: &[&str]) -> tokio::process::Command {
+    let mut command = tokio::process::Command::new(erisdb_binary());
+    command
+        .env_clear()
+        .env("DATABASE_URL", database)
+        .env("ERISDB_SECRET", secret)
+        .env("ERIS_NETWORK", "loopback")
+        .env("XDG_RUNTIME_DIR", runtime)
+        .args(args)
+        .kill_on_drop(true);
+    command
+}
+
+fn strings(grants: &[&str]) -> Vec<String> {
+    grants.iter().map(|g| g.to_string()).collect()
+}
+
+async fn register(client: &Client, facet: &str) {
+    let (status, body) = client
+        .request("POST", "/v1/items", Some(json!({"facet": "facet", "body": {"name": facet, "schema": {}}})))
         .await
-        .expect("dial");
+        .unwrap();
+    assert_eq!(status, 201, "{body}");
+}
 
-    let fresh = client.refresh_capability(3600).await.expect("refresh");
-    assert_ne!(fresh, old);
+// ---------------------------------------------------------------- the client
 
-    // The client swapped its own token: later requests carry the fresh
-    // one, with the scope and signed user intact.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_client_speaks_erisdb_over_iroh_by_its_key() {
+    let world = World::new().await;
+    let key = SecretKey::from_bytes(&[7u8; 32]);
+    let enrolled = world.enroll(&key, &["lists:read", "lists:create"]).await;
+    assert_eq!(enrolled.grants, ["lists:read", "lists:create"]);
+    let client = Client::dial_on(world.addr().await, key.clone(), "Lists (Android) v0.1", &Network::Loopback).await.unwrap();
+    assert_eq!(client.server().id, world.id);
+    assert_eq!(client.id(), key.public());
+
+    let (status, body) = client.request("GET", "/v1/health", None).await.unwrap();
+    assert_eq!((status, &body["ok"]), (200, &json!(true)));
+    register(&client, "lists").await;
     let (status, item) = client
-        .request(
-            "POST",
-            "/v1/items",
-            Some(json!({"facet": "facet", "body": {"name": "refreshed", "version": 1, "schema": {}}})),
-        )
+        .request("POST", "/v1/items", Some(json!({"facet": "lists", "body": {"list": "books", "name": "Piranesi"}})))
         .await
         .unwrap();
     assert_eq!(status, 201, "{item}");
-    assert_eq!(item["source"]["user"], "droid");
+    // The source pipeline holds over QUIC: the claimed client, the observed
+    // key as the address, and the installation that key belongs to.
+    assert_eq!(item["source"]["client"], "Lists (Android) v0.1");
+    assert_eq!(item["source"]["addr"], format!("iroh:{}", key.public()));
+    assert_eq!(item["source"]["installation"], enrolled.client);
 
-    // The returned string is the whole story: a second client built from
-    // it alone talks to the same core.
-    let other = Client::dial_addr(addr.clone(), &fresh, "Fresh v0", Some([10u8; 32]))
-        .await
-        .expect("dial with fresh token");
-    let (status, body) = other.request("GET", "/v1/items?facet=facet", None).await.unwrap();
-    assert_eq!(status, 200, "{body}");
+    let (status, listed) = client.request("GET", "/v1/items?facet=lists", None).await.unwrap();
+    assert_eq!(status, 200);
+    assert_eq!(listed["items"].as_array().unwrap().len(), 1);
+    // Several requests share one connection, one bi-stream each.
+    for _ in 0..3 {
+        assert_eq!(client.request("GET", "/v1/health", None).await.unwrap().0, 200);
+    }
+    let (status, _) = client.request("DELETE", &format!("/v1/items/{}", item["id"].as_str().unwrap()), None).await.unwrap();
+    assert_eq!(status, 403, "lists:delete was never approved");
+}
 
-    // An expired token cannot refresh: refresh keeps a session alive, it
-    // does not resurrect one. The failure is an error, and the client
-    // keeps the token it had.
-    let dead = erisdb::auth::mint(SECRET, &["*"], Some(-10), None).unwrap();
-    let stale = Client::dial_addr(addr, &dead, "Stale v0", Some([11u8; 32])).await.expect("dial");
-    let refused = stale.refresh_capability(3600).await.unwrap_err();
+#[tokio::test(flavor = "multi_thread")]
+async fn the_client_reads_its_own_permissions() {
+    let world = World::new().await;
+    let client = world.app(16, &["tasks:read", "lists:*"], "Curious v0").await;
+    let held = client.permissions().await.unwrap();
+    assert_eq!(held.grants, ["tasks:read", "lists:*"]);
+    assert!(held.client.is_some(), "an installation says which it is");
+    assert_eq!(held.exp, None, "a key does not expire");
+}
 
-    // The refusal carries its status as a number, so callers branch on
-    // 401 instead of matching prose.
+/// The answers ErisAuth branches on come back typed: a wrong passphrase
+/// (and whether it locked the device), a lockout and how long, no
+/// passphrase at all.
+#[tokio::test(flavor = "multi_thread")]
+async fn enrollment_and_passphrase_answers_are_typed() {
+    let world = World::new().await;
+    let erisdb = world.laptop.erisdb().await;
+    let note = |seed: u8| {
+        let app = SecretKey::from_bytes(&[seed; 32]).public();
+        world.laptop.node.issue(app, "Tasks", "erisdb", strings(&["tasks:read"]), false, None).unwrap()
+    };
+    assert!(matches!(erisdb.enroll(&note(1), "not it").await.unwrap(), Guarded::Wrong { retry_after: None }));
+    assert!(matches!(erisdb.enroll(&note(1), "not it").await.unwrap(), Guarded::Wrong { retry_after: None }));
+    assert!(matches!(erisdb.enroll(&note(1), "not it").await.unwrap(), Guarded::Wrong { retry_after: Some(60) }));
+    assert!(matches!(erisdb.enroll(&note(1), PASSPHRASE).await.unwrap(), Guarded::Locked { retry_after: 1..=60 }));
+    assert!(matches!(erisdb.change_passphrase(PASSPHRASE, "a new one").await.unwrap(), Guarded::Locked { .. }));
+    let unlocked = world.core.cli(world.erisauth.runtime.path(), &["passphrase", "unlock"]).output().await.unwrap();
+    assert!(unlocked.status.success());
+
+    assert!(matches!(erisdb.change_passphrase(PASSPHRASE, "a new one").await.unwrap(), Guarded::Passed(())));
+    assert!(matches!(erisdb.enroll(&note(2), PASSPHRASE).await.unwrap(), Guarded::Wrong { .. }));
+    let Guarded::Passed(enrolled) = erisdb.enroll(&note(2), "a new one").await.unwrap() else { panic!("refused") };
+    assert_eq!(enrolled.grants, ["tasks:read"]);
+
+    // A refusal that is not about the passphrase is an error carrying its status.
+    let refused = erisdb.change_passphrase("a new one", "short").await.unwrap_err();
+    assert_eq!(refused.downcast_ref::<erisdb_client::Refused>().map(|r| r.status), Some(400));
+    let stranger = Device::founder("stranger").await;
+    let theirs = Client::over(stranger.node.endpoint().clone(), world.addr().await, "ErisAuth");
+    let app = SecretKey::generate().public();
+    let their_note = stranger.node.issue(app, "Tasks", "erisdb", strings(&["tasks:read"]), false, None).unwrap();
+    let refused = theirs.enroll(&their_note, "a new one").await.unwrap_err();
     let refused = refused.downcast_ref::<erisdb_client::Refused>().expect("a refusal");
-    assert_eq!(refused.status, 401);
-}
-
-/// The status survives the FFI boundary as a field of the envelope: the
-/// blocking facade hands Kotlin a number to branch on, not a sentence to
-/// substring-match.
-#[tokio::test(flavor = "multi_thread")]
-async fn the_blocking_facade_reports_a_refusals_status() {
-    let _facade = facade();
-    let (_pg, addr) = spawn_core().await;
-    let dead = erisdb::auth::mint(SECRET, &["*"], Some(-10), None).unwrap();
-    let addr_json = serde_json::to_string(&addr).unwrap();
-
-    let response = std::thread::spawn(move || {
-        erisdb_client::blocking::configure(&addr_json, &dead, "Stale (Blocking) v0", &[13u8; 32])
-            .expect("configure");
-        erisdb_client::blocking::refresh_capability(3600)
-    })
-    .join()
-    .unwrap();
-    let v: Value = serde_json::from_str(&response).unwrap();
-    assert_eq!(v["ok"], false, "{response}");
-    assert_eq!(v["status"], 401, "{response}");
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn the_blocking_facade_refreshes_its_capability() {
-    let _facade = facade();
-    let (_pg, addr) = spawn_core().await;
-    let old = erisdb::auth::mint(SECRET, &["*"], Some(30), Some("droid")).unwrap();
-    let addr_json = serde_json::to_string(&addr).unwrap();
-    let old_for_thread = old.clone();
-
-    let response = std::thread::spawn(move || {
-        erisdb_client::blocking::configure(
-            &addr_json,
-            &old_for_thread,
-            "Test (Blocking) v0",
-            &[12u8; 32],
-        )
-        .expect("configure");
-        erisdb_client::blocking::refresh_capability(3600)
-    })
-    .join()
-    .unwrap();
-    let v: serde_json::Value = serde_json::from_str(&response).unwrap();
-    assert_eq!(v["ok"], true, "{response}");
-    let fresh = v["token"].as_str().unwrap().to_string();
-    assert_ne!(fresh, old);
-
-    // The process-wide client now speaks with the fresh token.
-    let after = std::thread::spawn(|| erisdb_client::blocking::request("GET", "/v1/health", None))
-        .join()
-        .unwrap();
-    let v: serde_json::Value = serde_json::from_str(&after).unwrap();
-    assert_eq!(v["status"], 200, "{after}");
+    assert_eq!((refused.status, &refused.body["error"]), (403, &json!("not_a_device")));
 }
 
 // Multi-threaded: the subscription holds one bi-stream open while a
 // second connection writes through the same core.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_client_streams_the_change_feed() {
-    let (_pg, addr) = spawn_core().await;
-    let token = erisdb::auth::mint(SECRET, &["*"], Some(3600), Some("droid")).unwrap();
-
-    let reader = Client::dial_addr(addr.clone(), &token, "Reader v0", Some([3u8; 32]))
-        .await
-        .expect("dial reader");
-    let writer =
-        Client::dial_addr(addr, &token, "Writer v0", Some([4u8; 32])).await.expect("dial writer");
-
-    let (status, _) = writer
-        .request(
-            "POST",
-            "/v1/items",
-            Some(json!({"facet": "facet", "body": {
-                "name": "notes",
-                "version": 1,
-                "schema": {"type": "object", "required": ["text"]}
-            }})),
-        )
-        .await
-        .unwrap();
-    assert_eq!(status, 201);
+    let world = World::new().await;
+    let reader = world.app(3, &["notes:read"], "Reader v0").await;
+    let writer = world.app(4, &["notes:*"], "Writer v0").await;
+    register(&writer, "notes").await;
 
     // The caller owns the cursor: start from where the feed is now.
-    let (status, feed) = reader.request("GET", "/v1/changes?since=0", None).await.unwrap();
-    assert_eq!(status, 200);
+    let (status, feed) = reader.request("GET", "/v1/changes?facet=notes&since=0", None).await.unwrap();
+    assert_eq!(status, 200, "{feed}");
     let since = feed["next"].as_i64().unwrap();
-    assert!(since > 0);
-
     let mut sub = reader.subscribe_changes(since, Some("notes")).await.expect("subscribe");
 
-    // A write through the other connection lands on the open stream.
-    let (status, item) = writer
-        .request("POST", "/v1/items", Some(json!({"facet": "notes", "body": {"text": "hi"}})))
-        .await
-        .unwrap();
-    assert_eq!(status, 201, "{item}");
-
-    let event = tokio::time::timeout(std::time::Duration::from_secs(10), sub.next())
-        .await
-        .expect("event arrives")
-        .expect("stream alive")
-        .expect("not end of stream");
+    let (_, item) = writer.request("POST", "/v1/items", Some(json!({"facet": "notes", "body": {"text": "hi"}}))).await.unwrap();
+    let event = tokio::time::timeout(Duration::from_secs(10), sub.next()).await.unwrap().unwrap().unwrap();
     assert!(event.seq > since);
-    assert_eq!(event.facet, "notes");
-    assert_eq!(event.op, "created");
+    assert_eq!((event.facet.as_str(), event.op.as_str()), ("notes", "created"));
     assert_eq!(event.body.as_ref().unwrap()["text"], "hi");
     assert_eq!(event.item_id.as_deref(), item["id"].as_str());
     assert_eq!(event.raw["seq"], event.seq);
 
-    // A second write continues on the same stream, in order.
-    let (_, item2) = writer
-        .request("POST", "/v1/items", Some(json!({"facet": "notes", "body": {"text": "again"}})))
-        .await
-        .unwrap();
-    let next = tokio::time::timeout(std::time::Duration::from_secs(10), sub.next())
-        .await
-        .expect("second event arrives")
-        .expect("stream alive")
-        .expect("not end of stream");
+    let (_, second) = writer.request("POST", "/v1/items", Some(json!({"facet": "notes", "body": {"text": "again"}}))).await.unwrap();
+    let next = tokio::time::timeout(Duration::from_secs(10), sub.next()).await.unwrap().unwrap().unwrap();
     assert!(next.seq > event.seq);
-    assert_eq!(next.item_id.as_deref(), item2["id"].as_str());
+    assert_eq!(next.item_id.as_deref(), second["id"].as_str());
+}
 
-    // The facet filter holds: a write elsewhere is not delivered here.
-    let (status, _) = writer
-        .request(
-            "POST",
-            "/v1/items",
-            Some(json!({"facet": "facet", "body": {"name": "other", "version": 1, "schema": {}}})),
+/// When the mesh ends an app — its device removed, here — the app hears
+/// 401 on its next call and its open feed ends.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_app_the_mesh_ends_hears_401_and_its_feed_ends() {
+    let world = World::new().await;
+    let phone_key = SecretKey::generate();
+    let phone_endpoint = net::endpoint(phone_key.clone(), &Network::Loopback).await.unwrap();
+    let phone = Node::start(Config {
+        endpoint: phone_endpoint.clone(),
+        network: Network::Loopback,
+        local: Local::Device(phone_key),
+        store: Arc::new(MemoryStore::default()),
+    })
+    .await
+    .unwrap();
+    let _router = Router::builder(phone_endpoint).accept(mesh::ALPN, phone.protocol()).spawn();
+    world.laptop.node.append(Op::Add { device: phone.id(), name: "phone".into() }).await.unwrap();
+    phone.adopt(world.laptop.node.snapshot().await.unwrap()).await.unwrap();
+
+    let key = SecretKey::generate();
+    let note = phone.issue(key.public(), "Tasks", "erisdb", strings(&["tasks:read"]), false, None).unwrap();
+    let erisdb = Client::over(phone.endpoint().clone(), world.addr().await, "ErisAuth");
+    phone.sync_with(world.id).await.unwrap();
+    assert!(matches!(erisdb.enroll(&note, PASSPHRASE).await.unwrap(), Guarded::Passed(_)));
+    let app = Client::dial_on(world.addr().await, key, "Tasks", &Network::Loopback).await.unwrap();
+    let mut sub = app.subscribe_changes(1_000_000, Some("tasks")).await.unwrap();
+
+    world.laptop.node.append(Op::Remove { devices: vec![phone.id()] }).await.unwrap();
+    let ended = tokio::time::timeout(Duration::from_secs(10), sub.next()).await.expect("the feed ends");
+    assert!(matches!(ended, Ok(None)), "{ended:?}");
+    let (status, _) = app.request("GET", "/v1/items?facet=tasks", None).await.unwrap();
+    assert_eq!(status, 401);
+}
+
+// ---------------------------------------------------------------- signing in
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_app_signs_in_through_erisauth_with_one_call() {
+    let world = World::new().await;
+    // The person approves less than was asked.
+    let narrowing = Agent::on(&world.laptop, Arc::new(|_: &Ask| Some(vec!["tasks:read".to_string()]))).await;
+    let key = SecretKey::from_bytes(&[41u8; 32]);
+    let signed_in =
+        erisdb_client::sign_in_at(&narrowing.socket(), &Network::Loopback, key.clone(), "Tasks (Linux)", &strings(&["tasks:read", "tasks:create"]))
+            .await
+            .unwrap()
+            .expect("an ErisAuth was listening");
+    let SignIn::Approved { client, note, snapshot } = signed_in else { panic!("denied") };
+    assert_eq!(client.server().id, world.id, "the app learns where ErisDB is");
+    assert_eq!((note.app(), note.body.grants.clone()), (key.public(), strings(&["tasks:read"])));
+    assert_eq!(erisdb_client::locate(&snapshot).unwrap().id, world.id);
+    assert_eq!(client.permissions().await.unwrap().grants, ["tasks:read"]);
+
+    // Dialing again later takes nothing but the saved address and the key.
+    let again = Client::dial_on(client.server().clone(), key, "Tasks (Linux)", &Network::Loopback).await.unwrap();
+    assert_eq!(again.permissions().await.unwrap().grants, ["tasks:read"]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_no_through_erisauth_is_a_denial() {
+    let world = World::new().await;
+    let declining = Agent::on(&world.laptop, Arc::new(|_: &Ask| None)).await;
+    let outcome = erisdb_client::sign_in_at(&declining.socket(), &Network::Loopback, SecretKey::generate(), "Tasks", &strings(&["tasks:read"]))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(outcome, SignIn::Denied(why) if why.contains("said no")));
+}
+
+#[tokio::test]
+async fn without_erisauth_signing_in_is_none() {
+    let dir = tempfile::tempdir().unwrap();
+    let outcome = erisdb_client::sign_in_at(
+        &agent::socket_in(dir.path()),
+        &Network::Loopback,
+        SecretKey::generate(),
+        "Tasks",
+        &strings(&["tasks:read"]),
+    )
+    .await
+    .unwrap();
+    assert!(outcome.is_none());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_mesh_s_erisdb_is_read_from_a_snapshot() {
+    let world = World::new().await;
+    let snapshot = world.laptop.node.snapshot().await.unwrap();
+    let read: Value = serde_json::from_str(&erisdb_client::blocking::locate(&serde_json::to_string(&snapshot).unwrap())).unwrap();
+    assert_eq!(read["ok"], true, "{read}");
+    let addr: EndpointAddr = serde_json::from_value(read["server"].clone()).unwrap();
+    assert_eq!(addr.id, world.id);
+
+    let without = Device::founder("elsewhere").await.node.snapshot().await.unwrap();
+    assert!(erisdb_client::locate(&without).is_err());
+    let read: Value = serde_json::from_str(&erisdb_client::blocking::locate(&serde_json::to_string(&without).unwrap())).unwrap();
+    assert_eq!(read["ok"], false, "{read}");
+    let read: Value = serde_json::from_str(&erisdb_client::blocking::locate("not a snapshot")).unwrap();
+    assert_eq!(read["ok"], false, "{read}");
+}
+
+/// A mesh has one ErisDB. Approving another revokes the first's note: apps
+/// signing in land on the newer one, and the first lets no more apps in.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_newer_erisdb_is_where_apps_go() {
+    let world = World::new().await;
+    let first = world.addr().await;
+    let newer = Core::join(&world.laptop, &world.erisauth).await;
+    assert_ne!(newer.id, world.id);
+    assert_eq!(erisdb_client::locate(&world.laptop.node.snapshot().await.unwrap()).unwrap().id, newer.id);
+
+    let key = SecretKey::generate();
+    let signed_in = erisdb_client::sign_in_at(&world.erisauth.socket(), &Network::Loopback, key, "Tasks", &strings(&["tasks:read"]))
+        .await
+        .unwrap()
+        .expect("an ErisAuth was listening");
+    let SignIn::Approved { client, .. } = signed_in else { panic!("denied") };
+    assert_eq!(client.server().id, newer.id);
+    assert_eq!(client.permissions().await.unwrap().grants, ["tasks:read"]);
+
+    let at_first = Client::over(world.laptop.node.endpoint().clone(), first, "ErisAuth");
+    let note = world.laptop.node.issue(SecretKey::generate().public(), "Tasks", "erisdb", strings(&["tasks:read"]), false, None).unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let refused = loop {
+        match at_first.enroll(&note, PASSPHRASE).await {
+            Err(e) if e.downcast_ref::<erisdb_client::Refused>().is_some_and(|r| r.status == 503) => break e,
+            other => {
+                assert!(tokio::time::Instant::now() < deadline, "the first ErisDB still lets apps in: {other:?}");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    };
+    let refused = refused.downcast_ref::<erisdb_client::Refused>().unwrap();
+    assert_eq!(refused.body["error"], "not_the_erisdb", "{}", refused.body);
+}
+
+// ---------------------------------------------------------------- the blocking facade
+
+// Multi-threaded: the test thread blocks in join() while the core and the
+// device keep serving on the other workers.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_blocking_facade_works_from_sync_code() {
+    let _facade = facade();
+    let world = World::new().await;
+    let key = [9u8; 32];
+    world.enroll(&SecretKey::from_bytes(&key), &["tasks:read"]).await;
+    let server = serde_json::to_string(&world.addr().await).unwrap();
+
+    // The facade owns its runtime: callable from a plain thread, exactly
+    // like a JNI entry point.
+    let (health, refused, held) = std::thread::spawn(move || {
+        erisdb_client::blocking::dial_on(&server, "Test (Blocking) v0", &key, &Network::Loopback).expect("dial");
+        (
+            erisdb_client::blocking::request("GET", "/v1/health", None),
+            erisdb_client::blocking::request("GET", "/v1/items?facet=lists", None),
+            erisdb_client::blocking::permissions(),
         )
-        .await
-        .unwrap();
-    assert_eq!(status, 201);
-    let (_, item3) = writer
-        .request("POST", "/v1/items", Some(json!({"facet": "notes", "body": {"text": "third"}})))
-        .await
-        .unwrap();
-    let third = tokio::time::timeout(std::time::Duration::from_secs(10), sub.next())
-        .await
-        .expect("third event arrives")
-        .expect("stream alive")
-        .expect("not end of stream");
-    assert_eq!(third.item_id.as_deref(), item3["id"].as_str());
+    })
+    .join()
+    .unwrap();
+    let v: Value = serde_json::from_str(&health).unwrap();
+    assert_eq!((v["status"].as_u64(), &v["body"]["ok"]), (Some(200), &json!(true)), "{health}");
+    // Refusals come back as data, with the status to branch on.
+    let v: Value = serde_json::from_str(&refused).unwrap();
+    assert_eq!(v["status"], 403, "{refused}");
+    let v: Value = serde_json::from_str(&held).unwrap();
+    assert_eq!(v["permissions"]["grants"], json!(["tasks:read"]), "{held}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn the_blocking_subscription_pulls_changes() {
     let _facade = facade();
-    let (_pg, addr) = spawn_core().await;
-    let token = erisdb::auth::mint(SECRET, &["*"], Some(3600), Some("droid")).unwrap();
-    let addr_json = serde_json::to_string(&addr).unwrap();
-
-    let writer =
-        Client::dial_addr(addr, &token, "Writer v0", Some([5u8; 32])).await.expect("dial writer");
-    writer
-        .request(
-            "POST",
-            "/v1/items",
-            Some(json!({"facet": "facet", "body": {
-                "name": "memo",
-                "version": 1,
-                "schema": {"type": "object", "required": ["text"]}
-            }})),
-        )
-        .await
-        .unwrap();
+    let world = World::new().await;
+    let writer = world.app(5, &["memo:*"], "Writer v0").await;
+    register(&writer, "memo").await;
+    let key = [6u8; 32];
+    world.enroll(&SecretKey::from_bytes(&key), &["memo:read"]).await;
+    let server = serde_json::to_string(&world.addr().await).unwrap();
 
     let sub = std::thread::spawn(move || {
-        erisdb_client::blocking::configure(&addr_json, &token, "Test (Blocking) v0", &[6u8; 32])
-            .expect("configure");
+        erisdb_client::blocking::dial_on(&server, "Test (Blocking) v0", &key, &Network::Loopback).expect("dial");
         erisdb_client::blocking::subscribe_changes(0, Some("memo")).expect("subscribe")
     })
     .join()
     .unwrap();
 
     // Nothing on the feed yet for this facet: the pull times out as data.
-    let idle =
-        std::thread::spawn(move || erisdb_client::blocking::next_change(sub, 500)).join().unwrap();
-    let v: serde_json::Value = serde_json::from_str(&idle).unwrap();
+    let idle = std::thread::spawn(move || erisdb_client::blocking::next_change(sub, 500)).join().unwrap();
+    let v: Value = serde_json::from_str(&idle).unwrap();
     assert_eq!(v["ok"], true, "{idle}");
     assert!(v.get("change").is_none(), "{idle}");
 
-    let (_, item) = writer
-        .request("POST", "/v1/items", Some(json!({"facet": "memo", "body": {"text": "yo"}})))
-        .await
-        .unwrap();
-
-    let got = std::thread::spawn(move || erisdb_client::blocking::next_change(sub, 10_000))
-        .join()
-        .unwrap();
-    let v: serde_json::Value = serde_json::from_str(&got).unwrap();
+    let (_, item) = writer.request("POST", "/v1/items", Some(json!({"facet": "memo", "body": {"text": "yo"}}))).await.unwrap();
+    let got = std::thread::spawn(move || erisdb_client::blocking::next_change(sub, 10_000)).join().unwrap();
+    let v: Value = serde_json::from_str(&got).unwrap();
     assert_eq!(v["ok"], true, "{got}");
     assert_eq!(v["change"]["item_id"], item["id"], "{got}");
-    assert_eq!(v["change"]["facet"], "memo");
-    assert!(v["change"]["seq"].as_i64().unwrap() > 0);
 
     erisdb_client::blocking::close_subscription(sub);
     // A closed handle answers as data, not a panic.
-    let after = erisdb_client::blocking::next_change(sub, 100);
-    let v: serde_json::Value = serde_json::from_str(&after).unwrap();
-    assert_eq!(v["ok"], false, "{after}");
+    let v: Value = serde_json::from_str(&erisdb_client::blocking::next_change(sub, 100)).unwrap();
+    assert_eq!(v["ok"], false);
 }
 
-// Multi-threaded: the test thread blocks in join() while the in-process
-// core keeps serving on the other workers.
+/// A caught panic leaves the facade usable: the next call is answered
+/// normally.
 #[tokio::test(flavor = "multi_thread")]
-async fn the_blocking_facade_works_from_sync_code() {
+async fn the_facade_survives_a_panicking_call() {
     let _facade = facade();
-    let (_pg, addr) = spawn_core().await;
-    let token = erisdb::auth::mint(SECRET, &["meta:system:read"], Some(3600), None).unwrap();
-    let addr_json = serde_json::to_string(&addr).unwrap();
-
-    // The facade owns its runtime: callable from a plain thread, exactly
-    // like a JNI entry point.
-    let handle = std::thread::spawn(move || {
-        erisdb_client::blocking::configure(&addr_json, &token, "Test (Blocking) v0", &[9u8; 32])
-            .expect("configure");
+    let world = World::new().await;
+    let key = [14u8; 32];
+    world.enroll(&SecretKey::from_bytes(&key), &["tasks:read"]).await;
+    let server = serde_json::to_string(&world.addr().await).unwrap();
+    let response = std::thread::spawn(move || {
+        erisdb_client::blocking::dial_on(&server, "Guarded v0", &key, &Network::Loopback).expect("dial");
+        erisdb_client::blocking::guard(|| panic!("boom"), erisdb_client::blocking::panic_envelope);
         erisdb_client::blocking::request("GET", "/v1/health", None)
-    });
-    let response = handle.join().unwrap();
-    let v: serde_json::Value = serde_json::from_str(&response).unwrap();
+    })
+    .join()
+    .unwrap();
+    let v: Value = serde_json::from_str(&response).unwrap();
     assert_eq!(v["status"], 200, "{response}");
-    assert_eq!(v["body"]["ok"], true);
-
-    // Errors come back as data, never panics across the FFI boundary.
-    // (Still on a plain thread: the facade is for executor-less callers.)
-    let bad =
-        std::thread::spawn(|| erisdb_client::blocking::request("GET", "/v1/items?facet=lists", None))
-            .join()
-            .unwrap();
-    let v: serde_json::Value = serde_json::from_str(&bad).unwrap();
-    assert_eq!(v["status"], 403); // meta:system:read cannot read lists
 }
 
-// ---------------------------------------------------------------------
-// Pairing: the code grants nothing, and a human decides what does.
-// ---------------------------------------------------------------------
-
-/// A ticket for this core, exactly as `erisdb pair` cuts one.
-fn ticket_for(code: &str) -> String {
-    erisdb_client::Ticket::new(
-        code.to_string(),
-        Some(erisdb::net::endpoint_id(SECRET).to_string()),
-        None,
-        Some("my-laptop".into()),
-    )
-    .expect("a ticket")
-    .encode(erisdb::APP)
-    .expect("encode")
-}
-
-/// The operator's side: cut a pairing code over the ordinary API.
-async fn cut_a_pairing(op: &Client) -> (String, String) {
-    let (status, cut) =
-        op.request("POST", "/v1/pairings", Some(json!({"ttl_secs": 600}))).await.expect("cut");
-    assert_eq!(status, 201, "{cut}");
-    (
-        cut["id"].as_str().expect("an id").to_string(),
-        cut["secret"].as_str().expect("a code").to_string(),
-    )
-}
-
-/// The human's side: wait for the request to appear, then answer it.
-/// `granted` of `None` denies.
-async fn answer(op: &Client, id: &str, granted: Option<&[&str]>) {
-    for _ in 0..200 {
-        let (_, session) = op.request("GET", &format!("/v1/pairings/{id}"), None).await.unwrap();
-        if session["body"]["status"] == "requested" {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    let (path, body) = match granted {
-        Some(g) => {
-            (format!("/v1/pairings/{id}/approve"), json!({"granted": g, "ttl_secs": 3600}))
-        }
-        None => (format!("/v1/pairings/{id}/deny"), json!({})),
-    };
-    let (status, answered) = op.request("POST", &path, Some(body)).await.unwrap();
-    assert_eq!(status, 200, "{answered}");
-}
-
-/// A core, an operator holding everything, and the `tasks` facet the app
-/// is about to ask for.
-async fn a_core_to_pair_with() -> (
-    testcontainers_modules::testcontainers::ContainerAsync<Postgres>,
-    iroh::EndpointAddr,
-    Client,
-) {
-    let (pg, addr) = spawn_core().await;
-    let operator = erisdb::auth::mint(SECRET, &["*"], Some(3600), Some("me")).unwrap();
-    let op = Client::dial_addr(addr.clone(), &operator, "Dashboard v0", Some([30u8; 32]))
-        .await
-        .expect("dial operator");
-    let (status, body) = op
-        .request(
-            "POST",
-            "/v1/items",
-            Some(json!({"facet": "facet", "body": {"name": "tasks", "version": 1, "schema": {}}})),
-        )
-        .await
-        .unwrap();
-    assert_eq!(status, 201, "{body}");
-    (pg, addr, op)
-}
-
-/// The whole two-phase flow: a code that grants nothing, a manifest, a
-/// human who narrows it, and a token collected exactly once.
+/// Concurrent callers all make progress while a subscription is parked:
+/// the facade's runtime is sized for a live feed plus a handful of calls,
+/// which is what an app with a sync loop and a UI actually does.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_client_pairs_itself_and_a_human_decides_what_it_gets() {
-    let (_pg, addr, op) = a_core_to_pair_with().await;
-    let (id, code) = cut_a_pairing(&op).await;
-
-    // The code travels as a ticket; the client reads it back off the QR.
-    let ticket = erisdb_client::Ticket::parse(erisdb_client::APP, &ticket_for(&code)).expect("the ticket parses");
-    assert_eq!(ticket.v, 1);
-    assert_eq!(ticket.name.as_deref(), Some("my-laptop"));
-    assert_eq!(ticket.token, code);
-
-    // The code is a capability over nothing: it redeems its own session
-    // and cannot read a single item.
-    let app = Client::dial_addr(addr.clone(), &ticket.token, "Tasks (Android) v0.3", Some([31u8; 32]))
-        .await
-        .expect("dial with the code");
-    let held = app.permissions().await.expect("permissions");
-    assert_eq!(held.grants, ["meta:pairing:redeem"]);
-    let (status, _) = app.request("GET", "/v1/items?facet=tasks", None).await.unwrap();
-    assert_eq!(status, 403, "a photographed code reads nothing");
-
-    // Ask for four, and a human approves two of them.
-    let cancel = Cancel::new();
-    let (outcome, ()) = tokio::join!(
-        app.pair(
-            "Tasks (Android) v0.3",
-            &["tasks:read", "tasks:create", "tasks:update", "tasks:delete"],
-            Duration::from_secs(60),
-            &cancel,
-        ),
-        answer(&op, &id, Some(&["tasks:read", "tasks:create"])),
-    );
-    let (token, granted) = match outcome.expect("pairing ran") {
-        Pairing::Approved { token, granted } => (token, granted),
-        other => panic!("expected an approval, got {other:?}"),
-    };
-    assert_eq!(granted, ["tasks:read", "tasks:create"], "the human narrowed the request");
-
-    // The token is real, and is exactly what was approved.
-    let paired = Client::dial_addr(addr, &token, "Tasks (Android) v0.3", Some([31u8; 32]))
-        .await
-        .expect("dial paired");
-    assert_eq!(paired.permissions().await.expect("permissions").grants, granted);
-    let (status, item) = paired
-        .request("POST", "/v1/items", Some(json!({"facet": "tasks", "body": {"text": "x"}})))
-        .await
-        .unwrap();
-    assert_eq!(status, 201, "{item}");
-    let (status, _) = paired
-        .request("DELETE", &format!("/v1/items/{}", item["id"].as_str().unwrap()), None)
-        .await
-        .unwrap();
-    assert_eq!(status, 403, "delete was asked for and not granted");
-
-    // The bound installation can recover if a collection response is lost.
-    assert!(matches!(app.pairing_status().await.unwrap(), Pairing::Approved { .. }));
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn a_denied_pairing_grants_nothing() {
-    let (_pg, addr, op) = a_core_to_pair_with().await;
-    let (id, code) = cut_a_pairing(&op).await;
-    let app = Client::dial_addr(addr, &code, "Rejected v0", Some([32u8; 32])).await.expect("dial");
-
-    let cancel = Cancel::new();
-    let (outcome, ()) = tokio::join!(
-        app.pair("Rejected v0", &["tasks:read"], Duration::from_secs(60), &cancel),
-        answer(&op, &id, None),
-    );
-    assert_eq!(outcome.expect("pairing ran"), Pairing::Denied);
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn installation_keys_bind_collection_renewal_and_access_over_real_iroh() {
-    let (_pg, addr, operator) = a_core_to_pair_with().await;
-    let (id, code) = cut_a_pairing(&operator).await;
-    let app = Client::dial_addr(addr.clone(), &code, "Phone", Some([71; 32])).await.unwrap();
-    let intruder = Client::dial_addr(addr.clone(), &code, "Phone", Some([72; 32])).await.unwrap();
-    let requested = app.redeem_pairing("Phone", &["tasks:read", "tasks:create"]).await.unwrap();
-    let (_, seen) = operator.request("GET", &format!("/v1/pairings/{id}"), None).await.unwrap();
-    assert_eq!(requested["body"]["fingerprint"], seen["body"]["fingerprint"]);
-    let (status, approved) = operator.request("POST", &format!("/v1/pairings/{id}/approve"), Some(json!({"ttl_secs": 1}))).await.unwrap();
-    assert_eq!(status, 200, "{approved}");
-    assert_eq!(intruder.request("GET", "/v1/pair/status", None).await.unwrap().0, 401);
-    let Pairing::Approved { token, .. } = app.pairing_status().await.unwrap() else { panic!("not approved") };
-    let stolen = Client::dial_addr(addr.clone(), &token, "Phone", Some([73; 32])).await.unwrap();
-    assert_eq!(stolen.request("GET", "/v1/items?facet=tasks", None).await.unwrap().0, 401);
-    assert!(stolen.refresh_capability(1).await.is_err());
-
-    // The real installation sleeps past expiry, then reconnects and writes.
-    // The explicit 401 is safely retried after identity-authenticated renewal.
-    tokio::time::sleep(Duration::from_secs(2)).await;
-    let resumed = Client::dial_addr(addr, &token, "Phone", Some([71; 32])).await.unwrap();
-    let (status, item) = resumed.request("POST", "/v1/items", Some(json!({"facet": "tasks", "body": {"text": "once"}}))).await.unwrap();
-    assert_eq!(status, 201, "{item}");
-    assert_eq!(item["source"]["installation"], id);
-    let (_, items) = resumed.request("GET", "/v1/items?facet=tasks", None).await.unwrap();
-    assert_eq!(items["items"].as_array().unwrap().len(), 1, "renewal duplicated a write");
-    assert_eq!(operator.request("POST", &format!("/v1/clients/{id}/revoke"), Some(json!({}))).await.unwrap().0, 200);
-    assert_eq!(resumed.request("GET", "/v1/items?facet=tasks", None).await.unwrap().0, 401);
-    assert!(resumed.refresh_capability(1).await.is_err());
-}
-
-/// A human may never answer, so waiting is always bounded.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_pairing_gives_up_rather_than_waiting_forever() {
-    let (_pg, addr, op) = a_core_to_pair_with().await;
-    let (_id, code) = cut_a_pairing(&op).await;
-    let app = Client::dial_addr(addr, &code, "Ignored v0", Some([33u8; 32])).await.expect("dial");
-
-    let cancel = Cancel::new();
-    let started = Instant::now();
-    let outcome = app
-        .pair("Ignored v0", &["tasks:read"], Duration::from_secs(2), &cancel)
-        .await
-        .expect("pairing ran");
-    assert_eq!(outcome, Pairing::TimedOut);
-    assert!(started.elapsed() < Duration::from_secs(30), "the deadline was not honoured");
-}
-
-/// Closing the pairing screen stops the wait, whatever deadline it was
-/// given.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_waiting_pairing_is_cancellable() {
-    let (_pg, addr, op) = a_core_to_pair_with().await;
-    let (_id, code) = cut_a_pairing(&op).await;
-    let app = Client::dial_addr(addr, &code, "Impatient v0", Some([34u8; 32])).await.expect("dial");
-
-    let cancel = Cancel::new();
-    let stopper = cancel.clone();
-    tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        stopper.cancel();
-    });
-
-    let started = Instant::now();
-    let outcome = app
-        .pair("Impatient v0", &["tasks:read"], Duration::from_secs(3600), &cancel)
-        .await
-        .expect("pairing ran");
-    assert_eq!(outcome, Pairing::Cancelled);
-    assert!(started.elapsed() < Duration::from_secs(30), "cancelling is not a deadline");
-}
-
-/// The FFI shape of pairing: redeem once, then pull for an answer, with
-/// every wait bounded and every answer a value.
-#[tokio::test(flavor = "multi_thread")]
-async fn the_blocking_facade_pairs() {
+async fn the_facade_serves_calls_while_a_subscription_is_parked() {
     let _facade = facade();
-    let (_pg, addr, op) = a_core_to_pair_with().await;
-    let (id, code) = cut_a_pairing(&op).await;
-    let addr_json = serde_json::to_string(&addr).unwrap();
-
-    // A ticket comes off the camera as one string; parsing it is a call
-    // of its own, so the app can show the core's name before dialing.
-    let encoded = ticket_for(&code);
-    let parsed = std::thread::spawn(move || erisdb_client::blocking::parse_ticket(&encoded))
-        .join()
-        .unwrap();
-    let v: Value = serde_json::from_str(&parsed).unwrap();
-    assert_eq!(v["ok"], true, "{parsed}");
-    assert_eq!(v["ticket"]["name"], "my-laptop");
-    assert_eq!(v["ticket"]["token"], code.as_str());
-
-    let redeemed = std::thread::spawn(move || {
-        erisdb_client::blocking::pair_redeem(
-            &addr_json,
-            &code,
-            "Tasks (Android) v0.3",
-            r#"["tasks:read","tasks:create"]"#,
-            &[35u8; 32],
-        )
-    })
-    .join()
-    .unwrap();
-    let v: Value = serde_json::from_str(&redeemed).unwrap();
-    assert_eq!(v["ok"], true, "{redeemed}");
-    assert_eq!(v["pairing"]["body"]["client"], "Tasks (Android) v0.3", "{redeemed}");
-
-    // Nobody has answered yet: the pull ends as data, not as a hang.
-    let waiting =
-        std::thread::spawn(|| erisdb_client::blocking::pair_poll(700)).join().unwrap();
-    let v: Value = serde_json::from_str(&waiting).unwrap();
-    assert_eq!(v["ok"], true, "{waiting}");
-    assert_eq!(v["status"], "waiting", "{waiting}");
-
-    answer(&op, &id, Some(&["tasks:read"])).await;
-
-    let approved =
-        std::thread::spawn(|| erisdb_client::blocking::pair_poll(20_000)).join().unwrap();
-    let v: Value = serde_json::from_str(&approved).unwrap();
-    assert_eq!(v["ok"], true, "{approved}");
-    assert_eq!(v["status"], "approved", "{approved}");
-    assert!(v["token"].as_str().unwrap().starts_with("erisdb1."), "{approved}");
-    assert_eq!(v["granted"], json!(["tasks:read"]), "{approved}");
-
-    // The session is spent; the slot is gone with it.
-    let after = std::thread::spawn(|| erisdb_client::blocking::pair_poll(100)).join().unwrap();
-    let v: Value = serde_json::from_str(&after).unwrap();
-    assert_eq!(v["ok"], false, "{after}");
-}
-
-/// A parked pull wakes when the app closes the pairing screen, rather
-/// than holding a thread until its timeout runs out.
-#[tokio::test(flavor = "multi_thread")]
-async fn the_blocking_pairing_poll_is_cancellable() {
-    let _facade = facade();
-    let (_pg, addr, op) = a_core_to_pair_with().await;
-    let (_id, code) = cut_a_pairing(&op).await;
-    let addr_json = serde_json::to_string(&addr).unwrap();
-
-    std::thread::spawn(move || {
-        erisdb_client::blocking::pair_redeem(
-            &addr_json,
-            &code,
-            "Impatient (Blocking) v0",
-            r#"["tasks:read"]"#,
-            &[36u8; 32],
-        )
+    let world = World::new().await;
+    let key = [15u8; 32];
+    world.enroll(&SecretKey::from_bytes(&key), &["meta:feed:read"]).await;
+    let server = serde_json::to_string(&world.addr().await).unwrap();
+    let sub = std::thread::spawn(move || {
+        erisdb_client::blocking::dial_on(&server, "Busy v0", &key, &Network::Loopback).expect("dial");
+        erisdb_client::blocking::subscribe_changes(0, None).expect("subscribe")
     })
     .join()
     .unwrap();
 
-    let parked = std::thread::spawn(|| erisdb_client::blocking::pair_poll(600_000));
-    std::thread::sleep(Duration::from_millis(400));
-    let started = Instant::now();
-    std::thread::spawn(erisdb_client::blocking::pair_cancel).join().unwrap();
-    let answer = parked.join().unwrap();
-
-    assert!(started.elapsed() < Duration::from_secs(30), "cancelling is not a deadline");
-    let v: Value = serde_json::from_str(&answer).unwrap();
-    assert_eq!(v["ok"], true, "{answer}");
-    assert_eq!(v["status"], "cancelled", "{answer}");
+    let parked = std::thread::spawn(move || erisdb_client::blocking::next_change(sub, 3_000));
+    let callers: Vec<_> =
+        (0..4).map(|_| std::thread::spawn(|| erisdb_client::blocking::request("GET", "/v1/health", None))).collect();
+    for caller in callers {
+        let response = caller.join().unwrap();
+        let v: Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(v["status"], 200, "{response}");
+    }
+    parked.join().unwrap();
+    erisdb_client::blocking::close_subscription(sub);
 }
 
-/// A ticket is read with what every platform already has, and refused
-/// loudly rather than half-stored. The good case is a ticket the core
-/// itself built.
-#[tokio::test]
-async fn a_ticket_is_read_or_refused() {
-    use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
-    use base64::Engine;
-    use erisdb_client::{Ticket, APP};
-
-    // The client reads the scheme the core writes.
-    assert_eq!(APP, erisdb::APP);
-
-    let eid = "e718b50236b0b98637fbf39cb4040e79800094313dc195e221e8e075304a6a06";
-    let good = Ticket::new(
-        "erisdb1.payload.sig".into(),
-        Some(eid.into()),
-        Some("http://10.0.0.2:7700".into()),
-        Some("my-laptop".into()),
-    )
-    .unwrap()
-    .encode(erisdb::APP)
-    .unwrap();
-
-    let t = Ticket::parse(APP, &format!("  {good}\n")).expect("whitespace is forgiven");
-    assert_eq!(t.v, 1);
-    assert_eq!(t.token, "erisdb1.payload.sig");
-    assert_eq!(t.eid.as_deref(), Some(eid));
-    assert_eq!(t.url.as_deref(), Some("http://10.0.0.2:7700"));
-    assert_eq!(t.name.as_deref(), Some("my-laptop"));
-
-    let encode = |v: Value| format!("erisdb://pair/{}", B64.encode(serde_json::to_vec(&v).unwrap()));
-    for bad in [
-        String::new(),
-        good.strip_prefix("erisdb://pair/").unwrap().to_string(),
-        format!("https://pair/{good}"),
-        "erisdb://pair/!!!not-base64!!!".to_string(),
-        format!("erisdb://pair/{}", B64.encode("not json")),
-        // An unknown version is refused rather than guessed at.
-        encode(json!({"v": 2, "token": "erisdb1.a.b", "eid": eid})),
-        // No address is half a config.
-        encode(json!({"v": 1, "token": "erisdb1.a.b"})),
-        // No code to redeem.
-        encode(json!({"v": 1, "eid": eid})),
-        encode(json!({"v": 1, "token": "", "eid": eid})),
-        // An endpoint id that is not one.
-        encode(json!({"v": 1, "token": "erisdb1.a.b", "eid": "too-short"})),
-        encode(json!({"v": 1, "token": "erisdb1.a.b", "eid": "g".repeat(64)})),
-    ] {
-        assert!(Ticket::parse(APP, &bad).is_err(), "accepted {bad:?}");
-    }
-
-    // A url-only ticket is legal, and this client says plainly that it
-    // cannot dial one: it speaks QUIC and nothing else.
-    let browser_only = encode(json!({"v": 1, "token": "erisdb1.a.b", "url": "http://10.0.0.2:7700"}));
-    let t = Ticket::parse(APP, &browser_only).expect("legal ticket");
-    assert!(t.endpoint_addr().is_none());
-    let refused = erisdb_client::pair(&t, "Tasks", &["tasks:read"], None, Duration::from_secs(1), &Cancel::new())
-        .await
-        .unwrap_err()
-        .to_string();
-    assert!(refused.contains("endpoint id"), "{refused}");
+#[test]
+fn a_dial_that_cannot_start_says_why() {
+    let _facade = facade();
+    assert!(erisdb_client::blocking::dial("not an address", "Nobody", &[1u8; 32]).unwrap_err().contains("endpoint id"));
+    assert!(erisdb_client::blocking::dial(&"ab".repeat(32), "Nobody", &[1u8; 31]).unwrap_err().contains("32 bytes"));
 }
 
 // ---------------------------------------------------------------------
@@ -795,31 +664,39 @@ enum Misbehaviour {
 }
 
 struct Peer {
-    _pg: testcontainers_modules::testcontainers::ContainerAsync<Postgres>,
+    _world: World,
     core: Client,
-    addr: iroh::EndpointAddr,
+    addr: EndpointAddr,
     requests: Arc<Mutex<Vec<String>>>,
     connections: Arc<AtomicUsize>,
 }
 
 impl Peer {
-    fn requests(&self) -> usize { self.requests.lock().unwrap().len() }
-    fn first_request(&self) -> String { self.requests.lock().unwrap()[0].clone() }
-    fn connections(&self) -> usize { self.connections.load(Ordering::SeqCst) }
+    fn requests(&self) -> usize {
+        self.requests.lock().unwrap().len()
+    }
+    fn connections(&self) -> usize {
+        self.connections.load(Ordering::SeqCst)
+    }
 }
 
-/// A QUIC edge forwards complete HTTP exchanges to the actual ErisDB server.
-/// It can discard the answer only AFTER the server completed the transaction,
-/// reproducing an ambiguous write without inventing any service responses.
+/// A QUIC edge forwards complete HTTP exchanges to the actual ErisDB, as an
+/// app of its own the laptop let in. It can discard the answer only AFTER
+/// the core completed the transaction, reproducing an ambiguous write
+/// without inventing any service responses.
 async fn misbehaving_peer(how: Misbehaviour) -> Peer {
     use http_body_util::{BodyExt, Full};
     use hyper::body::{Bytes, Incoming};
     use hyper_util::rt::TokioIo;
-    let (pg, core_addr, core) = a_core_to_pair_with().await;
-    let ep = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
-        .alpns(vec![erisdb_client::ALPN.to_vec()]).bind().await.unwrap();
-    let upstream = ep.connect(core_addr, erisdb_client::ALPN).await.unwrap();
-    let addr = ep.addr();
+    let world = World::new().await;
+    let core = world.app(30, &["*"], "Dashboard v0").await;
+    register(&core, "tasks").await;
+    let proxy = SecretKey::generate();
+    world.enroll(&proxy, &["*"]).await;
+    let ep = net::endpoint(proxy, &Network::Loopback).await.unwrap();
+    ep.set_alpns(vec![erisdb_client::ALPN.to_vec()]);
+    let upstream = ep.connect(world.addr().await, erisdb_client::ALPN).await.unwrap();
+    let addr = net::advertised(&ep, &Network::Loopback).await;
     let requests = Arc::new(Mutex::new(Vec::new()));
     let connections = Arc::new(AtomicUsize::new(0));
     let (seen, count) = (requests.clone(), connections.clone());
@@ -839,14 +716,13 @@ async fn misbehaving_peer(how: Misbehaviour) -> Peer {
                                 let (parts, body) = request.into_parts();
                                 let request = hyper::Request::from_parts(parts, Full::new(body.collect().await?.to_bytes()));
                                 let (send, recv) = upstream.open_bi().await?;
-                                let (mut sender, driver) = hyper::client::conn::http1::handshake(
-                                    TokioIo::new(tokio::io::join(recv, send))).await?;
+                                let (mut sender, driver) =
+                                    hyper::client::conn::http1::handshake(TokioIo::new(tokio::io::join(recv, send))).await?;
                                 tokio::spawn(driver);
                                 let response = sender.send_request(request).await?;
                                 let (parts, body) = response.into_parts();
                                 let body = body.collect().await?.to_bytes();
-                                if how == Misbehaviour::DieHoldingTheRequest ||
-                                    how == Misbehaviour::DieOnceThenAnswer && nth == 0 {
+                                if how == Misbehaviour::DieHoldingTheRequest || how == Misbehaviour::DieOnceThenAnswer && nth == 0 {
                                     conn.close(1u32.into(), b"lost response after real core completed");
                                 } else if how == Misbehaviour::AnswerThenClose {
                                     tokio::spawn(async move {
@@ -858,26 +734,25 @@ async fn misbehaving_peer(how: Misbehaviour) -> Peer {
                             }
                         });
                         let _ = hyper::server::conn::http1::Builder::new()
-                            .serve_connection(TokioIo::new(tokio::io::join(recv, send)), service).await;
+                            .serve_connection(TokioIo::new(tokio::io::join(recv, send)), service)
+                            .await;
                     });
                 }
             });
         }
     });
-    Peer { _pg: pg, core, addr, requests, connections }
+    Peer { _world: world, core, addr, requests, connections }
 }
 
-async fn client_for(peer: &Peer, identity: [u8; 32]) -> Client {
-    let token = erisdb::auth::mint(SECRET, &["*"], Some(3600), None).unwrap();
-    Client::dial_addr(peer.addr.clone(), &token, "Retry v0", Some(identity)).await.unwrap()
+async fn client_for(peer: &Peer, seed: u8) -> Client {
+    Client::dial_on(peer.addr.clone(), SecretKey::from_bytes(&[seed; 32]), "Retry v0", &Network::Loopback).await.unwrap()
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_write_is_never_sent_twice() {
     let peer = misbehaving_peer(Misbehaviour::DieHoldingTheRequest).await;
-    let client = client_for(&peer, [20u8; 32]).await;
-    let outcome = client.request("POST", "/v1/items",
-        Some(json!({"facet": "tasks", "body": {"text": "once"}}))).await;
+    let client = client_for(&peer, 20).await;
+    let outcome = client.request("POST", "/v1/items", Some(json!({"facet": "tasks", "body": {"text": "once"}}))).await;
     assert!(outcome.is_err(), "a lost answer is an error, not a silent retry");
     assert_eq!(peer.requests(), 1);
     let (status, stored) = peer.core.request("GET", "/v1/items?facet=tasks", None).await.unwrap();
@@ -887,36 +762,11 @@ async fn a_write_is_never_sent_twice() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_redeem_is_never_sent_twice() {
-    let peer = misbehaving_peer(Misbehaviour::DieHoldingTheRequest).await;
-    let (id, code) = cut_a_pairing(&peer.core).await;
-    let client = Client::dial_addr(peer.addr.clone(), &code, "Retry v0", Some([24u8; 32])).await.unwrap();
-    assert!(client.redeem_pairing("Tasks (Android) v0.3", &["tasks:read"]).await.is_err());
-    assert_eq!(peer.requests(), 1);
-    assert!(peer.first_request().starts_with("POST /v1/pair/redeem"));
-    let (_, pairing) = peer.core.request("GET", &format!("/v1/pairings/{id}"), None).await.unwrap();
-    assert_eq!(pairing["body"]["status"], "requested");
-    assert_eq!(pairing["revision"], 2, "redeeming committed one state transition");
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn a_pairing_poll_is_retried_on_a_broken_connection() {
-    let peer = misbehaving_peer(Misbehaviour::DieOnceThenAnswer).await;
-    let (_, code) = cut_a_pairing(&peer.core).await;
-    let client = Client::dial_addr(peer.addr.clone(), &code, "Retry v0", Some([25u8; 32])).await.unwrap();
-    assert_eq!(client.pairing_status().await.unwrap(), Pairing::Waiting);
-    assert_eq!(peer.requests(), 2);
-    assert_eq!(peer.connections(), 2);
-    assert!(peer.first_request().starts_with("GET /v1/pair/status"));
-}
-
-#[tokio::test(flavor = "multi_thread")]
 async fn a_read_is_retried_on_a_broken_connection() {
     let peer = misbehaving_peer(Misbehaviour::DieOnceThenAnswer).await;
-    let client = client_for(&peer, [21u8; 32]).await;
+    let client = client_for(&peer, 21).await;
     let (status, body) = client.request("GET", "/v1/health", None).await.unwrap();
-    assert_eq!(status, 200);
-    assert_eq!(body["ok"], true);
+    assert_eq!((status, &body["ok"]), (200, &json!(true)));
     assert_eq!(peer.requests(), 2);
     assert_eq!(peer.connections(), 2);
 }
@@ -924,12 +774,12 @@ async fn a_read_is_retried_on_a_broken_connection() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_dead_cached_connection_is_redialled_for_a_write() {
     let peer = misbehaving_peer(Misbehaviour::AnswerThenClose).await;
-    let client = client_for(&peer, [22u8; 32]).await;
+    let client = client_for(&peer, 22).await;
     client.request("GET", "/v1/health", None).await.unwrap();
     tokio::time::sleep(Duration::from_millis(700)).await;
-    let (status, item) = client.request("POST", "/v1/items",
-        Some(json!({"facet": "tasks", "body": {"text": "redialled"}}))).await.unwrap();
-    assert_eq!(status, 201);
+    let (status, item) =
+        client.request("POST", "/v1/items", Some(json!({"facet": "tasks", "body": {"text": "redialled"}}))).await.unwrap();
+    assert_eq!(status, 201, "{item}");
     assert_eq!(item["body"]["text"], "redialled");
     assert_eq!(peer.requests(), 2);
     assert_eq!(peer.connections(), 2);
@@ -940,7 +790,7 @@ async fn a_dead_cached_connection_is_redialled_for_a_write() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_body_that_is_not_json_arrives_as_text() {
     let peer = misbehaving_peer(Misbehaviour::PassThrough).await;
-    let client = client_for(&peer, [23u8; 32]).await;
+    let client = client_for(&peer, 23).await;
     let (status, body) = client.request("GET", "/v1/items/not-a-uuid", None).await.unwrap();
     assert_eq!(status, 400);
     assert!(body.as_str().is_some_and(|text| text.contains("UUID")), "{body}");
@@ -956,191 +806,34 @@ async fn a_body_that_is_not_json_arrives_as_text() {
 /// app around it.
 #[test]
 fn a_panic_becomes_an_envelope() {
-    let response =
-        erisdb_client::blocking::guard(|| panic!("boom"), erisdb_client::blocking::panic_envelope);
+    let response = erisdb_client::blocking::guard(|| panic!("boom"), erisdb_client::blocking::panic_envelope);
     let v: Value = serde_json::from_str(&response).expect("the envelope is JSON");
     assert_eq!(v["ok"], false, "{response}");
     assert_eq!(v["status"], 0, "{response}");
     assert!(v["error"].as_str().unwrap().contains("boom"), "{response}");
 }
 
-/// Identity hex is decoded by character, not by byte offset: whatever
-/// 64-byte string the JVM hands over, the answer is data.
+/// Key hex is decoded by character, not by byte offset: whatever 64-byte
+/// string the JVM hands over, the answer is data.
 #[test]
-fn identity_hex_never_panics() {
-    let good = "0".repeat(64);
-    assert_eq!(erisdb_client::blocking::decode_identity_hex(&good), Some([0u8; 32]));
-    assert_eq!(
-        erisdb_client::blocking::decode_identity_hex(&"AB".repeat(32)),
-        Some([0xABu8; 32]),
-        "uppercase hex decodes too"
-    );
-
+fn key_hex_never_panics() {
+    let decode = erisdb_client::blocking::decode_key_hex;
+    assert_eq!(decode(&"0".repeat(64)), Some([0u8; 32]));
+    assert_eq!(decode(&"AB".repeat(32)), Some([0xABu8; 32]), "uppercase hex decodes too");
     // 64 bytes, 22 characters: byte-slicing this lands inside a character.
     let multibyte = format!("{}0", "€".repeat(21));
     assert_eq!(multibyte.len(), 64);
-    assert_eq!(erisdb_client::blocking::decode_identity_hex(&multibyte), None);
-
-    assert_eq!(erisdb_client::blocking::decode_identity_hex(""), None);
-    assert_eq!(erisdb_client::blocking::decode_identity_hex(&"z".repeat(64)), None);
-    assert_eq!(erisdb_client::blocking::decode_identity_hex(&"0".repeat(63)), None);
+    assert_eq!(decode(&multibyte), None);
+    assert_eq!(decode(""), None);
+    assert_eq!(decode(&"z".repeat(64)), None);
+    assert_eq!(decode(&"0".repeat(63)), None);
 }
 
-/// A caught panic leaves the facade usable: the next call is answered
-/// normally.
-#[tokio::test(flavor = "multi_thread")]
-async fn the_facade_survives_a_panicking_call() {
-    let _facade = facade();
-    let (_pg, addr) = spawn_core().await;
-    let token = erisdb::auth::mint(SECRET, &["*"], Some(3600), None).unwrap();
-    let addr_json = serde_json::to_string(&addr).unwrap();
-
-    let response = std::thread::spawn(move || {
-        erisdb_client::blocking::configure(&addr_json, &token, "Guarded v0", &[14u8; 32])
-            .expect("configure");
-        erisdb_client::blocking::guard(|| panic!("boom"), erisdb_client::blocking::panic_envelope);
-        erisdb_client::blocking::request("GET", "/v1/health", None)
-    })
-    .join()
-    .unwrap();
-    let v: Value = serde_json::from_str(&response).unwrap();
-    assert_eq!(v["status"], 200, "{response}");
-}
-
-/// Concurrent callers all make progress while a subscription is parked:
-/// the facade's runtime is sized for a live feed plus a handful of calls,
-/// which is what an app with a sync loop and a UI actually does.
-#[tokio::test(flavor = "multi_thread")]
-async fn the_facade_serves_calls_while_a_subscription_is_parked() {
-    let _facade = facade();
-    let (_pg, addr) = spawn_core().await;
-    let token = erisdb::auth::mint(SECRET, &["*"], Some(3600), None).unwrap();
-    let addr_json = serde_json::to_string(&addr).unwrap();
-
-    let sub = std::thread::spawn(move || {
-        erisdb_client::blocking::configure(&addr_json, &token, "Busy v0", &[15u8; 32])
-            .expect("configure");
-        erisdb_client::blocking::subscribe_changes(0, None).expect("subscribe")
-    })
-    .join()
-    .unwrap();
-
-    // One thread parked on the feed, four asking questions at once.
-    let parked = std::thread::spawn(move || erisdb_client::blocking::next_change(sub, 3_000));
-    let callers: Vec<_> = (0..4)
-        .map(|_| std::thread::spawn(|| erisdb_client::blocking::request("GET", "/v1/health", None)))
-        .collect();
-    for caller in callers {
-        let response = caller.join().unwrap();
-        let v: Value = serde_json::from_str(&response).unwrap();
-        assert_eq!(v["status"], 200, "{response}");
-    }
-    parked.join().unwrap();
-    erisdb_client::blocking::close_subscription(sub);
-}
-
-/// A stand-in for the device's ErisAuth, speaking its socket protocol: it
-/// cuts the pairing, hands over the ticket, checks that the redeemer is the
-/// app that asked, and answers as the person would. `granted` of `None` says no.
-async fn a_stand_in_erisauth(
-    op: Client,
-    addr: iroh::EndpointAddr,
-    granted: Option<Vec<String>>,
-) -> (tempfile::TempDir, std::path::PathBuf) {
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("agent.sock");
-    let listener = tokio::net::UnixListener::bind(&path).unwrap();
-    tokio::spawn(async move {
-        let (stream, _) = listener.accept().await.unwrap();
-        let (read, mut write) = stream.into_split();
-        let mut line = String::new();
-        BufReader::new(read).read_line(&mut line).await.unwrap();
-        let ask: Value = serde_json::from_str(&line).unwrap();
-        assert_eq!(ask["service"], "erisdb");
-        let (id, code) = cut_a_pairing(&op).await;
-        let ticket = erisdb_client::Ticket::new(code, Some(addr.id.to_string()), None, Some("laptop".into()))
-            .unwrap()
-            .with_addrs(addr.ip_addrs().copied().collect())
-            .encode(erisdb_client::APP)
-            .unwrap();
-        write.write_all(format!("{}\n", json!({"ticket": ticket})).as_bytes()).await.unwrap();
-        let session = loop {
-            let (_, session) = op.request("GET", &format!("/v1/pairings/{id}"), None).await.unwrap();
-            if session["body"]["status"] == "requested" {
-                break session;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        };
-        assert_eq!(session["body"]["identity"], ask["identity"], "the app redeemed with the key it named");
-        let reply = match granted {
-            Some(granted) => {
-                answer(&op, &id, Some(&granted.iter().map(String::as_str).collect::<Vec<_>>())).await;
-                json!({"approved": granted})
-            }
-            None => {
-                answer(&op, &id, None).await;
-                json!({"denied": "the person said no"})
-            }
-        };
-        write.write_all(format!("{reply}\n").as_bytes()).await.unwrap();
-    });
-    (dir, path)
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn an_app_signs_in_through_erisauth_with_one_call() {
-    let (_pg, addr, op) = a_core_to_pair_with().await;
-    let (_dir, socket) = a_stand_in_erisauth(op, addr.clone(), Some(vec!["tasks:read".into()])).await;
-    let key = [41u8; 32];
-    let (ticket, pairing) = erisdb_client::pair_via_erisauth_at(
-        &socket,
-        "Tasks (Linux)",
-        &["tasks:read", "tasks:create"],
-        key,
-        Duration::from_secs(60),
-        &Cancel::new(),
-    )
-    .await
-    .expect("signing in ran")
-    .expect("an ErisAuth was listening");
-    assert_eq!(ticket.endpoint_addr().unwrap().id, addr.id, "the app learns where the core is");
-    let Pairing::Approved { token, granted } = pairing else { panic!("{pairing:?}") };
-    assert_eq!(granted, ["tasks:read"]);
-    let signed_in = Client::dial_addr(addr, &token, "Tasks (Linux)", Some(key)).await.unwrap();
-    assert_eq!(signed_in.permissions().await.unwrap().grants, ["tasks:read"]);
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn a_no_through_erisauth_is_a_denial() {
-    let (_pg, addr, op) = a_core_to_pair_with().await;
-    let (_dir, socket) = a_stand_in_erisauth(op, addr, None).await;
-    let (_, pairing) = erisdb_client::pair_via_erisauth_at(
-        &socket,
-        "Tasks (Linux)",
-        &["tasks:read"],
-        [42u8; 32],
-        Duration::from_secs(60),
-        &Cancel::new(),
-    )
-    .await
-    .unwrap()
-    .unwrap();
-    assert_eq!(pairing, Pairing::Denied);
-}
-
-#[tokio::test]
-async fn without_erisauth_an_app_hears_none_and_pairs_by_ticket() {
-    let dir = tempfile::tempdir().unwrap();
-    let outcome = erisdb_client::pair_via_erisauth_at(
-        &dir.path().join("agent.sock"),
-        "Tasks (Linux)",
-        &["tasks:read"],
-        [43u8; 32],
-        Duration::from_secs(1),
-        &Cancel::new(),
-    )
-    .await
-    .unwrap();
-    assert!(outcome.is_none());
+/// What an app tells ErisAuth it is: the endpoint id its key dials as.
+#[test]
+fn a_key_names_the_endpoint_it_dials_as() {
+    let key = [7u8; 32];
+    let hex: String = key.iter().map(|b| format!("{b:02x}")).collect();
+    assert_eq!(erisdb_client::blocking::endpoint_id(&hex), Some(SecretKey::from_bytes(&key).public().to_string()));
+    assert_eq!(erisdb_client::blocking::endpoint_id("not hex"), None);
 }

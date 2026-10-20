@@ -8,7 +8,6 @@ import android.util.AtomicFile
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
-import java.security.SecureRandom
 
 // Offline-first: the item cache renders instantly on launch, and every
 // mutation is committed to the on-disk outbox BEFORE any network is
@@ -17,10 +16,10 @@ import java.security.SecureRandom
 //
 // Three kinds of thing live here, in three places that suit them:
 //
-//   secrets   — the token and the iroh private key, sealed by a keystore
-//               key (Secrets.kt), never in the clear;
-//   settings  — server id and token lifetime: a handful of
-//               small values, which is what SharedPreferences is for;
+//   secrets   — the app's Iroh key and the ErisDB it was let into, sealed
+//               together by a keystore key (android-shared's Secrets.kt);
+//   settings  — a handful of small values, which is what SharedPreferences
+//               is for;
 //   the cache — one file. SharedPreferences reads its whole XML into
 //               memory and rewrites all of it on every commit, which is
 //               the wrong shape for hundreds of kilobytes of items.
@@ -28,38 +27,18 @@ import java.security.SecureRandom
 @SuppressLint("ApplySharedPref")
 class Store(ctx: Context) : OutboxStore {
     private val prefs = ctx.getSharedPreferences("erisdb", Context.MODE_PRIVATE)
-    private val secrets: SecretStore = KeystoreSecrets(ctx)
     private val cacheFile = AtomicFile(File(ctx.filesDir, "items.json"))
+
+    /** The app's key and where its ErisDB is. */
+    val credentials = Credentials(KeystoreSecrets(ctx, "erisdb.tasks.secrets"))
 
     // ------------------------------------------------------------ settings
 
-    var server: String
-        get() = prefs.getString("server", "") ?: ""
-        set(value) {
-            prefs.edit().putString("server", value).commit()
-        }
-
-    /** The label a pairing ticket gave this core, so the app can say
-     * *paired with my-laptop*. Never trusted for anything. */
-    var coreName: String
-        get() = prefs.getString("coreName", "") ?: ""
-        set(value) {
-            prefs.edit().putString("coreName", value).commit()
-        }
-
-    /** The token lifetime observed at connect (exp − now), the lifetime
-     * every refresh preserves; 0 means the token never expires. */
-    var ttl: Long
-        get() = prefs.getLong("ttl", 0L)
-        set(value) {
-            prefs.edit().putLong("ttl", value).commit()
-        }
-
     /**
-     * What the core last reported this token holds, or null before it has
-     * been asked. Kept in the clear: it is what an operator approved, and
-     * the core is the one that enforces it — this copy only decides which
-     * buttons are worth drawing.
+     * What ErisDB last reported this app holds, or null before it has been
+     * asked. Kept in the clear: it is what the person approved, and ErisDB
+     * is the one that enforces it — this copy only decides which buttons
+     * are worth drawing.
      */
     var grants: List<String>?
         get() = readGrants(prefs.getString("grants", null))
@@ -70,31 +49,14 @@ class Store(ctx: Context) : OutboxStore {
             edit.commit()
         }
 
-    // ------------------------------------------------------------ secrets
-
-    /** Durable before returning: a kill right after a refresh must not
-     * lose the fresh token and leave the app holding a dead one. */
-    var token: String
-        get() = secrets.get("token") ?: ""
-        set(value) = secrets.put("token", value)
-
-    /** The device's iroh identity: 32 random bytes, minted once and kept
-     * forever, so `source.addr` names this phone stably. */
-    fun identityHex(): String {
-        secrets.get("identity")?.let { return it }
-        val bytes = ByteArray(32).also { SecureRandom().nextBytes(it) }
-        val hex = bytes.joinToString("") { "%02x".format(it) }
-        secrets.put("identity", hex)
-        return hex
-    }
-
     // ------------------------------------------------------------ cache
 
-    /** Items and the position that produced them are one snapshot. An absent,
-     * unreadable, or different-core snapshot must be fetched again in full. */
+    /** Items and the position that produced them are one snapshot, kept with
+     * the endpoint id of the ErisDB they came from. An absent, unreadable, or
+     * other ErisDB's snapshot must be fetched again in full. */
     fun loadSnapshot(): Snapshot? = runCatching {
         val saved = JSONObject(String(cacheFile.readFully(), Charsets.UTF_8))
-        require(saved.getString("server") == server)
+        require(saved.getString("server") == credentials.server?.let(::serverId))
         val cursor = saved.getLong("cursor")
         require(cursor >= 0)
         val items = LinkedHashMap<String, JSONObject>()
@@ -108,7 +70,7 @@ class Store(ctx: Context) : OutboxStore {
     /** AtomicFile syncs and replaces the whole snapshot. No separately saved
      * cursor can move past items that failed to reach disk. */
     fun saveSnapshot(server: String, snapshot: Snapshot) {
-        val bytes = JSONObject().put("server", server).put("cursor", snapshot.cursor)
+        val bytes = JSONObject().put("server", serverId(server)).put("cursor", snapshot.cursor)
             .put("items", JSONArray(snapshot.items.values.toList())).toString().toByteArray(Charsets.UTF_8)
         val stream = cacheFile.startWrite()
         try {

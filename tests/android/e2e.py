@@ -1,41 +1,60 @@
 #!/usr/bin/env python3
-"""Real APK UI -> JNI -> Iroh -> core -> Postgres. Requires an isolated emulator.
+"""Real APK UI -> ErisAuth -> JNI -> Iroh -> core -> Postgres, on an isolated emulator.
 
-Start tests/browser/server.cjs with ERISDB_TEST_IROH=1, then run this script.
-No intercepted requests, fake clients, simulated time, or in-memory database.
+What it needs, all of it real:
+- an isolated Android emulator (API 30 or later) on adb, serial `emulator-*`, with internet access,
+  and none of dev.eris.auth, dev.erisdb.tasks or dev.erisdb.lists installed: the suite installs
+  and uninstalls them, and refuses a device holding them;
+- this machine's internet access too: the host's devices and the emulator's find each other through
+  n0's relays, the only network the Android apps use;
+- Docker, for a disposable Postgres;
+- the `erisdb` binary (`ERISDB_BIN`, else built from `erisdb/`) and the `erisauth` binary
+  (`ERISAUTH_BIN`, else built from ErisAuth beside this checkout, `../ErisAuth`);
+- the debug APKs: `scripts/build-android.sh` builds Tasks and Lists, and ErisAuth's own
+  `scripts/build-android.sh` builds `ERISAUTH_APK` (else `../ErisAuth/android/app/build/outputs/
+  apk/debug/app-debug.apk`).
+
+The mesh is made as a person makes one: ErisAuth on this machine starts it, `erisdb join` asks it
+to approve ErisDB, `erisdb passphrase set` sets the passphrase, and `erisdb serve` runs ErisDB.
+ErisAuth on the emulator joins by the host's ticket, the fingerprint on both screens. Each app then
+signs in as a person signs it in: it asks ErisAuth on the phone, and the person answers in
+ErisAuth's own screens — denying, then approving part of what was asked with a wrong passphrase
+and then the right one. No intercepted requests, fake clients, simulated time, or in-memory
+database.
 """
-import base64
-from concurrent.futures import ThreadPoolExecutor
 import json
 import os
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import re
+import shutil
+import socket
 import subprocess
 import sys
+import tempfile
 import time
-import urllib.request
 import urllib.error
+import urllib.request
 import xml.etree.ElementTree as ET
 
 ROOT = Path(__file__).resolve().parents[2]
-CORE = 'http://127.0.0.1:18771'
-SECRET = 'erisdb-browser-e2e-only'
+ERISAUTH = ROOT.parent / 'ErisAuth'
 ADB = os.environ.get('ADB', 'adb')
-BIN = Path(os.environ.get('ERISDB_BIN', ROOT / 'erisdb/target/debug/erisdb'))
-ADMIN = subprocess.check_output([BIN, 'mint', '--grant', '*', '--ttl', '3600', '--secret', SECRET], text=True).strip()
-EID = subprocess.check_output([BIN, 'endpoint-id', '--secret', SECRET], text=True).strip()
+SECRET = 'erisdb-android-e2e-only'
+PASSPHRASE = 'correct horse battery staple'
+LISTEN = '127.0.0.1:18771'
+CORE = f'http://{LISTEN}'
+CLIENTS = {'tasks': 'Tasks (Android) v0.4', 'lists': 'Lists (Android) v0.5'}
+NAMES = {'tasks': 'Tasks', 'lists': 'Lists'}
+MANIFEST = {app: [f'{app}:{action}' for action in ('read', 'create', 'update', 'delete')] for app in CLIENTS}
 
 
-def adb(*args):
-    return subprocess.check_output([ADB, *args], text=True, timeout=45).strip()
-
-
-def api(method, path, body=None):
-    req = urllib.request.Request(CORE + path, method=method,
-        headers={'Authorization': 'Bearer ' + ADMIN, 'Content-Type': 'application/json'},
-        data=None if body is None else json.dumps(body).encode())
-    with urllib.request.urlopen(req, timeout=30) as response:
-        return None if response.status == 204 else json.load(response)
+def binary(variable, crate, name):
+    """A built binary: the one `variable` names, else `crate`'s, built now."""
+    if os.environ.get(variable):
+        return Path(os.environ[variable])
+    subprocess.check_call(['cargo', 'build', '--manifest-path', str(crate / 'Cargo.toml'), '--bin', name])
+    return crate / 'target/debug' / name
 
 
 def eventually(check, seconds=120, description='the real app/core state', diagnostics=None):
@@ -49,9 +68,138 @@ def eventually(check, seconds=120, description='the real app/core state', diagno
     raise AssertionError(f'timed out waiting for {description}{detail}')
 
 
+# ---------------------------------------------------------------- the host: ErisAuth and ErisDB
+
+class Host:
+    """This machine as a device of the mesh: ErisAuth running here, and ErisDB joined through it."""
+
+    def __init__(self):
+        self.dirs = tempfile.mkdtemp(prefix='erisdb-android-e2e-')
+        self.data = Path(self.dirs, 'data')
+        self.runtime = Path(self.dirs, 'runtime')
+        self.data.mkdir()
+        self.runtime.mkdir(mode=0o700)
+        self.processes = []
+        self.postgres = None
+        self.erisauth = binary('ERISAUTH_BIN', ERISAUTH, 'erisauth')
+        self.erisdb = binary('ERISDB_BIN', ROOT / 'erisdb', 'erisdb')
+
+    def start(self):
+        self.postgres = subprocess.check_output(
+            ['docker', 'run', '--rm', '-d', '-e', 'POSTGRES_PASSWORD=erisdb-e2e', '-p', '127.0.0.1::5432',
+             'postgres:17-alpine'], text=True).strip()
+        address = subprocess.check_output(['docker', 'port', self.postgres, '5432/tcp'], text=True).strip()
+        self.database = f'postgres://postgres:erisdb-e2e@{address}/postgres'
+        eventually(lambda: subprocess.run(['docker', 'exec', self.postgres, 'pg_isready', '-h', '127.0.0.1', '-U',
+                                           'postgres'], capture_output=True).returncode == 0,
+                   seconds=60, description='postgres')
+
+        self.spawn([self.erisauth, 'serve', '--no-notify'], self.device_env())
+        eventually(self.listening, seconds=60, description='ErisAuth on this machine')
+        assert self.say({'op': 'init', 'name': 'host'}).get('ok'), 'the host starts a mesh'
+
+        join = subprocess.Popen([self.erisdb, 'join'], env=self.erisdb_env() | {'XDG_RUNTIME_DIR': str(self.runtime)},
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        prompt = self.prompt(lambda p: p['becomes_erisdb'])
+        assert self.say({'op': 'decide', 'id': prompt['id']}) == {'ok': True}
+        out, err = join.communicate(timeout=120)
+        assert join.returncode == 0, f'erisdb join: {err}'
+
+        subprocess.run([self.erisdb, 'passphrase', 'set'], env=self.erisdb_env(), input=PASSPHRASE + '\n', text=True,
+                       check=True, timeout=60)
+        self.spawn([self.erisdb, 'serve'], self.erisdb_env())
+        eventually(lambda: self.health(), seconds=120, description='erisdb serve')
+        eventually(self.reaches_erisdb, description='the host reaching ErisDB')
+        self.admin = subprocess.check_output([self.erisdb, 'mint', '--grant', '*', '--ttl', '3600'],
+                                             env=self.erisdb_env(), text=True).strip()
+
+    def device_env(self):
+        env = dict(os.environ, XDG_DATA_HOME=str(self.data), XDG_RUNTIME_DIR=str(self.runtime))
+        env.pop('ERIS_NETWORK', None)  # n0's relays: the phone has no other way to reach this machine
+        return env
+
+    def erisdb_env(self):
+        env = dict(os.environ, DATABASE_URL=self.database, ERISDB_SECRET=SECRET, ERISDB_LISTEN=LISTEN)
+        env.pop('ERIS_NETWORK', None)
+        return env
+
+    def spawn(self, command, env):
+        self.processes.append(subprocess.Popen(command, env=env))
+
+    def socket(self):
+        return self.runtime / 'erisauth' / 'agent.sock'
+
+    def listening(self):
+        try:
+            self.state()
+            return True
+        except OSError:
+            return False
+
+    def say(self, line):
+        """One command on ErisAuth's socket, as its approval page and terminal send them."""
+        with socket.socket(socket.AF_UNIX) as s:
+            s.connect(str(self.socket()))
+            s.sendall((json.dumps(line) + '\n').encode())
+            answer = s.makefile().readline()
+        return json.loads(answer)
+
+    def state(self):
+        return self.say({'op': 'state'})
+
+    def prompt(self, which=lambda prompt: True):
+        return eventually(lambda: next((p for p in self.state()['approvals'] if which(p)), None),
+                          description='a request put to the person at the host')
+
+    def reaches_erisdb(self):
+        erisdb = (self.state()['mesh'] or {}).get('erisdb')
+        return bool(erisdb and erisdb.get('reachable'))
+
+    def health(self):
+        try:
+            with urllib.request.urlopen(CORE + '/v1/health', timeout=5) as response:
+                return response.status == 200
+        except OSError:
+            return False
+
+    def api(self, method, path, body=None):
+        """The operator's API, with a minted token over TCP."""
+        req = urllib.request.Request(CORE + path, method=method,
+            headers={'Authorization': 'Bearer ' + self.admin, 'Content-Type': 'application/json'},
+            data=None if body is None else json.dumps(body).encode())
+        with urllib.request.urlopen(req, timeout=30) as response:
+            return None if response.status == 204 else json.load(response)
+
+    def installation(self, app):
+        """The newest installation of `app`, by the name it asked ErisAuth under."""
+        found = [c for c in self.api('GET', '/v1/clients')['clients'] if c['name'] == CLIENTS[app]]
+        return found[-1] if found else None
+
+    def stop(self):
+        for process in reversed(self.processes):
+            process.terminate()
+            try:
+                process.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                process.kill()
+        if self.postgres:
+            subprocess.run(['docker', 'rm', '-f', self.postgres], capture_output=True)
+        shutil.rmtree(self.dirs, ignore_errors=True)
+
+
+# ---------------------------------------------------------------- the phone
+
+def adb(*args):
+    return subprocess.check_output([ADB, *args], text=True, timeout=45).strip()
+
+
 def screen():
     adb('shell', 'uiautomator', 'dump', '/sdcard/erisdb-e2e.xml')
     return ET.fromstring(adb('shell', 'cat', '/sdcard/erisdb-e2e.xml'))
+
+
+def texts():
+    return [n.get('text') for n in screen().iter('node') if n.get('text')]
 
 
 def has_text(value):
@@ -68,16 +216,18 @@ def find_button(label):
                  if n.get('content-desc') == label or n.get('text') in (label, label + '  ⋯')), None)
 
 
-def button(label):
+def button(label, seconds=120):
     # ElementTree leaf nodes are falsey; use an explicit list for waiting.
-    nodes = eventually(lambda: [n] if (n := find_button(label)) is not None else [])
+    nodes = eventually(lambda: [n] if (n := find_button(label)) is not None else [], seconds=seconds,
+                       description=f'the button {label!r}', diagnostics=texts)
     tap(nodes[0])
 
 
-def edit(index, value, replace=False):
-    def fields():
-        return [n for n in screen().iter('node') if n.get('class') == 'android.widget.EditText']
+def fields():
+    return [n for n in screen().iter('node') if n.get('class') == 'android.widget.EditText']
 
+
+def edit(index, value, replace=False):
     # Compose/IME focus must settle before ADB injects text. Verify the editor
     # itself before submitting; retrying a keystroke must never submit twice.
     for attempt in range(2):
@@ -96,16 +246,92 @@ def edit(index, value, replace=False):
     adb('shell', 'input', 'keyevent', 'KEYCODE_BACK')
 
 
-def run(app):
+def type_secret(field, value):
+    """Type into a password field, which shows nothing to read back, clearing it first."""
+    tap(field)
+    adb('shell', 'input', 'keyevent', 'KEYCODE_MOVE_END')
+    adb('shell', 'input', 'keyevent', *(['KEYCODE_DEL'] * 64))
+    adb('shell', 'input', 'text', value.replace(' ', '%s'))
+    adb('shell', 'input', 'keyevent', 'KEYCODE_BACK')
+
+
+def offline():
+    adb('shell', 'svc', 'wifi', 'disable')
+    adb('shell', 'svc', 'data', 'disable')
+
+
+def online():
+    adb('shell', 'svc', 'wifi', 'enable')
+    adb('shell', 'svc', 'data', 'enable')
+
+
+class ErisAuthApp:
+    """ErisAuth on the phone, driven through its own screens as its person drives it."""
+    package = 'dev.eris.auth'
+    component = 'dev.eris.auth/dev.eris.auth.MainActivity'
+
+    def install(self, host):
+        apk = Path(os.environ.get('ERISAUTH_APK', ERISAUTH / 'android/app/build/outputs/apk/debug/app-debug.apk'))
+        assert apk.is_file(), f'build {apk} first'
+        adb('install', '-g', str(apk))
+        added = host.say({'op': 'add'})
+        ticket = added['ticket']
+        # A ticket opened as a link fills in the join screen, as a scanned one does.
+        adb('shell', 'am', 'start', '-W', '-a', 'android.intent.action.VIEW', '-d', ticket, '-n', self.component)
+        eventually(lambda: has_text('Join your devices'), description='ErisAuth\'s join screen', diagnostics=texts)
+        edit(0, 'emulator')
+        button('Join')
+        prompt = host.prompt(lambda p: p['kind'] == 'device')
+        assert prompt['id'] == added['id'] and prompt['name'] == 'emulator'
+        eventually(lambda: has_text(prompt['fingerprint']), description='the fingerprint on the phone too')
+        assert host.say({'op': 'decide', 'id': prompt['id']}) == {'ok': True}
+        eventually(lambda: find_button('Requests') is not None, description='the phone in the mesh', diagnostics=texts)
+        eventually(lambda: any(d['name'] == 'emulator' for d in host.state()['mesh']['devices']))
+
+    def requests(self):
+        adb('shell', 'am', 'start', '-W', '-n', self.component)
+        button('Requests')
+
+    def asked_by(self, app):
+        """Wait for `app`'s request on ErisAuth's Requests screen."""
+        self.requests()
+        eventually(lambda: has_text(CLIENTS[app]), description=f'{app} asking ErisAuth', diagnostics=texts)
+
+    def deny(self, app):
+        self.asked_by(app)
+        button('Deny')
+        eventually(lambda: not has_text(CLIENTS[app]))
+
+    def withhold(self, grants):
+        """Untick grants on the request in view, so the person approves the rest."""
+        for grant in grants:
+            button(grant)
+
+    def approve(self, app, given, passphrase=PASSPHRASE):
+        """Type `passphrase` into the request in view and approve `given` of what `app` asked."""
+        field = eventually(lambda: fields()[-1:], description='the passphrase field', diagnostics=texts)[0]
+        type_secret(field, passphrase)
+        asked = len(MANIFEST[app])
+        button('Approve' if given == asked else f'Approve {given} of {asked}')
+
+    def uninstall(self):
+        adb('uninstall', self.package)
+
+
+# ---------------------------------------------------------------- one app
+
+def run(app, host, erisauth):
     package = f'dev.erisdb.{app}'
     component = f'{package}/dev.erisdb.{app}.MainActivity'
+    add = 'add task' if app == 'tasks' else 'add entry'
     apk = ROOT / f'apps/{app}-android/app/build/outputs/apk/debug/app-debug.apk'
     assert apk.is_file(), f'build {apk} first'
-    installed = adb('shell', 'pm', 'list', 'packages', package).splitlines()
-    assert f'package:{package}' not in installed, 'use an isolated emulator; existing app data must be preserved'
+
+    def launch():
+        adb('shell', 'am', 'start', '-W', '-n', component)
 
     def create_entry(label):
-        button('add task' if app == 'tasks' else 'add entry')
+        button(add)
         if app == 'tasks':
             edit(0, label)
         else:
@@ -131,6 +357,13 @@ def run(app):
             button('Delete')
         button('Delete')
 
+    def settings():
+        if app == 'tasks':
+            button('settings')
+        else:
+            button('menu')
+            button('Settings')
+
     def saved_items():
         try:
             return json.loads(adb('shell', 'run-as', package, 'cat', 'files/items.json'))['items']
@@ -141,94 +374,81 @@ def run(app):
         preferences = ET.fromstring(adb('shell', 'run-as', package, 'cat', 'shared_prefs/erisdb.xml'))
         return json.loads(next(n.text for n in preferences if n.get('name') == 'outbox'))
 
-    print(f'{app}: install and pair on a core without its schema', flush=True)
+    def saved_labels():
+        saved = json.loads(adb('shell', 'run-as', package, 'cat', 'files/items.json'))
+        return {v['body'].get('title', v['body'].get('name')) for v in saved['items']}
+
+    installed = adb('shell', 'pm', 'list', 'packages', package).splitlines()
+    assert f'package:{package}' not in installed, 'use an isolated emulator; existing app data must be preserved'
+    print(f'{app}: install; it asks ErisAuth on its first launch', flush=True)
     adb('install', '-g', str(apk))
     try:
-        assert not any(item['body']['name'] == app for item in api('GET', '/v1/items?facet=facet')['items'])
-        for outcome in ('denied', 'expired'):
-            print(f'{app}: pairing {outcome}' + (' after rescan/restart' if outcome == 'denied' else ' while awaiting approval'), flush=True)
-            refused = api('POST', '/v1/pairings', {'ttl_secs': 300 if outcome == 'denied' else 60})
-            payload = {'v': 1, 'name': 'Unapproved', 'eid': EID, 'token': refused['secret']}
-            code = 'erisdb://pair/' + base64.urlsafe_b64encode(json.dumps(payload).encode()).decode().rstrip('=')
-            adb('shell', 'am', 'start', '-W', '-a', 'android.intent.action.VIEW', '-d', code, '-n', component)
-            refused_path = f"/v1/pairings/{refused['id']}"
-            def pairing_details():
-                return {'session': api('GET', refused_path), 'screen': [n.get('text') for n in screen().iter('node') if n.get('text')]}
-            requested = eventually(lambda: (v if (v := api('GET', refused_path))['body']['status'] == 'requested' else None),
-                                   description=f'{app} {outcome} pairing request', diagnostics=pairing_details)
-            eventually(lambda: has_text(requested['body']['fingerprint']))
-            if outcome == 'denied':
-                adb('shell', 'am', 'force-stop', package)
-                adb('shell', 'am', 'start', '-W', '-a', 'android.intent.action.VIEW', '-d', code, '-n', component)
-                eventually(lambda: has_text(requested['body']['fingerprint']),
-                           description=f'{app} pairing fingerprint after rescan/restart', diagnostics=pairing_details)
-                api('POST', refused_path + '/deny', {})
-                eventually(lambda: has_text('said no'))
-            else:
-                eventually(lambda: has_text('That pairing code is done'), seconds=75,
-                           description=f'{app} pending pairing expiry', diagnostics=pairing_details)
-                assert time.time() >= refused['expires']
-            assert not any(client['id'] == refused['id'] for client in api('GET', '/v1/clients')['clients'])
-            button('Back to pairing')
-        session = api('POST', '/v1/pairings', {})
-        payload = {'v': 1, 'name': 'Android E2E', 'eid': EID, 'token': session['secret']}
-        ticket = 'erisdb://pair/' + base64.urlsafe_b64encode(json.dumps(payload).encode()).decode().rstrip('=')
-        if app == 'lists':
-            # Actual loss of device connectivity, not an intercepted API reply.
-            adb('shell', 'svc', 'wifi', 'disable')
-            adb('shell', 'svc', 'data', 'disable')
-        adb('shell', 'am', 'start', '-W', '-a', 'android.intent.action.VIEW', '-d', ticket, '-n', component)
-        if app == 'lists':
-            try:
-                eventually(lambda: has_text("can't reach"), seconds=75)
-            finally:
-                adb('shell', 'svc', 'wifi', 'enable')
-                adb('shell', 'svc', 'data', 'enable')
-        path = f"/v1/pairings/{session['id']}"
-        pending = eventually(lambda: (v if (v := api('GET', path))['body']['status'] == 'requested' else None))
-        assert pending['body']['requested'] == [f'{app}:{action}' for action in ('read', 'create', 'update', 'delete')]
-        eventually(lambda: has_text(pending['body']['fingerprint']))
-        api('POST', path + '/approve', {'granted': [f'{app}:read', f'{app}:create'], 'ttl_secs': 5})
-        eventually(lambda: any(client['id'] == session['id'] for client in api('GET', '/v1/clients')['clients']))
-        client = api('GET', f"/v1/clients/{session['id']}")
-        assert client['identity']['kind'] == 'iroh'
-        button('add task' if app == 'tasks' else 'add entry')
+        assert not any(item['body']['name'] == app for item in host.api('GET', '/v1/items?facet=facet')['items'])
+        launch()
+        eventually(lambda: has_text('Waiting for ErisAuth'), diagnostics=texts)
+
+        print(f'{app}: the person says no in ErisAuth', flush=True)
+        erisauth.deny(app)
+        launch()
+        eventually(lambda: has_text(f'ErisAuth did not let {NAMES[app]} in'), diagnostics=texts)
+        assert host.installation(app) is None, 'a denial lets nothing in'
+
+        print(f'{app}: asked again, approved in part, after a wrong passphrase', flush=True)
+        button('Ask again')
+        eventually(lambda: has_text('Waiting for ErisAuth'))
+        erisauth.asked_by(app)
+        erisauth.withhold([f'{app}:update', f'{app}:delete'])
+        erisauth.approve(app, given=2, passphrase='not the passphrase')
+        eventually(lambda: has_text('That is not the passphrase.'), diagnostics=texts)
+        assert host.installation(app) is None, 'a wrong passphrase lets nothing in'
+        erisauth.approve(app, given=2)
+        installation = eventually(lambda: host.installation(app), description=f'{app} enrolled at ErisDB')
+        assert sorted(installation['approved']) == sorted([f'{app}:read', f'{app}:create']), installation
+        assert installation['grants'] == installation['approved']
+        launch()
+        eventually(lambda: find_button(add) is not None, description=f'{app} signed in', diagnostics=texts)
+
+        # The key and the address of the ErisDB it was let into, sealed on the phone, and nothing else.
+        raw = adb('shell', 'run-as', package, 'cat', 'shared_prefs/erisdb-secrets.xml')
+        assert {n.get('name') for n in ET.fromstring(raw)} == {'key', 'server'}, raw
+        assert host.state()['mesh']['erisdb']['app'] not in raw, 'the address is sealed, not in the clear'
+
         label = f'{app}AndroidE2E{time.time_ns()}'
+        button(add)
         if app == 'tasks':
             edit(0, label)
         else:
             edit(0, 'E2E')
             edit(1, label)
         print(f'{app}: save offline and restart with a queued creation', flush=True)
-        adb('shell', 'svc', 'wifi', 'disable')
-        adb('shell', 'svc', 'data', 'disable')
+        offline()
         try:
             button('Save')
             eventually(lambda: has_text(label))
             adb('shell', 'am', 'force-stop', package)
-            adb('shell', 'am', 'start', '-W', '-n', component)
+            launch()
             eventually(lambda: has_text(label))
-            assert api('GET', f'/v1/items?facet={app}')['items'] == []
-            assert not any(f['body']['name'] == app for f in api('GET', '/v1/items?facet=facet')['items'])
+            assert host.api('GET', f'/v1/items?facet={app}')['items'] == []
+            assert not any(f['body']['name'] == app for f in host.api('GET', '/v1/items?facet=facet')['items'])
         finally:
-            adb('shell', 'svc', 'wifi', 'enable')
-            adb('shell', 'svc', 'data', 'enable')
+            online()
+
         def created():
-            return next((item for item in api('GET', f'/v1/items?facet={app}')['items']
+            return next((item for item in host.api('GET', f'/v1/items?facet={app}')['items']
                          if item['body'].get('title', item['body'].get('name')) == label), None)
         print(f'{app}: reconnect and verify the real schema and saved entry', flush=True)
         item = eventually(created)
-        assert item['source']['installation'] == session['id']
-        registered = next(f for f in api('GET', '/v1/items?facet=facet')['items'] if f['body']['name'] == app)
+        assert item['source']['installation'] == installation['id']
+        registered = next(f for f in host.api('GET', '/v1/items?facet=facet')['items'] if f['body']['name'] == app)
         definition = registered['body']
-        assert registered['source']['installation'] == session['id']
+        assert registered['source']['installation'] == installation['id']
         assert definition['strict'] is True and definition['version'] == 1
         # Compare with the actual APK source's schema, not a test substitute.
         facet_source = (ROOT / f'apps/{app}-android/app/src/main/java/dev/erisdb/{app}/Facet.kt').read_text()
         schema = json.loads(re.search(r'private const val SCHEMA = """(.*?)"""', facet_source, re.S)[1])
         assert definition['schema'] == schema
         try:
-            api('POST', '/v1/items', {'facet': app, 'body': {}})
+            host.api('POST', '/v1/items', {'facet': app, 'body': {}})
         except urllib.error.HTTPError as error:
             assert error.code == 422
         else:
@@ -237,78 +457,59 @@ def run(app):
         # Keep the server unchanged: a later update can hide a lost local cache
         # by sending the missing item through the change feed again.
         second_label = label + 'Second'
-        button('add task' if app == 'tasks' else 'add entry')
-        if app == 'tasks':
-            edit(0, second_label)
-        else:
-            edit(0, 'E2E')
-            edit(1, second_label)
-        button('Save')
-        eventually(lambda: len(api('GET', f'/v1/items?facet={app}')['items']) == 2)
-        eventually(lambda: json.loads(next(n.text for n in ET.fromstring(
-            adb('shell', 'run-as', package, 'cat', 'shared_prefs/erisdb.xml')) if n.get('name') == 'outbox')) == [])
-        def saved_labels():
-            saved = json.loads(adb('shell', 'run-as', package, 'cat', 'files/items.json'))
-            return {v['body'].get('title', v['body'].get('name')) for v in saved['items']}
+        create_entry(second_label)
+        eventually(lambda: len(host.api('GET', f'/v1/items?facet={app}')['items']) == 2)
+        eventually(lambda: queued() == [])
         eventually(lambda: saved_labels() == {label, second_label})
-        baseline = api('GET', f'/v1/items?facet={app}')['items']
+        baseline = host.api('GET', f'/v1/items?facet={app}')['items']
 
         adb('shell', 'am', 'force-stop', package)
-        adb('shell', 'svc', 'wifi', 'disable')
-        adb('shell', 'svc', 'data', 'disable')
+        offline()
         try:
-            adb('shell', 'am', 'start', '-W', '-n', component)
+            launch()
             eventually(lambda: has_text(label) and has_text(second_label))
         finally:
-            adb('shell', 'svc', 'wifi', 'enable')
-            adb('shell', 'svc', 'data', 'enable')
+            online()
         eventually(lambda: has_text(label) and has_text(second_label))
-        assert api('GET', f'/v1/items?facet={app}')['items'] == baseline
+        assert host.api('GET', f'/v1/items?facet={app}')['items'] == baseline
         print(f'{app}: both unchanged saved items survive offline process restart', flush=True)
-        # Actual on-device storage damage: credentials and the server stay intact.
+        # Actual on-device storage damage: the sealed key, its ErisDB and the server stay intact.
         # A missing/unreadable cache must never reuse a cursor for absent items.
-        for damage, command in [('unreadable', ('truncate', '-s', '0')),
-                                ('missing', ('rm',))]:
+        for damage, command in [('unreadable', ('truncate', '-s', '0')), ('missing', ('rm',))]:
             adb('shell', 'am', 'force-stop', package)
             adb('shell', 'run-as', package, *command, 'files/items.json')
-            adb('shell', 'am', 'start', '-W', '-n', component)
+            launch()
             print(f'{app}: recover unchanged server data after a {damage} local cache', flush=True)
             eventually(lambda: has_text(label) and has_text(second_label), seconds=35)
             eventually(lambda: saved_labels() == {label, second_label})
-            assert api('GET', f'/v1/items?facet={app}')['items'] == baseline
+            assert host.api('GET', f'/v1/items?facet={app}')['items'] == baseline
 
+        print(f'{app}: a later launch dials the kept ErisDB with nothing but its key', flush=True)
         adb('shell', 'am', 'force-stop', package)
-        print(f'{app}: restart after real token expiration', flush=True)
-        time.sleep(6)  # Real expiration while the app is stopped.
-        changed = label + 'AfterExpiry'
+        changed = label + 'Remote'
         body = item['body'] | {('title' if app == 'tasks' else 'name'): changed}
-        api('PUT', f"/v1/items/{item['id']}", {'body': body, 'revision': item['revision']})
-        adb('shell', 'am', 'start', '-W', '-n', component)
+        host.api('PUT', f"/v1/items/{item['id']}", {'body': body, 'revision': item['revision']})
+        launch()
         eventually(lambda: has_text(changed))  # Cannot come from the cached snapshot.
-        # Re-pair this actual app installation. Wait beyond a normal background
-        # sync interval before approval so pairing and sync share a real runtime.
-        again = api('POST', '/v1/pairings', {})
-        payload['token'] = again['secret']
-        next_ticket = 'erisdb://pair/' + base64.urlsafe_b64encode(json.dumps(payload).encode()).decode().rstrip('=')
-        adb('shell', 'am', 'start', '-W', '-a', 'android.intent.action.VIEW', '-d', next_ticket, '-n', component)
-        button('Pair again')
-        next_path = f"/v1/pairings/{again['id']}"
-        pending = eventually(lambda: (v if (v := api('GET', next_path))['body']['status'] == 'requested' else None))
-        eventually(lambda: has_text(pending['body']['fingerprint']))
-        time.sleep(11)
-        assert api('GET', next_path)['body']['status'] == 'requested'
-        api('POST', next_path + '/approve', {'granted': [f'{app}:{action}' for action in ('read', 'create', 'update', 'delete')], 'ttl_secs': 5})
-        collected = eventually(lambda: (v if (v := api('GET', next_path))['body']['status'] == 'collected' else None))
-        assert collected['body']['client_id'] == session['id']
-        current = api('GET', f"/v1/clients/{session['id']}")
-        assert current['identity'] == client['identity']
-        client = current
-        eventually(lambda: has_text(changed))
+
+        print(f'{app}: sign in again from Settings to ask for the rest', flush=True)
+        settings()
+        button('Sign in again')
+        eventually(lambda: has_text('Waiting for ErisAuth'))
+        erisauth.asked_by(app)
+        erisauth.approve(app, given=len(MANIFEST[app]))
+        again = eventually(lambda: (i if sorted((i := host.installation(app))['grants']) == sorted(MANIFEST[app])
+                                    else None),
+                           description=f'{app} granted the rest')
+        assert again['id'] == installation['id'] and again['app'] == installation['app'], 'the same app, the same key'
+        installation = again
+        launch()
+        eventually(lambda: has_text(changed) and find_button(add) is not None, diagnostics=texts)
+
         print(f'{app}: offline creates retain order and pending deletes follow their server IDs', flush=True)
         pending = label + 'Queued'
         discarded = label + 'Discarded'
-        adb('shell', 'svc', 'wifi', 'disable')
-        adb('shell', 'svc', 'data', 'disable')
+        offline()
         try:
             create_entry(pending)
             button(pending)
@@ -320,49 +521,48 @@ def run(app):
             delete_entry(discarded)
             eventually(lambda: has_text(pending) and not has_text(discarded))
             adb('shell', 'am', 'force-stop', package)
-            adb('shell', 'am', 'start', '-W', '-n', component)
+            launch()
             eventually(lambda: has_text(pending) and not has_text(discarded))
         finally:
-            adb('shell', 'svc', 'wifi', 'enable')
-            adb('shell', 'svc', 'data', 'enable')
+            online()
         eventually(lambda: queued() == [])
-        final_items = api('GET', f'/v1/items?facet={app}')['items']
+        final_items = host.api('GET', f'/v1/items?facet={app}')['items']
         assert len(final_items) == 3, final_items
         assert sum(v['body'].get('title', v['body'].get('name')) == pending for v in final_items) == 1
         assert not any(v['body'].get('title', v['body'].get('name')) == discarded for v in final_items)
-        changes = api('GET', f'/v1/changes?facet={app}')['changes']
+        changes = host.api('GET', f'/v1/changes?facet={app}')['changes']
         queued_creates = [v['body'].get('title', v['body'].get('name')) for v in changes
-                          if v['op'] == 'created' and v.get('body') and v['body'].get('title', v['body'].get('name')) in (pending, discarded)]
+                          if v['op'] == 'created' and v.get('body')
+                          and v['body'].get('title', v['body'].get('name')) in (pending, discarded)]
         assert queued_creates == [pending, discarded], 'each queued create must be sent once, in order'
         delete_entry(pending)
-        eventually(lambda: len(api('GET', f'/v1/items?facet={app}')['items']) == 2)
-        print(f'{app}: re-paired; edit and delete through the UI', flush=True)
+        eventually(lambda: len(host.api('GET', f'/v1/items?facet={app}')['items']) == 2)
+
+        print(f'{app}: edit and delete through the UI, over a remote edit', flush=True)
         button(changed)
         edited = changed + 'Edited'
         edit(0 if app == 'tasks' else 1, edited, replace=True)
-        adb('shell', 'svc', 'wifi', 'disable')
-        adb('shell', 'svc', 'data', 'disable')
+        offline()
         try:
-            latest = api('GET', f"/v1/items/{item['id']}")
-            api('PUT', f"/v1/items/{item['id']}", {'revision': latest['revision'],
-                'body': latest['body'] | {('title' if app == 'tasks' else 'name'): changed + 'Remote'}})
+            latest = host.api('GET', f"/v1/items/{item['id']}")
+            host.api('PUT', f"/v1/items/{item['id']}", {'revision': latest['revision'],
+                     'body': latest['body'] | {('title' if app == 'tasks' else 'name'): changed + 'Again'}})
             button('Save')
             eventually(lambda: has_text(edited))
         finally:
-            adb('shell', 'svc', 'wifi', 'enable')
-            adb('shell', 'svc', 'data', 'enable')
-        updated = eventually(lambda: (v if (v := api('GET', f"/v1/items/{item['id']}"))['body'].get('title', v['body'].get('name')) == edited else None))
-        assert updated['source']['installation'] == session['id']
+            online()
+        updated = eventually(lambda: (v if (v := host.api('GET', f"/v1/items/{item['id']}"))['body'].get(
+            'title', v['body'].get('name')) == edited else None))
+        assert updated['source']['installation'] == installation['id']
         eventually(lambda: has_text(edited))
         assert updated['revision'] == latest['revision'] + 2, 'the queued edit must retry its real revision conflict'
         delete_entry(edited)
-        eventually(lambda: all(v['id'] != item['id'] for v in api('GET', f'/v1/items?facet={app}')['items']))
+        eventually(lambda: all(v['id'] != item['id'] for v in host.api('GET', f'/v1/items?facet={app}')['items']))
 
         print(f'{app}: queued writes rejected by narrowed authority leave the queue', flush=True)
         denied_label = label + 'NotAllowed'
-        remaining = api('GET', f'/v1/items?facet={app}')['items'][0]
-        adb('shell', 'svc', 'wifi', 'disable')
-        adb('shell', 'svc', 'data', 'disable')
+        remaining = host.api('GET', f'/v1/items?facet={app}')['items'][0]
+        offline()
         try:
             create_entry(denied_label)
             delete_entry(denied_label)
@@ -370,47 +570,55 @@ def run(app):
             edit(0 if app == 'tasks' else 1, second_label + 'NotAllowed', replace=True)
             button('Save')
             delete_entry(second_label + 'NotAllowed')
-            client = api('PUT', f"/v1/clients/{session['id']}", {'grants': [f'{app}:read'], 'revision': client['revision']})
+            installation = host.api('PUT', f"/v1/clients/{installation['id']}",
+                                    {'grants': [f'{app}:read'], 'revision': installation['revision']})
         finally:
-            adb('shell', 'svc', 'wifi', 'enable')
-            adb('shell', 'svc', 'data', 'enable')
+            online()
         eventually(lambda: queued() == [])
-        assert api('GET', f'/v1/items?facet={app}')['items'] == [remaining]
+        assert host.api('GET', f'/v1/items?facet={app}')['items'] == [remaining]
         eventually(lambda: has_text(second_label))
-        client = api('PUT', f"/v1/clients/{session['id']}", {'grants': [f'{app}:{action}' for action in ('read', 'create', 'update', 'delete')], 'revision': client['revision']})
+        installation = host.api('PUT', f"/v1/clients/{installation['id']}",
+                                {'grants': MANIFEST[app], 'revision': installation['revision']})
 
         print(f'{app}: snapshot pagination and multi-page change replay preserve every item', flush=True)
         adb('shell', 'am', 'force-stop', package)
+
         def seed_entry(index):
             body = ({'title': f'Page{index:04}', 'done': False} if app == 'tasks'
                     else {'list': 'Pagination', 'name': f'Page{index:04}'})
-            return api('POST', '/v1/items', {'facet': app, 'body': body})
+            return host.api('POST', '/v1/items', {'facet': app, 'body': body})
         with ThreadPoolExecutor(max_workers=8) as writers:
             paged = list(writers.map(seed_entry, range(1001)))
         expected = {entry['id'] for entry in paged} | {entry['id'] for entry in baseline if entry['id'] != item['id']}
         adb('shell', 'run-as', package, 'rm', 'files/items.json')
-        adb('shell', 'am', 'start', '-W', '-n', component)
+        launch()
         eventually(lambda: {entry['id'] for entry in saved_items()} == expected)
         adb('shell', 'am', 'force-stop', package)
         with ThreadPoolExecutor(max_workers=8) as writers:
-            list(writers.map(lambda entry: api('DELETE', f"/v1/items/{entry['id']}"), paged[:501]))
-        adb('shell', 'am', 'start', '-W', '-n', component)
+            list(writers.map(lambda entry: host.api('DELETE', f"/v1/items/{entry['id']}"), paged[:501]))
+        launch()
         expected -= {entry['id'] for entry in paged[:501]}
         eventually(lambda: {entry['id'] for entry in saved_items()} == expected)
         if app == 'tasks':
-            overdue = api('POST', '/v1/items', {'facet': app,
-                'body': {'title': 'LapseEvent', 'done': False, 'due': '2020-01-01T00:00:00Z'}})
+            overdue = host.api('POST', '/v1/items', {'facet': app,
+                               'body': {'title': 'LapseEvent', 'done': False, 'due': '2020-01-01T00:00:00Z'}})
             cached = eventually(lambda: next((v for v in saved_items() if v['id'] == overdue['id']), None))
-            tick = api('POST', '/v1/tick', {})
+            tick = host.api('POST', '/v1/tick', {})
             assert tick['lapsed'] == 1
             eventually(lambda: json.loads(adb('shell', 'run-as', package, 'cat', 'files/items.json'))['cursor'] >= tick['seq'])
-            assert next(v for v in saved_items() if v['id'] == overdue['id']) == cached, 'a lapse event must not change item timestamps or revision'
-            api('DELETE', f"/v1/items/{overdue['id']}")
-        api('PUT', f"/v1/clients/{session['id']}", {'grants': [f'{app}:read'], 'revision': client['revision']})
-        eventually(lambda: find_button('add task' if app == 'tasks' else 'add entry') is None)
-        api('POST', f"/v1/clients/{session['id']}/revoke", {})
-        eventually(lambda: has_text('revoked'))
-        print(f'{app}: pairing restart/denial/expiry, offline queue order/deletion/rejections, revision conflict, snapshot/feed pagination, cache recovery, renewal, CRUD and revocation passed', flush=True)
+            assert next(v for v in saved_items() if v['id'] == overdue['id']) == cached, \
+                'a lapse event must not change item timestamps or revision'
+            host.api('DELETE', f"/v1/items/{overdue['id']}")
+        installation = host.api('PUT', f"/v1/clients/{installation['id']}",
+                                {'grants': [f'{app}:read'], 'revision': installation['revision']})
+        eventually(lambda: find_button(add) is None)
+
+        print(f'{app}: revoked, it is shut out until it signs in again', flush=True)
+        host.api('POST', f"/v1/clients/{installation['id']}/revoke", {})
+        eventually(lambda: has_text('ErisDB no longer lets this app in'), diagnostics=texts)
+        print(f'{app}: ErisAuth sign-in (denied, wrong passphrase, part, the rest), offline queue order/deletion/'
+              'rejections, revision conflict, snapshot/feed pagination, cache recovery, CRUD and revocation passed',
+              flush=True)
     except Exception:
         Path('/tmp/erisdb-android-logcat.txt').write_text(adb('logcat', '-d'))
         try:
@@ -422,10 +630,29 @@ def run(app):
         adb('uninstall', package)
 
 
-if __name__ == '__main__':
+def main():
     serial = adb('get-serialno')
     assert serial.startswith('emulator-'), 'this destructive test installs/uninstalls its own apps; use an isolated emulator'
     apps = sys.argv[1:] or ['tasks', 'lists']
-    assert all(app in ('tasks', 'lists') for app in apps)
-    for app in apps:
-        run(app)
+    assert all(app in CLIENTS for app in apps)
+    held = adb('shell', 'pm', 'list', 'packages').splitlines()
+    assert 'package:dev.eris.auth' not in held, 'use an isolated emulator; ErisAuth there holds a device of a mesh'
+    host = Host()
+    erisauth = ErisAuthApp()
+    try:
+        print('host: a mesh, ErisDB joined through it, its passphrase set, serving', flush=True)
+        host.start()
+        print('phone: ErisAuth joins the mesh by the host\'s ticket', flush=True)
+        erisauth.install(host)
+        for app in apps:
+            run(app, host, erisauth)
+    finally:
+        try:
+            erisauth.uninstall()
+        except subprocess.CalledProcessError:
+            pass
+        host.stop()
+
+
+if __name__ == '__main__':
+    main()

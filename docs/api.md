@@ -2,7 +2,8 @@
 
 The server exposes the HTTP routes below over TCP and authenticated Iroh.
 Routes are implemented in [api.rs](../erisdb/src/api.rs), with installation
-authentication in [installation.rs](../erisdb/src/installation.rs).
+authorization in [installation.rs](../erisdb/src/installation.rs) and the
+passphrase in [passphrase.rs](../erisdb/src/passphrase.rs).
 Examples use illustrative IDs, timestamps and credentials; obtain those values
 from your running server.
 
@@ -17,8 +18,8 @@ from your running server.
 - [Items and facets](#items-and-facets)
 - [Change feed and ticks](#change-feed-and-ticks)
 - [Capabilities and permissions](#capabilities-and-permissions)
-- [Pairing](#pairing)
-- [Registered installations](#registered-installations)
+- [Enrollment](#enrollment)
+- [Installations](#installations)
 - [Plugins](#plugins)
 - [Operator CLI](#operator-cli)
 - [Limits](#limits)
@@ -27,45 +28,39 @@ from your running server.
 
 The core serves `/v1` on plain HTTP, default `127.0.0.1:7700`, and on HTTP/1.1
 streams inside authenticated Iroh QUIC using ALPN `erisdb/0`. The routes and
-payloads are shared; transport identity affects authentication and attribution.
-
-Use HTTPS remotely, with the core behind a **local** TLS reverse proxy; HTTP is
-supported on localhost. Registered HTTP access, enrollment and renewal require
-the core's actual TCP peer to be loopback. Forwarded headers do not satisfy this
-check. Native Iroh clients use the authenticated QUIC identity instead.
+payloads are shared; the transport decides which credentials a request can carry.
 
 | Credential | Used for | How it is sent |
 |---|---|---|
-| Operator/manual token | Routes allowed by its grants | `Authorization: Bearer erisdb1.…` |
-| Pairing capability | Redeem and poll one temporary pairing session | Same bearer header; the signed token names that session |
-| Registered access token | Data and administrative routes allowed by its effective grants | Same bearer header; the signed token names its installation |
-| HTTP installation secret | Collect approval and renew access | `X-ErisDB-Client-Proof: SECRET`; renewal needs no bearer token |
-| Native installation private key | Collect approval, access and renew | Possession is proved by the Iroh transport; never send the private key in JSON |
+| An enrolled app's key | Routes its installation's grants allow | Nothing in the request: over Iroh, with no `Authorization` header, the peer's key the QUIC handshake proved |
+| A device of the mesh | `POST /v1/enroll` and `POST /v1/passphrase` | The device calling over Iroh as itself |
+| Operator, minted or delegated token | Routes its grants allow | `Authorization: Bearer erisdb1.…`, over TCP or Iroh |
 
-Only the application health route is unauthenticated. `POST /v1/clients/{id}/refresh`
-authenticates with installation proof instead of a bearer token. All other
-routes require a valid bearer token. HTTP registered access tokens are bearer
-credentials; the independent installation secret is required for collection
-and renewal, not each ordinary HTTP read/write.
+Only the health route is unauthenticated. A request with a bearer token is
+authorized by the token; one without, over Iroh, by the installation of its key;
+one without, over TCP, by nothing (401).
 
-For every registered request, Postgres supplies the installation's current
-status and grants. Effective grants are the intersection of the token's grants
-and the registration's grants. Native access additionally requires the matching
-Iroh key. Missing, expired or revoked authority yields 401; insufficient grants
-yield 403. Manual tokens have no installation and keep their bounded
-refresh-chain semantics.
+For an app calling by its key, Postgres supplies its installation's status and
+grants, and the core's copy of the mesh's device list supplies whether its device
+is still a member and its note still unrevoked. A token delegated by an
+installation names it, and its effective grants are the intersection of its own
+and the installation's current grants. Missing, expired or revoked authority
+yields 401; insufficient grants yield 403. Operator and minted tokens have no
+installation and keep their bounded refresh-chain semantics.
+
+Use HTTPS remotely, with the core behind a **local** TLS reverse proxy; HTTP is
+supported on localhost. Bearer tokens on TCP are readable by anything on the
+path.
 
 Bodies use `Content-Type: application/json`. Responses are JSON except 204,
 SSE, framework rejections, and plugin-defined responses. Core responses carry
 `Cache-Control: no-store`. Do not follow redirects with credentials. CORS is
 permissive; possession of authority, not the browser origin, authorizes requests.
 Extra fields in top-level request envelopes are ignored except for
-`POST /v1/call`, which rejects them. Item bodies follow their own facet schema.
-The router also supplies HEAD for GET routes and unauthenticated CORS OPTIONS
-preflights. HEAD runs the GET handler but omits the response body, so do not use
-HEAD on `/v1/pair/status` as a side-effect-free probe: that handler can collect
-an approval. These framework methods are implicit, not additional application
-operations in the route table.
+`POST /v1/call`, `POST /v1/enroll` and `POST /v1/passphrase`, which reject them.
+Item bodies follow their own facet schema. The router also supplies HEAD for GET
+routes and unauthenticated CORS OPTIONS preflights. These framework methods are
+implicit, not additional application operations in the route table.
 
 `X-ErisDB-Client` is an optional printable-ASCII attribution label, at most 128
 bytes. It authenticates nothing. There are no cookies, query-string tokens,
@@ -74,7 +69,7 @@ route.
 
 ## Example setup
 
-Shell examples use Bash, curl, jq, and Python 3. Point these variables at a
+Shell examples use Bash, curl and jq. Point these variables at a
 running development core. The creation examples write real data; use a facet
 whose schema matches the example body.
 
@@ -94,10 +89,12 @@ api() {
 }
 ```
 
-`TOKEN` is the acting caller's token, not the server's signing secret. App code
-should use paired, narrowly granted access. Examples below assign `ITEM_ID`,
-`ITEM_REV`, `SNAPSHOT_SEQ`, `PAIR_ID`, `PAIR_TOKEN`, `CLIENT_ID`, and `PROOF`
-from previous responses. If using a section independently, supply its variables.
+`TOKEN` is the acting caller's token, not the server's signing secret. Apps
+call by their enrolled keys over Iroh instead, through
+[erisdb-client](../erisdb-client/README.md); the shell examples use an operator
+token over TCP. Examples below assign `ITEM_ID`, `ITEM_REV`, `SNAPSHOT_SEQ`, and
+`CLIENT_ID` from previous responses. If using a section independently, supply
+its variables.
 The delete example is a separate final operation; keep the item alive while
 trying update, history and revert.
 
@@ -131,7 +128,9 @@ in `clients` are separate objects, not generic items.
 
 Normal request attribution has `addr` (observed TCP peer or `iroh:ENDPOINT_ID`),
 `user` (signed token label), `client` (self-declared header), and `installation`
-(authenticated registration UUID). Individual values may be null.
+(the installation the caller's key or token belongs to). Individual values may
+be null. An installation the mesh revoked records `{"mesh": "device removed"}` or
+`{"mesh": "note revoked"}` as the source of its audit event.
 
 Postgres stores bodies as JSONB: key ordering is not preserved and duplicate
 object keys collapse. Timestamps and revisions are server-owned.
@@ -168,15 +167,10 @@ item ID/facet are implicit in the history request. Installation audit events use
 Treat them as registry events, not item updates. Deletion leaves prior snapshots
 in history; it does not erase audit records.
 
-### Pairing session and installation
-
-The pairing endpoints return a compact session envelope:
-`{id, revision, created_at, body}`. The body's fields depend on its state;
-[Pairing](#pairing) describes them. Generic item reads of the `pair` facet return
-the full item envelope instead.
+### Installation
 
 Installation objects have their own complete schema under
-[Registered installations](#registered-installations).
+[Installations](#installations).
 
 ## Permissions by route
 
@@ -190,7 +184,7 @@ See [permission matching](permissions.md) for enclosure and wildcard rules.
 |---|---|---|
 | GET | `/v1/health` | None |
 | GET | `/v1/server` | `meta:server:read` |
-| GET | `/v1/permissions` | Valid token |
+| GET | `/v1/permissions` | Any caller with authority: an enrolled key or a valid token |
 | POST | `/v1/items` | `{facet}:create` |
 | GET | `/v1/items` | `{facet}:read` |
 | GET | `/v1/items/{id}` | `{facet}:read` |
@@ -202,28 +196,21 @@ See [permission matching](permissions.md) for enclosure and wildcard rules.
 | GET | `/v1/changes/stream` | Same feed authority |
 | POST | `/v1/tick` | `meta:system:tick` |
 | POST | `/v1/capabilities` | `meta:capabilities:mint`, plus grant/lifetime enclosure |
-| POST | `/v1/capabilities/refresh` | Valid token |
-| POST | `/v1/pairings` | `meta:pairing:create` |
-| GET | `/v1/pairings` | `meta:pairing:read` |
-| GET | `/v1/pairings/{id}` | `meta:pairing:read` |
-| POST | `/v1/pairings/{id}/approve` | `meta:pairing:approve`, plus requested/acting grant enclosure |
-| POST | `/v1/pairings/{id}/deny` | `meta:pairing:approve` |
-| POST | `/v1/pair/redeem` | Pairing capability naming one session |
-| GET | `/v1/pair/status` | Pairing capability and redeemer's installation proof after redemption |
+| POST | `/v1/capabilities/refresh` | A valid bearer token |
+| POST | `/v1/enroll` | A device of the mesh over Iroh, its own note, and the passphrase |
+| POST | `/v1/passphrase` | A device of the mesh over Iroh, and the current passphrase |
 | GET | `/v1/clients` | `meta:clients:read` |
 | GET | `/v1/clients/{id}` | `meta:clients:read` |
-| PUT | `/v1/clients/{id}` | `meta:clients:write`, plus requested/acting grant enclosure |
+| PUT | `/v1/clients/{id}` | `meta:clients:write`, plus approved/acting grant enclosure |
 | POST | `/v1/clients/{id}/revoke` | `meta:clients:revoke` |
-| POST | `/v1/clients/{id}/refresh` | Installation proof; no bearer needed |
-| GET | `/v1/plugins` | Valid token; filters operations by effective grants |
+| GET | `/v1/plugins` | Any caller with authority; filters operations by effective grants |
 | POST | `/v1/call` | The selected operation's concrete permission |
 
 For the core's facets, `facet` reads require `meta:facets:read`. Creating a new
 registration named `NAME` requires `NAME:create` or `meta:facets:write`; changing,
-reverting, or deleting a registration requires `meta:facets:write`.
-`pair` reads require `meta:pairing:read`; `system`
-reads require `meta:system:read`. Generic writes/reverts to `pair` and `system`
-are refused: use their dedicated routes. A client registry UUID is not an item ID.
+reverting, or deleting a registration requires `meta:facets:write`. `system`
+reads require `meta:system:read`, and generic writes to `system` are refused: the
+core writes its own events. A client registry UUID is not an item ID.
 
 ## Errors
 
@@ -237,18 +224,25 @@ Branch on the status and `error`; `detail` is human-readable and may change.
 
 | HTTP | `error` | Cause |
 |---|---|---|
-| 400 | `bad_request` | Invalid grants, unsupported lifetime, invalid challenge/client label, expired pairing, forbidden schema reference, or invalid snapshot |
-| 401 | `unauthorized` | Missing/invalid/expired token, wrong installation proof/transport, revoked/expired/missing registration, or pairing token without a session |
+| 400 | `bad_request` | Invalid grants, unsupported lifetime, invalid client label, short new passphrase, refresh without a bearer token, forbidden schema reference, or invalid snapshot |
+| 400 | `bad_note` | An enrollment's note does not read, does not count in the mesh, or does not approve an app to call `erisdb` |
+| 401 | `unauthorized` | Missing/invalid/expired token, an unenrolled key, or an installation that is revoked or no longer counts in the mesh |
 | 403 | `forbidden` | Missing permission or grants/lifetime outside the caller's authority |
-| 404 | `not_found` | Missing item, history, pairing, or administratively requested installation |
+| 403 | `not_a_device` | Enrollment or a passphrase change from anything but a device of the mesh calling as itself over Iroh, or a device presenting another device's note |
+| 403 | `wrong_passphrase` | The passphrase was wrong; counted against the calling device. `retry_after` (seconds) is present when this guess locked the device out |
+| 404 | `not_found` | Missing item, history, or administratively requested installation |
 | 404 | `plugin_not_found` | Unknown plugin or operation |
-| 409 | `revision_conflict` | Stale item/installation revision or stale pairing approval anchor |
-| 409 | `conflict` | Duplicate facet name or invalid pairing-state transition |
+| 409 | `revision_conflict` | Stale item or installation revision |
+| 409 | `conflict` | Duplicate facet name, or a change to a revoked installation |
 | 422 | `unknown_facet` | Write to an unregistered facet |
 | 422 | `schema_violation` | Item body violates the facet schema |
 | 422 | `plugin_schema_violation` | Plugin input violates its manifest schema |
-| 429 | `too_many_requests` | Shared mint/refresh/installation-renewal bucket exhausted |
+| 429 | `too_many_requests` | Shared mint/refresh bucket exhausted |
+| 429 | `locked` | The calling device is locked out by wrong passphrases; `retry_after` and a `Retry-After` header say for how long |
 | 503 | `unavailable` | Change-stream or plugin-process capacity reached |
+| 503 | `no_passphrase` | Enrollment or a passphrase change before the operator set a passphrase |
+| 503 | `not_joined` | Enrollment on a core running without a mesh |
+| 503 | `not_the_erisdb` | Enrollment or a passphrase change at a core whose own approval no longer counts: the mesh approved another ErisDB, or this one's device left |
 | 503 | `plugin_unavailable` | Required allowlisted plugin environment variable is absent |
 | 502 | `plugin_failed` | Plugin startup, header protocol, or timeout failure before headers are committed |
 | 500 | `internal` | Database/internal failure; details remain in operator logs |
@@ -256,15 +250,15 @@ Branch on the status and `error`; `detail` is human-readable and may change.
 Framework rejections can be plain text: malformed JSON (400), wrong/missing JSON
 content type (415), missing/wrongly typed JSON fields (422), invalid UUID/query
 (400), oversized body (413), unknown route (404), or unsupported method (405).
-Token extraction normally precedes handler body validation; installation renewal
-is the exception because it has no bearer extractor. Plugin responses can have
-their own body and status, including non-JSON errors.
+Authorization normally precedes handler body validation; the enrollment routes,
+which authorize the calling device, read their body first. Plugin responses can
+have their own body and status, including non-JSON errors.
 
 There is no general idempotency-key API. Retry reads as appropriate; do not
 blindly retry a write after a transport failure with an unknown outcome. An
-explicit core authorization 401 occurs before the mutation: a registered client
-may renew once and retry. Pairing collection is specially repeatable with the
-same proof while its ticket is live. Revocation is idempotent.
+explicit core authorization 401 occurs before the mutation. Enrollment is safe to
+repeat: the same note gives the same installation the same grants. Revocation is
+idempotent.
 
 ## Health and server state
 
@@ -347,7 +341,7 @@ printf '%s\n' "$ITEM_JSON"
 ```
 
 Missing registration yields 422 `unknown_facet`; schema mismatch yields 422
-`schema_violation`. Creating `pair` or `system` through this route is refused.
+`schema_violation`. Creating `system` items through this route is refused.
 
 ### `GET /v1/items`
 
@@ -409,8 +403,8 @@ revision yields **409**. Without `revision`, the current item is deleted.
 api DELETE "/v1/items/$ITEM_ID?revision=$ITEM_REV"
 ```
 
-Prior bodies remain in history. Generic deletion cannot remove pairing or
-system records, and it does not revoke an installation.
+Prior bodies remain in history. Generic deletion cannot remove system records,
+and it does not revoke an installation.
 
 ### `GET /v1/items/{id}/history`
 
@@ -484,11 +478,12 @@ It sends no SSE `id` or `retry` field and does not consume `Last-Event-ID`; reco
 with the last processed `seq` in `since`. Browser clients need a streaming fetch
 that can set the bearer header (native EventSource cannot set it).
 
-Expiry, loss of feed permission, revocation, or backend failure closes the stream;
-an already-started response cannot become a new HTTP error. Registered authority
-is rechecked before each event, and registry notifications wake idle streams across
-replicas. Reconnect after renewal if still authorized. Capacity exhaustion before
-stream creation yields **503**. Already delivered events are not retracted.
+Expiry, loss of feed permission, revocation, the mesh ending the app, or backend
+failure closes the stream; an already-started response cannot become a new HTTP
+error. An installation's authority is rechecked before each event and at least
+every second while idle, and registry notifications wake idle streams across
+replicas. Capacity exhaustion before stream creation yields **503**. Already
+delivered events are not retracted.
 
 ### `POST /v1/tick`
 
@@ -528,20 +523,23 @@ requested chain outside it is refused. Invalid input yields 400, failed enclosur
 403, and rate limiting 429. The bearer token is authenticated before the rate
 check; the mint permission is checked after it.
 
-Delegation from a registered token retains its installation ID, so current grants,
-identity binding and revocation still apply to the child. A child token alone
-cannot obtain the installation's independent renewal authority.
+An app calling by its key mints too, when its grants include
+`meta:capabilities:mint`: the child names its installation, so the
+installation's current grants, its revocation and the mesh's removal of its
+device or note still bound the child. An installation has no deadline of its
+own, so the child's chain is bounded only by `max_ttl_secs` and its default.
 
 Token format is `erisdb1.BASE64URL(JSON).BASE64URL(HMAC_SHA256)`, without base64
 padding. The signed payload contains `grants` and optional `exp`, `max_exp`,
-`user`, `pair` (pairing session), and `client` (installation UUID). Unix deadlines
-are seconds. Payloads are signed, not encrypted; decoding is not verification.
+`user`, and `client` (installation UUID). Unix deadlines are seconds. Payloads
+are signed, not encrypted; decoding is not verification.
 See [capability semantics](capabilities.md) for the signing format.
 
 ### `POST /v1/capabilities/refresh`
 
-Requires a still-valid bearer token, no extra grant. Body: required positive
-integer `ttl_secs`. **201**:
+Requires a still-valid bearer token, no extra grant; an app calling by its key
+carries none and is refused with 400. Body: required positive integer
+`ttl_secs`. **201**:
 
 ```json
 {"token":"erisdb1.…","exp":1790000300,"chain_ends":1790003600}
@@ -554,24 +552,21 @@ curl --fail-with-body --silent --show-error \
   --header 'Content-Type: application/json' --data '{"ttl_secs":300}'
 ```
 
-This is **bounded token refresh**, not independent installation renewal. The new
-expiry is clamped to the existing chain end; without `max_exp`, the old token's
-expiry is the ceiling. Effective grants, signed user and installation binding
-carry forward. An expired token is 401. Refreshing a non-expiring manual token
-produces a bounded token, not another non-expiring one. The endpoint shares the
-mint/renewal rate limit.
-
-Paired clients that have an installation proof should use
-[`POST /v1/clients/{id}/refresh`](#post-v1clientsidrefresh), including after expiry.
+This is **bounded token refresh**. The new expiry is clamped to the existing
+chain end; without `max_exp`, the old token's expiry is the ceiling. Effective
+grants, signed user and installation carry forward. An expired token is 401.
+Refreshing a non-expiring manual token produces a bounded token, not another
+non-expiring one. The endpoint shares the mint rate limit.
 
 ### `GET /v1/permissions`
 
-Requires a valid token, no additional grant. No parameters. **200**:
+Requires an enrolled key or a valid token, no additional grant. No parameters.
+**200**, for an app calling by its key:
 
 ```json
 {
   "grants":["notes:read","notes:create"],
-  "exp":1790000300,"max_exp":null,"user":null,
+  "exp":null,"max_exp":null,"user":null,
   "client_id":"ad6caf6b-ece2-442a-a178-a93cc5aa0802"
 }
 ```
@@ -580,287 +575,117 @@ Requires a valid token, no additional grant. No parameters. **200**:
 api GET /v1/permissions
 ```
 
-`exp`, `max_exp`, `user`, and `client_id` can be null. For registered callers,
-`grants` reflects live registry reductions and may be narrower than the signed
-token's payload. Use this result to render available actions. A revoked client
-gets 401 rather than a successful empty grant list.
+`exp`, `max_exp`, `user`, and `client_id` can be null; a key has no expiry. For a
+token delegated by an installation, `grants` reflects live registry reductions
+and may be narrower than the signed token's payload. Use this result to render
+available actions. A revoked app, or one whose device left the mesh, gets 401
+rather than a successful empty grant list.
 
-## Pairing
+## Enrollment
 
-A **ticket** locates a core and carries short-lived permission to request
-pairing. A **pairing session** records the request and human decision. An
-**installation** is the durable identity created or updated on collection.
-An **access token** temporarily authorizes use of that installation.
+Apps get into ErisDB through a device of its owner's mesh; [the mesh](mesh.md)
+describes the whole path. Both routes here are called by a **device**, over Iroh,
+from its own endpoint: the caller's key must be a member of the mesh as ErisDB's
+copy of the device list stands. Over TCP, or from any other key, they answer
+403 `not_a_device`. The device syncs with ErisDB before calling, so ErisDB's list
+knows it (`Node::connect` does so on its own). Both answer only while this core is
+the mesh's ErisDB: once the mesh approves another, revoking this one's note, they
+answer 503 `not_the_erisdb`.
 
-```mermaid
-stateDiagram-v2
-    [*] --> pending: create
-    pending --> requested: redeem with identity
-    requested --> approved: human approves requested scope
-    approved --> collected: same identity collects
-    pending --> denied: deny
-    requested --> denied: deny
-    approved --> denied: cancel before collection
-```
+Both carry the passphrase, and share its refusals: 403 `wrong_passphrase`,
+counted against the calling device, with `retry_after` when that guess locked it
+out; 429 `locked` with `retry_after` and `Retry-After` while it waits, checking
+nothing; and 503 `no_passphrase` before the operator set one. The first three
+wrong guesses in a row cost nothing; the third locks the device out for a minute,
+and each one after doubles the wait, up to a day. A right guess clears the
+device's count; one device's guesses never lock out another.
 
-The session's `expires` deadline applies to redemption, approval and collection.
-It does not expire the installation subsequently created. A collected session
-remains readable for audit; denial after collection is refused. Repeating
-collection with the same proof is permitted while the ticket remains live.
+### `POST /v1/enroll`
 
-### Ticket format
-
-QR, deep links and pasted tickets contain exactly the same URI:
-
-```text
-erisdb://pair/BASE64URL_WITHOUT_PADDING(JSON)
-```
-
-| JSON field | Required | Meaning |
-|---|---|---|
-| `v` | Yes | Integer `1`; other versions are refused |
-| `token` | Yes | Pairing capability returned as `secret` by session creation |
-| `eid` | At least one of `eid`/`url` | 64-character hexadecimal Iroh endpoint ID |
-| `url` | At least one of `eid`/`url` | HTTP client base URL; HTTPS remotely, HTTP localhost |
-| `name` | No | Untrusted display label for the core |
-
-Iroh clients need `eid`; HTTP clients need `url`. There is no mDNS or short-code broker API. The operator
-CLI creates both the URI and terminal QR, optionally a PNG:
-
-```bash
-erisdb pair --name my-core --client-url https://db.example.com \
-  --qr-output /tmp/erisdb-pair.png
-```
-
-### `POST /v1/pairings`
-
-Requires `meta:pairing:create`. Optional JSON body with integer `ttl_secs`;
-default 600 seconds, clamped to 60–3600. **201**:
-
-```json
-{"id":"ad6caf6b-ece2-442a-a178-a93cc5aa0802","secret":"erisdb1.…","expires":1790000600}
-```
-
-```bash
-PAIR_JSON=$(api POST /v1/pairings --data '{"ttl_secs":600}')
-PAIR_ID=$(jq -r '.id' <<<"$PAIR_JSON")
-PAIR_TOKEN=$(jq -r '.secret' <<<"$PAIR_JSON")
-```
-
-`secret` is returned at creation and is not stored in the pairing record. It
-names this one session and grants only `meta:pairing:redeem`; it cannot read or
-write application data. An ordinary `*` token without a signed session claim
-cannot replace it on the client pairing routes.
-
-### `POST /v1/pair/redeem`
-
-Send the pairing capability as bearer. Required JSON: `client: string`,
-`requested: string[]`; HTTP also requires `challenge: string`.
-
-| Field | Constraint |
-|---|---|
-| `client` | Nonblank, at most 128 bytes, no control characters; an untrusted display name |
-| `requested` | 1–64 valid grants; asking adds no authority |
-| `challenge` | HTTP: canonical unpadded base64url of a 32-byte SHA-256 digest; native Iroh derives identity from its authenticated peer and does not need this field |
-
-Generate a fresh **installation** secret on the client, once, and preserve it.
-The challenge is `base64url(SHA256(ASCII(secret)))`, where `secret` is the
-unpadded base64url encoding of 32 random bytes. Reuse that installation secret
-when re-pairing the same installation with the same core.
-
-```bash
-PROOF=$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')
-CHALLENGE=$(printf '%s' "$PROOF" | python3 -c \
-  'import sys,hashlib,base64; print(base64.urlsafe_b64encode(hashlib.sha256(sys.stdin.buffer.read()).digest()).decode().rstrip("="))')
-REDEEMED=$(curl --fail-with-body --silent --show-error \
-  --request POST "$BASE/v1/pair/redeem" \
-  --header "Authorization: Bearer $PAIR_TOKEN" \
-  --header 'Content-Type: application/json' \
-  --data "$(jq -nc --arg challenge "$CHALLENGE" \
-    '{client:"Notes browser",requested:["notes:read","notes:create"],challenge:$challenge}')")
-jq '{id,fingerprint:.body.fingerprint,requested:.body.requested}' <<<"$REDEEMED"
-```
-
-The operator token is not used in this client-side request. **200** returns the
-compact session, now `requested`, including the bound identity and fingerprint:
+Required JSON: `note`, the signed note a device of the mesh issued the app, and
+`passphrase`. Unknown fields are refused.
 
 ```json
 {
-  "id":"ad6caf6b-ece2-442a-a178-a93cc5aa0802","revision":2,
-  "created_at":"2026-09-21T12:00:00Z",
-  "body":{
-    "status":"requested","expires":1790000600,"client":"Notes browser",
-    "requested":["notes:read","notes:create"],
-    "identity":{"kind":"browser","key":"<S256 commitment>"},
-    "fingerprint":"12AB-34CD-56EF"
-  }
+  "note": {"by":"9c1e…","body":"eyJtZXNo…","sig":"Qm3t…"},
+  "passphrase":"correct horse battery staple"
 }
 ```
 
-Compare the fingerprint shown by the client with the operator's session before
-approving. It binds the session, installation identity and requested grants.
-The display name alone is not verification. **409** means the session was
-already redeemed or otherwise changed; **400** covers invalid input/session
-expiry, while an expired pairing bearer can be rejected earlier with **401**.
-
-### `GET /v1/pairings`
-
-Requires `meta:pairing:read`. No parameters. **200** `{"pairings":[SESSION,…]}`,
-newest first, at most 100 records. Includes completed, denied and expired records;
-expiry is represented by the deadline, not a separate `expired` state.
-
-```bash
-api GET /v1/pairings
-```
-
-### `GET /v1/pairings/{id}`
-
-Requires `meta:pairing:read`. **200** compact session; **404** if absent or not a
-`pair` item. The body contains no issued access token or raw installation secret.
-
-```bash
-api GET "/v1/pairings/$PAIR_ID"
-```
-
-State-dependent body fields are `status`, `expires`, `client`, `requested`,
-`identity`, `fingerprint`, and, after approval, `granted`, `access_ttl_secs`,
-`approval_anchor`, `exp`, optional `max_exp` and `user`. After collection,
-`client_id` identifies the actual registration; on re-pairing it may differ
-from the session ID. `approval_anchor` is null or `{id,revision}` and prevents
-stale approvals overwriting later registry changes.
-
-### `POST /v1/pairings/{id}/approve`
-
-Requires `meta:pairing:approve`. The operator compares fingerprints and chooses
-the requested permissions or a subset. Body is optional; `{}` approves all
-requested grants with the defaults below.
-
-| JSON field | Default | Constraint |
-|---|---|---|
-| `granted` | Session's `requested` | Nonempty valid grants enclosed by both the request and the acting operator's effective grants |
-| `ttl_secs` | 604800 (7 days) | Access lifetime, integer 1–604800 |
-| `max_ttl_secs` | No installation deadline | Optional installation lifetime, integer 1–31536000 |
-| `user` | No signed user label | At most 128 bytes; attribution only |
-
-```bash
-# Operator side: only after comparing the client's fingerprint.
-APPROVED=$(api POST "/v1/pairings/$PAIR_ID/approve" --data \
-  '{"granted":["notes:read","notes:create"],"ttl_secs":3600}')
-jq '.body | {status,granted,access_ttl_secs,fingerprint}' <<<"$APPROVED"
-```
-
-**200** compact session with `status: "approved"`. The operator receives no
-access token. Approval creates durable authority independent of the operator's
-own login-token expiry; it is not bounded delegation. `max_ttl_secs`, when set,
-runs from approval time. Access is issued at collection with its own expiry,
-bounded by that optional installation deadline.
-
-**403** for grants outside the request/operator; **409** unless the session is
-`requested` or if another write changed its revision; **400** for invalid fields
-or an expired session. There is no grant-everything override.
-
-### `GET /v1/pair/status`
-
-Client side: requires the session's bearer capability. After redemption, also
-requires the bound Iroh peer or `X-ErisDB-Client-Proof`. Polling while `pending`
-returns **200** `{"status":"pending"}` without an established identity proof.
-Once requested: **200** `{"status":"requested","fingerprint":"12AB-34CD-56EF"}`.
-A denied redeemed session returns `status: "denied"` and its fingerprint.
-
-```bash
-COLLECTED=$(curl --fail-with-body --silent --show-error \
-  "$BASE/v1/pair/status" \
-  --header "Authorization: Bearer $PAIR_TOKEN" \
-  --header "X-ErisDB-Client-Proof: $PROOF")
-printf '%s\n' "$COLLECTED"
-```
-
-After approval, **200**:
+ErisDB checks, in order: it is itself the mesh's ErisDB, its own note counting
+(503 `not_the_erisdb`); the caller is a device of the mesh (403
+`not_a_device`); the note reads and its signer is the caller (400 `bad_note`, 403
+`not_a_device`); the note counts in ErisDB's list — the same mesh, its device a
+member, not revoked — and approves an app for service `erisdb` that does not serve
+it (400 `bad_note`); the passphrase (above). None of the refusals before the
+passphrase costs the device a guess. Then it creates the installation for the
+note's app, or, when that app has an active one, gives it the note's device, id
+and grants. **200**:
 
 ```json
-{
-  "status":"approved","granted":["notes:read","notes:create"],
-  "token":"erisdb1.…","client_id":"ad6caf6b-ece2-442a-a178-a93cc5aa0802",
-  "exp":1790003600,"fingerprint":"12AB-34CD-56EF"
-}
+{"client":"ad6caf6b-ece2-442a-a178-a93cc5aa0802","grants":["notes:read","notes:create"]}
 ```
 
-```bash
-CLIENT_ID=$(jq -r '.client_id' <<<"$COLLECTED")
-ACCESS_TOKEN=$(jq -r '.token' <<<"$COLLECTED")
-```
+The app now calls by its key. Each enrollment appends an installation audit
+event, `created` or `updated`, whose source `addr` is the device. Enrolling the
+same note twice gives the same result. A revoked installation is never updated:
+enrolling its app again creates a new one.
 
-Despite being GET, this endpoint **collects approval and writes registration
-state**. Do not prefetch/cache it. Collection is one transaction; the stored
-session becomes `collected`, while the successful client-facing result remains
-`approved`. The same proof can collect again until ticket expiry if a response
-was lost; no token is persisted in the session/history.
+### `POST /v1/passphrase`
 
-A photographed QR without the redeemer's proof cannot collect (401). Changed
-registration state since approval causes 409 `revision_conflict`; obtain a fresh
-approval. A revoked/expired registration cannot collect again. If a pending
-session was denied before any identity was recorded, polling is unauthorized
-rather than returning an identity-bound denial.
+Required JSON: `current` and `new`, strings; unknown fields are refused. `new` is
+at least 8 characters, at most 1024 bytes (400 otherwise, checked before
+`current`, so a short one costs no guess). A wrong `current` counts against the
+device like any wrong guess. **204** with no body; the new passphrase applies to
+the next enrollment. The operator sets the first passphrase, and resets one, on
+the server with `erisdb passphrase set`.
 
-If initial submission failed, poll first: only `pending` confirms that the
-client may submit again. Do not blindly replay redemption after an ambiguous
-transport failure.
+## Installations
 
-### `POST /v1/pairings/{id}/deny`
-
-Requires `meta:pairing:approve`. No body. **200** compact session with
-`status: "denied"`, with granted permissions and approval deadlines removed.
-Pending, requested and approved-but-uncollected sessions can be denied, including
-after session expiry. Already denied sessions can be denied again.
-
-```bash
-# Alternative to approving a separate, still-uncollected request:
-api POST "/v1/pairings/$PAIR_ID/deny"
-```
-
-A collected session yields **409**; revoke its installation instead. Denying
-never revokes a credential already issued through collection.
-
-## Registered installations
-
-The registry is separate from items and is shared by all replicas. One active
-registration exists per installation proof. Re-pairing that proof updates its
-existing registration/permissions. Revoked registrations remain revoked; fresh
-human approval creates a new UUID so older tokens stay invalid.
+An installation is an app a device let in: its Iroh key, the device that
+approved it, and the note it approved it with. The registry is separate from
+items and is shared by all replicas. One active installation exists per app key.
+Enrolling that app again updates it; revoked installations remain revoked, and a
+fresh enrollment creates a new UUID.
 
 ### Installation object
 
 ```json
 {
   "id":"ad6caf6b-ece2-442a-a178-a93cc5aa0802",
-  "name":"Notes browser",
-  "identity":{"kind":"browser","key":"<S256 commitment>"},
-  "requested":["notes:read","notes:create"],
+  "name":"Notes",
+  "app":"5f2d…64 hex",
+  "device":"9c1e…64 hex",
+  "note":"e04b…64 hex",
+  "approved":["notes:read","notes:create"],
   "grants":["notes:read","notes:create"],
-  "user_name":null,"access_ttl_secs":3600,"expires":null,
   "revoked_at":null,"revision":1,"created_at":"2026-09-21T12:00:00Z"
 }
 ```
 
 | Field | Meaning |
 |---|---|
-| `id` | Registration UUID; not necessarily the latest pairing session UUID |
-| `name` | App's untrusted display name |
-| `identity` | `{kind:"iroh",key:ENDPOINT_ID}` or `{kind:"browser",key:S256_COMMITMENT}` |
-| `requested` | Grant ceiling from the latest successful enrollment |
-| `grants` | Current approved grant set |
-| `user_name` | Optional signed attribution label used in newly issued tokens |
-| `access_ttl_secs` | Default and maximum lifetime of each renewed access token |
-| `expires` | Optional absolute installation deadline, Unix seconds; null means renewal until revoked |
+| `id` | Installation UUID |
+| `name` | The app's name for itself, as the device approved it; trusted for nothing |
+| `app` | The app's Iroh endpoint id: its credential |
+| `device` | Endpoint id of the device that approved it |
+| `note` | Id of the note it was approved with |
+| `approved` | The note's grants: the most this installation can hold |
+| `grants` | What it holds now |
 | `revoked_at` | RFC 3339 timestamp or null; revocation is irreversible |
 | `revision` | Optimistic concurrency version, initially 1 |
 | `created_at` | RFC 3339 creation time |
 
+An installation lets its app in while it is not revoked, its device is a member
+of the mesh and its note is not revoked. When the mesh removes the device or
+revokes the note, the app is refused at once, and ErisDB sets `revoked_at` with
+an audit event.
+
 ### `GET /v1/clients`
 
 Requires `meta:clients:read`. No query parameters. **200** `{"clients":[INSTALLATION,…]}`.
-Returns all registrations, including revoked/expired ones, ordered by creation
-time then ID. There is currently no filter or pagination.
+Returns all installations, including revoked ones, ordered by creation time then
+ID. There is no filter or pagination.
 
 ```bash
 api GET /v1/clients
@@ -879,8 +704,8 @@ CLIENT_REV=$(jq -r '.revision' <<<"$CLIENT_JSON")
 
 Requires `meta:clients:write`. Body: required `grants: string[]` and
 `revision: integer`. Replaces the grant set; this route does not change the
-name, identity, requested ceiling, user label or lifetime. **200** Installation
-with its revision incremented.
+name, key, device, note or approved ceiling. **200** Installation with its
+revision incremented.
 
 ```bash
 CLIENT_JSON=$(api PUT "/v1/clients/$CLIENT_ID" --data \
@@ -889,40 +714,12 @@ CLIENT_JSON=$(api PUT "/v1/clients/$CLIENT_ID" --data \
 CLIENT_REV=$(jq -r '.revision' <<<"$CLIENT_JSON")
 ```
 
-Grants must fit both `requested` and the acting administrator's effective grants
+Grants must fit both `approved` and the acting administrator's effective grants
 (403 otherwise). Empty grants are invalid (400); use revocation to remove all
-access. Missing registration gives 404, inactive registration 401, stale revision
-409. Decreases affect existing tokens on their next authorization check;
-increases require a newly issued token before an older narrower token can use
-them. Registry writes append system audit events and notify subscribers.
-
-### `POST /v1/clients/{id}/refresh`
-
-Uses installation proof, **not a bearer token**. Required JSON body `{}` or
-`{"ttl_secs":300}`. The optional lifetime must be 1 through the registration's
-`access_ttl_secs`; it defaults to that maximum. The token expiry is also bounded
-by any installation deadline.
-
-```bash
-RENEWED=$(curl --fail-with-body --silent --show-error \
-  --request POST "$BASE/v1/clients/$CLIENT_ID/refresh" \
-  --header "X-ErisDB-Client-Proof: $PROOF" \
-  --header 'Content-Type: application/json' --data '{}')
-ACCESS_TOKEN=$(jq -r '.token' <<<"$RENEWED")
-```
-
-Native clients make the same request over their persistent Iroh identity and
-omit the HTTP proof header. **200**:
-
-```json
-{"token":"erisdb1.…","exp":1790003600,"grants":["notes:read"],"client_id":"ad6caf6b-ece2-442a-a178-a93cc5aa0802"}
-```
-
-Works after the previous access token expires and after signing-key rotation,
-provided the core address is reachable and the installation remains active.
-Missing, revoked or expired registrations and wrong proof all give **401**;
-invalid lifetime gives **400**; rate exhaustion gives **429**. A valid old bearer
-token without proof is insufficient. Store the new token for subsequent calls.
+access. Missing installation gives 404, a revoked one 409, stale revision 409.
+Changes apply to the app's next request, and to tokens it delegated on their next
+authorization check. Registry writes append system audit events and notify
+subscribers.
 
 ### `POST /v1/clients/{id}/revoke`
 
@@ -934,16 +731,17 @@ the same revoked record without another increment. Missing ID gives **404**.
 api POST "/v1/clients/$CLIENT_ID/revoke"
 ```
 
-Blocks subsequent access and renewal on every replica, including delegated
-tokens. Idle subscriptions wake and close; each event rechecks authority. It
-does not undo already delivered data, already-authorized transactions, or plugin
-calls already launched. The API has no un-revoke or registry-delete route.
+Blocks the app's subsequent requests on every replica, and its delegated tokens.
+Idle subscriptions wake and close; each event rechecks authority. It does not
+undo already delivered data, already-authorized transactions, or plugin calls
+already launched. The API has no un-revoke or registry-delete route; the app
+gets back in only by enrolling again through a device.
 
 ## Plugins
 
 ### `GET /v1/plugins`
 
-Requires a valid token, no additional grant. **200** `{"plugins":[…]}`. Each
+Requires an enrolled key or a valid token, no additional grant. **200** `{"plugins":[…]}`. Each
 plugin has `name`, `description`, and an `operations` array. Each operation has
 `name`, `description`, `permission`, and `request_schema` (JSON Schema).
 Only operations the caller's effective grants allow are visible; plugins with
@@ -1031,8 +829,8 @@ Stdin receives one JSON line then EOF:
 ```
 
 `context.user` is omitted when the caller has no signed user label.
-`context.installation` names the authenticated registered installation that
-called, and is omitted for manual tokens. For a manifest with `grants`,
+`context.installation` names the installation that called, by its key or by a
+token it delegated, and is omitted for manual tokens. For a manifest with `grants`,
 `context.erisdb` is `{"url": …, "token": …}`: the core's address and a
 capability holding exactly those grants, signed for user `plugin:<name>`,
 belonging to no installation, and expiring with the call's timeout, with no
@@ -1060,22 +858,23 @@ command history. Built-in `--help` lists parser details.
 
 | Command | Main arguments | Example |
 |---|---|---|
-| `erisdb serve` | `--database-url`/`DATABASE_URL`, `--secret`/`ERISDB_SECRET`; optional `--listen`/`ERISDB_LISTEN`, `--iroh-secret`/`ERISDB_IROH_SECRET`, `--no-iroh`, `--plugin-dir`/`ERISDB_PLUGIN_DIR` | `erisdb serve --listen 127.0.0.1:7700` |
+| `erisdb join` | `--database-url`/`DATABASE_URL`, signing/optional Iroh secret; optional `--name` (`ErisDB`); ErisAuth listening at `$XDG_RUNTIME_DIR/erisauth/agent.sock` | `erisdb join` |
+| `erisdb serve` | `--database-url`/`DATABASE_URL`, `--secret`/`ERISDB_SECRET`; optional `--listen`/`ERISDB_LISTEN`, `--iroh-secret`/`ERISDB_IROH_SECRET`, `--network`/`ERIS_NETWORK`, `--plugin-dir`/`ERISDB_PLUGIN_DIR`, `--lockout-secs`/`ERISDB_LOCKOUT_SECS` (60) | `erisdb serve --listen 127.0.0.1:7700` |
+| `erisdb passphrase set` | `--database-url`/`DATABASE_URL`; the passphrase typed twice at a terminal, or one line of standard input | `erisdb passphrase set` |
+| `erisdb passphrase unlock [DEVICE]` | `--database-url`/`DATABASE_URL`; a device's endpoint id, or none for every device | `erisdb passphrase unlock` |
 | `erisdb endpoint-id` | Same signing/optional Iroh secret environment | `erisdb endpoint-id` |
 | `erisdb mint` | Required repeatable/comma-separated `--grant`; `--ttl` or `--no-expiry`; optional `--max-ttl`, `--user`; signing secret | `erisdb mint --grant notes:read --ttl 3600` |
-| `erisdb pair` | `--url`/`ERISDB_URL`; optional `--name`, `--ttl` (600), `--token-ttl` (604800), `--qr-output`, `--client-url`, `--no-iroh`; signing/optional Iroh secret | `erisdb pair --name laptop --client-url https://db.example.com` |
 | `erisdb clients list` | Parent `--url`/`ERISDB_URL`, `--secret`/`ERISDB_SECRET` | `erisdb clients list` |
-| `erisdb clients show ID` | Registration UUID | `erisdb clients show "$CLIENT_ID"` |
+| `erisdb clients show ID` | Installation UUID | `erisdb clients show "$CLIENT_ID"` |
 | `erisdb clients permissions ID` | Required repeatable/comma-separated `--grant`; fetches current revision first | `erisdb clients permissions "$CLIENT_ID" --grant notes:read` |
-| `erisdb clients revoke ID` | Registration UUID | `erisdb clients revoke "$CLIENT_ID"` |
+| `erisdb clients revoke ID` | Installation UUID | `erisdb clients revoke "$CLIENT_ID"` |
 
-Put parent options before the clients subcommand, for example
-`erisdb clients --url http://127.0.0.1:7700 list`. Administration prints JSON.
+Put parent options before the subcommand, for example
+`erisdb clients --url http://127.0.0.1:7700 list` and
+`erisdb passphrase --database-url … set`. Administration prints JSON.
 `mint --no-expiry` is for manual/operator authority; it has no individually
-revocable registration. Pairing offers approve-requested, select-subset, or deny;
-blank or invalid menu input asks again. Invalid subset numbers also ask again.
-Only `d` or an empty subset selection denies the request;
-it never silently grants beyond the request.
+revocable installation. `join` waits while the person answers on the device;
+Ctrl-C withdraws the request. `serve` refuses to start before `join`.
 
 ## Limits
 
@@ -1086,20 +885,19 @@ it never silently grants beyond the request.
 | Item list | Default 100, clamp 1–1000; no cursor |
 | Change page | Default 500, clamp 1–5000 |
 | Item history | No API pagination |
-| Pairing list | Newest 100; no pagination |
 | Installation list | All rows; no pagination |
 | Live change streams | 32 per replica; excess 503; each holds a Postgres listener connection |
 | Plugin processes | 32 per replica; excess 503 |
 | Iroh connections / streams | 64 connections, 32 streams per connection; excess dropped |
 | Store pool | 16 connections per core replica |
-| Mint and renewal rate | Shared bucket for `/v1/capabilities`, `/v1/capabilities/refresh`, `/v1/clients/{id}/refresh`: burst 10, replenishes one token per five seconds |
-| Rate identity | Observed TCP **IP**, not source port; authenticated Iroh peer key for native clients; a local proxy's callers share its IP bucket |
+| Mint and refresh rate | Shared bucket for `/v1/capabilities` and `/v1/capabilities/refresh`: burst 10, replenishes one token per five seconds |
+| Rate identity | Observed TCP **IP**, not source port; authenticated Iroh peer key over Iroh; a local proxy's callers share its IP bucket |
 | Rate durability | Per replica, reset by restart; no `Retry-After` header |
+| Passphrase guesses | Per device, in Postgres: three free, then 1 minute doubling to a day; `Retry-After` on 429 |
+| Passphrase length | 8 characters to 1024 bytes |
 | Grant count / size | 1–64 grants, each at most 128 bytes |
 | User / client label | At most 128 bytes; client header additionally printable ASCII |
-| Pairing session lifetime | Default 600 seconds, clamped 60–3600 |
-| Paired access lifetime | Default and maximum 604800 seconds (7 days); an approval may choose a shorter renewal maximum |
-| Installation lifetime | No deadline by default; explicitly temporary registrations allow 1–31536000 seconds |
+| Installation lifetime | Until revoked, or until the mesh removes its device or revokes its note |
 | Manual/delegated HTTP mint chain | Resulting chain at most 31536000 seconds (365 days) |
 | Plugin timeout | Default 600 seconds, configured 1–3600 |
 | Plugin header / retained stderr | 16 KiB / 64 KiB |

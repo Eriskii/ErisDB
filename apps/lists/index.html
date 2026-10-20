@@ -4,18 +4,20 @@
 <meta charset="utf-8">
 <!--
   Content-Security-Policy, inline because this is a single file served
-  from anywhere — a file:// path, a static host, whatever.
+  from anywhere — a static host, whatever.
 
-  script-src 'sha256-Sxxu/DWt8DEIYmS/2h2LmaoYRgsBUa9T2UIAci7WMP8=' 'sha256-GifrQ3F15RTx5v+RFNx4bHkJFVsRK6sxNy9ge+Jtau4='; recompute
-  with:
+  script-src names the scripts this page runs and nothing else: ErisDB's
+  browser client (clients/web, built into ../shared/erisdb-web/) by the
+  hash its integrity attribute carries too, and the inline script below
+  by its own. 'wasm-unsafe-eval' lets the client compile its WebAssembly,
+  which the page fetches under an integrity of its own (WASM_INTEGRITY).
+  scripts/update-csp.py writes all three.
 
-    { printf '\n'; sed -n '/^<script>$/,/^<\/script>$/p' index.html \
-      | sed '1d;$d'; } | sha256sum | cut -d' ' -f1 | xxd -r -p | base64
-
-  connect-src stays wide open: the core's URL is whatever a pairing ticket
-  or the manual fields name, so there is no origin to pin at authoring
-  time. frame-ancestors is not honoured in a meta policy; serve this file
-  with X-Frame-Options if you care.
+  connect-src stays wide open: the client reaches the device and ErisDB
+  through whichever relay the ticket and the mesh name, over a WebSocket,
+  so there is no origin to pin at authoring time. frame-ancestors is not
+  honoured in a meta policy; serve this file with X-Frame-Options if you
+  care.
 
   The QR scanner needs no directive of its own. The camera preview is a
   MediaStream attached with `video.srcObject`, which is an object, not a
@@ -23,7 +25,7 @@
   BarcodeDetector reads the <video> element directly with no canvas and
   no blob: URL in between.
 -->
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'sha256-Sxxu/DWt8DEIYmS/2h2LmaoYRgsBUa9T2UIAci7WMP8=' 'sha256-GifrQ3F15RTx5v+RFNx4bHkJFVsRK6sxNy9ge+Jtau4='; style-src 'unsafe-inline'; connect-src *; base-uri 'none'; form-action 'none'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'wasm-unsafe-eval' 'sha256-eg7Wab0vd9XQsFfsaPMkzSzVxPeKNrwJk7vbEKyhuNc=' 'sha256-Vfq1PF3DPATFB0XIQXROOkC8viDzTX51wfRWOu9p8l0='; style-src 'unsafe-inline'; connect-src * ws: wss:; base-uri 'none'; form-action 'none'">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>ErisDB · lists</title>
 <style>
@@ -95,7 +97,7 @@
   details.settings .row-s { display: flex; flex-direction: column; gap: .5rem; margin-top: .7rem; }
   .empty { color: var(--muted); text-align: center; padding: 1.5rem 0; }
   #cfg-state { font-size: .8rem; color: var(--muted); }
-  /* pairing */
+  /* signing in */
   .stack { display: flex; flex-direction: column; gap: .5rem; margin-top: .5rem; }
   .pairhead { font-size: 1rem; margin: 0 0 .2rem; }
   #pair-intro code { font-family: ui-monospace, monospace; font-size: .9em; }
@@ -108,7 +110,7 @@
   #scan-note:empty, #pair-msg:empty { display: none; }
   #pair-msg.bad { color: var(--danger); }
   #pair-msg.good { color: var(--ok); }
-  details.manual summary { cursor: pointer; color: var(--muted); font-size: .82rem; }
+  #pair-fingerprint { font: 600 1.15rem/1.4 ui-monospace, monospace; letter-spacing: .06em; }
   /* waiting for a human to answer on the other device */
   #pair-wait { display: flex; flex-direction: column; gap: .5rem; }
   #pair-wait .pairhead { display: flex; align-items: baseline; gap: .5rem; }
@@ -127,12 +129,12 @@
   #perm-banner.blocked { border-color: var(--danger); color: var(--danger); }
   /* `hidden` has to beat the display rules above, so it is stated once here */
   [hidden] { display: none !important; }
-  /* Unpaired, the connection card is the only card: it is the screen. */
-  body.unpaired .app { display: none; }
-  body.unpaired details.settings > summary { display: none; }
-  body.unpaired #cfg-state,
-  body.unpaired #cfg-forget { display: none; }
-  body:not(.unpaired) #pair-intro { display: none; }
+  /* Signed out, the connection card is the only card: it is the screen. */
+  body.signed-out .app { display: none; }
+  body.signed-out details.settings > summary { display: none; }
+  body.signed-out #cfg-state,
+  body.signed-out #cfg-forget { display: none; }
+  body:not(.signed-out) #pair-intro { display: none; }
 </style>
 </head>
 <body>
@@ -158,16 +160,18 @@
       <summary>connection</summary>
       <div class="row-s">
         <div id="pair-intro">
-          <h2 class="pairhead">Pair with a core</h2>
-          <div class="hint">Run <code>erisdb pair</code> on the core and scan the QR code
-            it prints. The code grants nothing on its own — this app asks for the
-            permissions it needs and a person at the core answers.</div>
+          <h2 class="pairhead">Sign in through ErisAuth</h2>
+          <div class="hint">On a device in your mesh, choose <b>Add a browser app</b> in
+            ErisAuth (or run <code>erisauth add-app</code>) and scan or paste the ticket it
+            shows. The ticket grants nothing on its own: this app asks for what it needs, and
+            you approve it on that device with ErisDB's passphrase.</div>
         </div>
         <div id="cfg-state"></div>
 
         <div id="pair-wait" hidden>
           <div class="pairhead"><span class="spinner"></span><span id="pair-wait-who"></span></div>
           <div class="hint" id="pair-wait-what"></div>
+          <code id="pair-fingerprint" hidden></code>
           <ul class="wants" id="pair-wants"></ul>
           <button id="pair-cancel" type="button">Cancel</button>
         </div>
@@ -180,31 +184,21 @@
           </div>
           <div id="scan-note" class="hint"></div>
 
-          <label class="hint" for="cfg-ticket">Paste a pairing code</label>
-          <textarea id="cfg-ticket" rows="2" placeholder="erisdb://pair/…"
+          <label class="hint" for="cfg-ticket">Paste a ticket</label>
+          <textarea id="cfg-ticket" rows="2" placeholder="eris://pair/…"
                     autocomplete="off" spellcheck="false"></textarea>
-          <button id="cfg-pair" type="button">Pair</button>
-
-          <details class="manual" id="manual">
-            <summary>Enter details manually</summary>
-            <div class="stack">
-              <input id="cfg-url" placeholder="core url, e.g. http://127.0.0.1:7700">
-              <input id="cfg-token" placeholder="capability token (erisdb1.…)" type="password"
-                     autocomplete="off" spellcheck="false">
-              <button id="cfg-save" type="button">Connect</button>
-            </div>
-          </details>
+          <button id="cfg-pair" type="button">Sign in</button>
         </div>
 
         <div id="pair-msg"></div>
 
-        <button id="cfg-forget" type="button" class="danger">Disconnect &amp; forget token</button>
+        <button id="cfg-forget" type="button" class="danger">Sign out &amp; forget this app's key</button>
       </div>
     </details>
   </div>
 </main>
 
-<script src="../shared/auth.js" integrity="sha256-Sxxu/DWt8DEIYmS/2h2LmaoYRgsBUa9T2UIAci7WMP8="></script>
+<script src="../shared/erisdb-web/erisdb_web.js" integrity="sha256-eg7Wab0vd9XQsFfsaPMkzSzVxPeKNrwJk7vbEKyhuNc="></script>
 <script>
 "use strict";
 // The facet name is the permission namespace, so it carries no version:
@@ -212,12 +206,13 @@
 // schema version lives in the registration body instead.
 const FACET = "lists";
 const FACET_VERSION = 1;
-const CLIENT = "Lists (Web) v0.2"; // stamped into every write's source
+const APP_NAME = "Lists (Web)"; // what the person reads on the device asked to approve it
+const CLIENT = "Lists (Web) v0.3"; // stamped into every write's source
 
 // ---------------------------------------------------------------- manifest
-// What this app asks a human for when it pairs. Asking is free — the
-// operator answers, and may answer with less — so the manifest is a wish
-// and `grants` below is the truth.
+// What this app asks the person for when it signs in. Asking is free — the
+// person answers on their device, and may answer with less — so the
+// manifest is a wish and `grants` below is the truth.
 //
 // The four facet grants are what the app is for, and they are four rather
 // than "write" because the useful answers live in between: create and
@@ -234,7 +229,7 @@ const WANTED = [
 ];
 
 // What each request means, for the waiting screen — the same sentences the
-// facet registration hands the operator's approval prompt.
+// facet registration carries for its permissions.
 const WANT_SAYS = {
   [`${FACET}:read`]: "read your lists",
   [`${FACET}:create`]: "add entries",
@@ -243,7 +238,9 @@ const WANT_SAYS = {
 };
 
 const LS = {
+  key: "erisdb.lists.key",
   config: "erisdb.lists.config",
+  pending: "erisdb.lists.pending-sign-in",
   items: "erisdb.lists.items",
   cursor: "erisdb.lists.cursor",
   selected: "erisdb.lists.selected",
@@ -279,7 +276,7 @@ function save(k, v) {
 
 function forget(k) { try { localStorage.removeItem(k); } catch {} }
 
-let config = load(LS.config, null);      // {url, token, name, ttl, grants}
+let config = load(LS.config, null);      // {note, snapshot, device, grants}: the approval
 let items = load(LS.items, {});          // id -> item, the server's snapshot
 let cursor = load(LS.cursor, null);      // change-feed seq, client-held
 let selected = load(LS.selected, null);  // list name filter, null = all
@@ -290,59 +287,82 @@ if (!Array.isArray(outbox)) outbox = [];
 if (items === null || typeof items !== "object") items = {};
 if (typeof selected !== "string") selected = null;
 
-// ---------------------------------------------------------------- core client
+// ---------------------------------------------------------------- ErisDB client
+// ErisDB's browser client is WebAssembly (clients/web). It holds this app's
+// key, signs in by ticket, and speaks to ErisDB over Iroh through a relay:
+// one HTTP/1.1 exchange per QUIC stream, carrying no token, since ErisDB
+// knows the app by the key the handshake proves. The glue script above
+// defines `ErisDBWeb`; the module itself is fetched under the integrity
+// below and compiled once.
+const WASM = "../shared/erisdb-web/erisdb_web_bg.wasm";
+const WASM_INTEGRITY = "sha256-PA1r6BZMq4ik/FB6WLe41qP53gU51deew+c0oBAJB4k=";
 
-async function api(method, path, body, retry = true) {
-  if (!config) throw new Error("not connected");
-  const session = config;
-  const res = await fetch(ErisDBAuth.baseURL(session.url) + path, {
-    redirect: "error", cache: "no-store",
-    method,
-    headers: {
-      "Authorization": "Bearer " + session.token,
-      "X-ErisDB-Client": CLIENT,
-      ...(body !== undefined ? { "Content-Type": "application/json" } : {}),
-    },
-    body: body !== undefined ? JSON.stringify(body) : undefined,
-  });
-  if (res.status === 401 && retry && config === session && session.refreshSecret) {
-    await refreshToken(true);
-    if (config?.url === session.url && config.refreshSecret === session.refreshSecret && config.token !== session.token) {
-      return api(method, path, body, false); // 401 precedes every server-side effect.
-    }
-  }
-  if (res.status === 204) return { status: 204, body: null };
-  let json = null;
-  try { json = await res.json(); } catch {}
-  return { status: res.status, body: json };
+let webLoading = null;
+function erisdbWeb() {
+  webLoading ??= ErisDBWeb({ module_or_path: fetch(WASM, { integrity: WASM_INTEGRITY }) })
+    .then(() => ErisDBWeb, error => { webLoading = null; throw error; });
+  return webLoading;
 }
 
-// ---------------------------------------------------------------- capability
-// A token is `erisdb1.<b64url(payload)>.<b64url(sig)>` and the payload is JSON
-// carrying an optional `exp` in unix seconds. The client reads exp to know
-// when to refresh; the signature is the core's business, and the token
-// goes nowhere but the API. It is never written back into the DOM: the
-// settings panel shows a configured state, not the secret.
+// ---------------------------------------------------------------- the app's key
+// The app is its key: 32 bytes made here once and kept in localStorage. Its
+// public half is the endpoint id a device approves and ErisDB knows the app
+// by, and it is the only credential there is. Signing out forgets it.
 
-function tokenExp(token) {
-  try {
-    const b64 = token.split(".")[1].replace(/-/g, "+").replace(/_/g, "/");
-    const exp = JSON.parse(atob(b64)).exp;
-    return typeof exp === "number" ? exp : null;   // null: never expires
-  } catch { return null; }
+const b64 = bytes => btoa(String.fromCharCode(...bytes))
+  .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+
+function appKey() {
+  const saved = load(LS.key, null);
+  if (typeof saved !== "string" || !/^[A-Za-z0-9_-]{43}$/.test(saved)) return null;
+  return Uint8Array.from(atob(saved.replace(/-/g, "+").replace(/_/g, "/") + "="), c => c.charCodeAt(0));
+}
+
+/** The app's key, made now if this browser holds none. */
+async function ensureKey() {
+  const held = appKey();
+  if (held) return held;
+  const key = (await erisdbWeb()).generateKey();
+  if (!save(LS.key, b64(key))) {
+    throw new Error("This browser will not keep the app's key. Enable local storage and try again.");
+  }
+  return key;
+}
+
+// One connection to ErisDB per approval, made when the first request needs it.
+let connecting = null;
+function erisdb() {
+  if (!config) return Promise.reject(new Error("not signed in"));
+  connecting ??= erisdbWeb()
+    .then(web => web.connect(appKey(), config.snapshot, CLIENT))
+    .catch(error => { connecting = null; throw error; });
+  return connecting;
+}
+
+function hangUp() {
+  const was = connecting;
+  connecting = null;
+  was?.then(client => client.close(), () => {});
+}
+
+/** One API call: `{status, body}`. Throws when ErisDB could not be asked. */
+async function api(method, path, body) {
+  if (!config) throw new Error("not signed in");
+  return (await erisdb()).request(method, path, body);
 }
 
 // ---------------------------------------------------------------- grants
-// What this token may actually do, as GET /v1/permissions reports it. The
-// operator may approve less than the manifest asked for, so every control
-// on the screen is drawn from this rather than from WANTED.
+// What this app may actually do, as GET /v1/permissions reports it. The
+// person may approve less than the manifest asked for, and ErisDB's
+// operator may narrow it further, so every control on the screen is drawn
+// from this rather than from WANTED.
 //
-// `null` means "not asked yet". A token adopted from storage is still a
-// valid token, so the app stays fully usable and learns the truth on its
-// first sync; graying the screen out on boot and un-graying it a moment
-// later would be a worse lie than being briefly optimistic. A refused write
-// is caught safely either way: 403 is permanent, so the op leaves the
-// outbox with its reason instead of jamming the queue.
+// `null` means "not asked yet". An approval adopted from storage still
+// stands, so the app stays fully usable and learns the truth on its first
+// sync; graying the screen out on boot and un-graying it a moment later
+// would be a worse lie than being briefly optimistic. A refused write is
+// caught safely either way: 403 is permanent, so the op leaves the outbox
+// with its reason instead of jamming the queue.
 let grants = config?.grants ?? null;
 
 // Set when a write comes back 403: the grants on file are behind whatever
@@ -375,12 +395,12 @@ function can(action) {
   return grants.some(g => covers(g, permission));
 }
 
-/** Ask the core what this token holds. Needs no permission of its own — a
+/** Ask ErisDB what this app holds. Needs no permission of its own — a
  * caller may always ask what it already has — and it is the only authority
- * on the answer, since an operator may have approved a subset. */
+ * on the answer, since the person may have approved a subset. */
 async function loadPermissions() {
   const r = await api("GET", "/v1/permissions");
-  if (r.status === 401) { expired(); return false; }
+  if (r.status === 401) { cutOff(); return false; }
   if (r.status !== 200 || !Array.isArray(r.body?.grants)) throw new Error("permissions " + r.status);
   grants = r.body.grants;
   config = { ...config, grants };
@@ -389,188 +409,172 @@ async function loadPermissions() {
   return true;
 }
 
-// Trade a still-valid token for one with the same scope and the same
-// lifetime the admin chose. Past the half-life, sync() calls this; one
-// refresh is in flight at a time and a failure simply waits for the next
-// sync. The open stream keeps its old, still-valid token and picks the
-// fresh one up when it reconnects.
-let refreshing = null;
-function refreshToken(force = false) {
-  if (refreshing) return refreshing;
-  if (!config?.ttl && !config?.refreshSecret) return Promise.resolve();
-  const exp = tokenExp(config.token);
-  if (!force && (exp === null || exp - Date.now() / 1000 >= config.ttl / 2)) return Promise.resolve();
-  const session = config;
-  refreshing = (async () => {
-    try {
-      const r = await ErisDBAuth.renew(session);
-      if (config?.url !== session.url || config.token !== session.token || config.refreshSecret !== session.refreshSecret) return;
-      if (r.status === 200 || r.status === 201) {
-        config = { ...config, token: r.body.token, grants: r.body.grants ?? config.grants };
-        grants = config.grants;
-        renderPermissions();
-        save(LS.config, config);
-        renderConfigState();
-      } else if (r.status === 401) {
-        expired();
-      }
-    } catch {} // Offline credentials remain available for the next sync.
-  })().finally(() => { refreshing = null; });
-  return refreshing;
-}
-
-// Registered renewal can recover expired access. A refused installation
-// must pair again; manual tokens still have a bounded refresh chain.
-function expired() {
-  setStatus(config?.refreshSecret ? "access revoked · pair again" : "token expired · pair again");
+// A 401 is ErisDB saying it no longer lets this app in: a device revoked
+// its approval, or the device that gave it left the mesh. Nothing on this
+// side mends that; the person signs the app in again, with the same key,
+// and queued writes wait for it.
+function cutOff() {
+  setStatus("ErisDB no longer lets this app in · sign in again");
+  pairMsg("ErisDB refused this app: its approval was revoked, or the device that gave it " +
+    "left the mesh. Sign in again with a new ticket from ErisAuth.", "bad");
   $("#settings").open = true;
 }
 
-// Drop the capability and everything derived from it. The queued writes
-// go too — they are addressed to a core this browser no longer holds a
-// token for.
-function disconnect() {
+// Forget the key, the approval and everything derived from them. The
+// queued writes go too: without the key nothing can send them.
+function signOut() {
+  const key = appKey();
+  cancelSignIn();
+  streamFeed?.close();
+  hangUp();
   config = null;
   grants = null; permsStale = false; facetMissing = false;
   items = {}; cursor = null; selected = null; outbox = []; editing = null; lastDrop = null;
   for (const k of Object.values(LS)) forget(k);
-  streamAbort?.abort();
+  if (key) erisdbWeb().then(web => web.closeEndpoint(key)).catch(() => {});
   stopScan();
-  cancelPairing();
-  $("#cfg-url").value = "";
-  $("#cfg-token").value = "";
   $("#cfg-ticket").value = "";
   pairMsg("");
   renderPairState();
   renderConfigState();
   renderPermissions();
   render();
-  setStatus("disconnected");
+  setStatus("signed out");
 }
 
-// ---------------------------------------------------------------- pairing
-// A ticket is `erisdb://pair/<base64url-nopad(JSON)>` naming where the core
-// is and carrying a pairing CODE. The format is docs/pairing.md, and it is
-// base64url of JSON precisely so that a browser reads one with atob and
-// JSON.parse and nothing else.
+// ---------------------------------------------------------------- signing in
+// A ticket is `eris://pair/…`, shown by ErisAuth's "Add a browser app" on a
+// device in the person's mesh: the device, the relay that reaches it, and a
+// one-time code. The code is worth a request and nothing more:
 //
-// The code is not a capability over any data: it holds exactly
-// `meta:pairing:redeem`, names one session, and expires in minutes.
-// Pairing is two phases with a human in between:
+//   redeem   the app says, as its own key, what it asks for: a note for
+//            ErisDB carrying WANTED
+//   compare  both screens show the request's fingerprint, each computing it
+//            for itself
+//   approve  on the device, with ErisDB's passphrase; the device enrolls the
+//            app at ErisDB before it answers
+//   collect  the app takes its note and a snapshot of the mesh, which says
+//            where ErisDB is
 //
-//   redeem   POST /v1/pair/redeem — the app says who it is and what it wants
-//   wait     GET  /v1/pair/status — until a person approves, narrows, or denies
-//   collect  the same poll returns the token, ONCE
-//
-// So a photographed QR code is worth nothing on its own. It gets whoever
-// took it as far as raising a prompt on the operator's screen, naming an
-// app they did not install and asking for permissions they can refuse.
+// Only the key that redeemed a code can collect its answer, so a
+// photographed ticket gets whoever took it as far as a prompt on the
+// person's device, naming an app they did not open and asking for
+// permissions they can refuse.
 
-const PAIR_PREFIX = "erisdb://pair/";
+const PAIR_PREFIX = "eris://pair/";
 
-// These apps speak HTTP over fetch(). A ticket carrying only an endpoint
-// id names a core reachable over iroh, and no browser can dial one.
-const EID_ONLY =
-  "This core is reachable over iroh only — the code carries an endpoint id and no url, " +
-  "and a browser cannot dial iroh. Pair the Android app with this code, or serve the " +
-  "core over http and run erisdb pair again for a ticket with a url in it.";
+// A sign-in in flight: `live` until it ends or the person cancels it, and
+// the client's handle on the request once the device holds it.
+let joining = null;
 
-/** Unpadded base64url to text, strictly: anything that is not clean
- * base64url of valid UTF-8 throws rather than decoding to mojibake. */
-function decodeB64url(s) {
-  if (!/^[A-Za-z0-9_-]+$/.test(s)) throw new Error("not base64url");
-  const b64 = s.replace(/-/g, "+").replace(/_/g, "/");
-  const bin = atob(b64 + "=".repeat((4 - b64.length % 4) % 4));
-  const bytes = Uint8Array.from(bin, c => c.charCodeAt(0));
-  return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+/** A scanned or pasted ticket, all the way to a signed-in app. */
+async function signIn(text) {
+  let web, ticket;
+  try { web = await erisdbWeb(); }
+  catch { pairMsg("ErisDB's client did not load. Reload the page and try again.", "bad"); return; }
+  try { ticket = web.readTicket(String(text ?? "")); }
+  catch (e) { pairMsg(ticketError(e), "bad"); return; }
+  cancelSignIn();
+  $("#cfg-ticket").value = "";
+  const who = ticket.name ?? "your device";
+  const mine = joining = { live: true, handle: null };
+  showWaiting(who, `asking ${who}…`, "");
+  let handle;
+  try { handle = await web.signIn(await ensureKey(), text, APP_NAME, WANTED); }
+  catch (e) {
+    if (mine.live) failSignIn(signInError(e, who));
+    return;
+  }
+  if (!mine.live) { handle.withdraw().catch(() => {}); return; }   // cancelled while it was out
+  mine.handle = handle;
+  save(LS.pending, handle.saved);
+  awaitAnswer(mine);
+}
+
+/** A sign-in an earlier page started under the same key: wait for the
+ * same answer. */
+async function resumeSignIn(saved) {
+  const who = saved.host ?? "your device";
+  const mine = joining = { live: true, handle: null };
+  $("#settings").open = true;
+  showWaiting(who, "resuming sign-in…", "");
+  let handle;
+  try { handle = await (await erisdbWeb()).resumeSignIn(appKey(), saved); }
+  catch (e) {
+    if (mine.live) failSignIn(signInError(e, who));
+    return;
+  }
+  if (!mine.live) return;
+  mine.handle = handle;
+  awaitAnswer(mine);
+}
+
+/** Wait for the person. The fingerprint is this page's own: a device that
+ * shows another one is looking at someone else's request. */
+async function awaitAnswer(mine) {
+  const { handle } = mine;
+  showWaiting(handle.host,
+    `Check that ErisAuth on ${handle.host} shows this same code, then approve there ` +
+    "with ErisDB's passphrase.", handle.fingerprint);
+  let approval;
+  try { approval = await handle.approval(); }
+  catch (e) {
+    if (mine.live) failSignIn(signInError(e, handle.host));
+    return;
+  }
+  if (!mine.live) return;
+  endSignIn();
+  if (!approval) {
+    failSignIn(`ErisAuth on ${handle.host} said no, so this app was given nothing. ` +
+      "Open a new ticket there to ask again.");
+    return;
+  }
+  await adopt(approval, handle.host);
+  pairMsg("signed in through " + handle.host, "good");
+  setStatus("signed in through " + handle.host);
+  $("#settings").open = false;   // signing in is done: land in the app
+}
+
+/** Why a ticket will not do, in words a person can act on. */
+function ticketError(e) {
+  if (e?.code === "no_relay") {
+    return "This ticket names no relay, and a browser reaches a device only through one. " +
+      "Open a new ticket in ErisAuth on a device that is online.";
+  }
+  return `This ticket is damaged or is not one from ErisAuth (${e?.message ?? e}). ` +
+    `A ticket starts with ${PAIR_PREFIX}; paste it again, or open a new one in ErisAuth.`;
+}
+
+/** Why a sign-in ended without an answer. */
+function signInError(e, who) {
+  switch (e?.code) {
+    case "unreachable":
+      return `Could not reach ${who} through its relay. Check that ErisAuth is running ` +
+        "there and that this device is online, then try again.";
+    case "used":
+      return "That ticket has been used already: each one lets in one app, once. " +
+        "Open a new one in ErisAuth.";
+    case "expired":
+      return "That ticket ran out before anyone answered. Open a new one in ErisAuth.";
+    default:
+      return `${who} would not take this sign-in: ${e?.message ?? e}`;
+  }
 }
 
 /**
- * Parse and validate a pairing ticket, returning `{name, eid, url, code}`
- * with `name` and `eid` null when the ticket omits them. `code` is the
- * ticket's `token` field under the name that says what it is: a redeem
- * secret for one session, not a capability over anything.
- *
- * Every rejection throws with a message naming what is wrong. Nothing
- * here is guessed or repaired: refusing loudly beats storing half a
- * config, and a scanner that silently stores rubbish looks like a scanner
- * that does not work.
+ * Take the approval: keep it, learn what it holds, register the schema if
+ * that was allowed, start syncing. Signing in again keeps the cache and
+ * the queued writes, since the key, and so the app, is the same.
  */
-function parseTicket(str) {
-  const s = String(str ?? "").trim();
-  if (!s.startsWith(PAIR_PREFIX)) {
-    throw new Error("not a pairing code — it has to start with " + PAIR_PREFIX);
-  }
-  const payload = s.slice(PAIR_PREFIX.length);
-  if (!payload) throw new Error("pairing code carries no payload after " + PAIR_PREFIX);
-  let text;
-  try { text = decodeB64url(payload); }
-  catch { throw new Error("pairing code is damaged — the payload is not valid base64url"); }
-  let t;
-  try { t = JSON.parse(text); }
-  catch { throw new Error("pairing code is damaged — the payload is not JSON"); }
-  if (t === null || typeof t !== "object" || Array.isArray(t)) {
-    throw new Error("pairing code is damaged — the payload is not a ticket object");
-  }
-  if (t.v !== 1) {
-    throw new Error("pairing code is version " + JSON.stringify(t.v) +
-      " and this app speaks version 1 — update the app, or cut a v1 ticket");
-  }
-  if (typeof t.token !== "string" || !t.token) {
-    throw new Error("pairing code carries no secret to redeem");
-  }
-  const hasEid = t.eid !== undefined && t.eid !== null;
-  const hasUrl = t.url !== undefined && t.url !== null;
-  if (!hasEid && !hasUrl) {
-    throw new Error("pairing code names neither a url nor an endpoint id");
-  }
-  if (hasEid && !(typeof t.eid === "string" && /^[0-9a-f]{64}$/.test(t.eid))) {
-    throw new Error("pairing code's endpoint id is not 64 lowercase hex characters");
-  }
-  let url = null;
-  if (hasUrl) {
-    // The url is dialled with fetch() from this origin, so the scheme is
-    // decided by the URL parser — parseUrl is the one in the links
-    // section — and only http(s) is dialled at all.
-    const u = typeof t.url === "string" ? parseUrl(t.url) : null;
-    if (!u || (u.protocol !== "http:" && u.protocol !== "https:")) {
-      throw new Error("pairing code's url is not an http or https url");
-    }
-    url = ErisDBAuth.baseURL(t.url);
-  }
-  return {
-    name: typeof t.name === "string" && t.name.trim() ? t.name.trim() : null,
-    eid: hasEid ? t.eid : null,
-    url,
-    code: t.token,
-  };
-}
-
-/**
- * Adopt a capability: store it, learn what it holds, register the facet if
- * that was allowed, start syncing. Every path that ends in a url and a
- * token comes through here.
- *
- * The token is written to storage before the first `await`, because the
- * installation proof can recover a lost collection response while the
- * pairing ticket remains live.
- */
-async function connect(url, token, name, granted, refreshSecret = null) {
-  url = ErisDBAuth.baseURL(url);
-  const sameInstallation = config?.url === url && refreshSecret && config.refreshSecret === refreshSecret;
-  // The token's remaining life is the lifetime to keep renewing at; a
-  // token without an exp never expires, so it never refreshes.
-  const exp = tokenExp(token);
-  config = {
-    url, token, name: name ?? null, refreshSecret,
-    grants: Array.isArray(granted) ? granted : null,
-    ttl: exp === null ? null : Math.max(1, Math.round(exp - Date.now() / 1000)),
-  };
+async function adopt({ note, snapshot }, device) {
+  const again = config !== null;
+  config = { note, snapshot, device, grants: null };
   save(LS.config, config);
-  grants = config.grants;
+  hangUp();
+  grants = null;
   permsStale = false; facetMissing = false;
-  if (!sameInstallation) {
-    items = {}; cursor = null; outbox = []; editing = null; lastDrop = null;
+  if (!again) {
+    items = {}; outbox = []; editing = null; lastDrop = null;
   }
   cursor = null; // Re-fetch the newly approved scope without losing queued work.
   persist(); saveOutbox();
@@ -578,160 +582,42 @@ async function connect(url, token, name, granted, refreshSecret = null) {
   renderConfigState();
   renderPermissions();
   render();
-  // An approval carries what was granted, but the token itself is the
-  // authority on it, so the UI settles on the core's answer.
+  // The approval says what was granted, but ErisDB is the authority on it,
+  // so the UI settles on its answer.
   try { await loadPermissions(); } catch {}
   try { await ensureFacet(); } catch {}
-  streamAbort?.abort();   // the loop reconnects against the new config
+  streamFeed?.close();   // the loop reconnects against the new approval
   streamLoop();
 }
 
-// A pairing conversation in flight: the code, the core it came from, and a
-// `live` flag the cancel button clears so an in-flight poll stands down.
-const PENDING_PAIR = "erisdb.lists.pending-pair";
-let pairing = null;
-
-/** One request carrying the pairing code. This is the entire conversation
- * an app has before it holds a capability of its own, so it speaks to two
- * endpoints and no others. */
-async function codeFetch(base, code, method, path, body, proof) {
-  const res = await fetch(ErisDBAuth.baseURL(base) + path, {
-    redirect: "error", cache: "no-store",
-    method,
-    headers: {
-      "Authorization": "Bearer " + code,
-      ...(proof ? { "X-ErisDB-Client-Proof": proof } : {}),
-      "X-ErisDB-Client": CLIENT,
-      ...(body !== undefined ? { "Content-Type": "application/json" } : {}),
-    },
-    body: body !== undefined ? JSON.stringify(body) : undefined,
-  });
-  let json = null;
-  try { json = await res.json(); } catch {}
-  return { status: res.status, body: json };
+/** The person stops waiting: the device forgets the request. */
+function cancelSignIn() {
+  joining?.handle?.withdraw().catch(() => {});
+  endSignIn();
 }
 
-/** A scanned or pasted ticket, all the way to a paired app: redeem the
- * code, wait for a person, collect the token. */
-async function pairWith(str) {
-  let t;
-  try { t = parseTicket(str); }
-  catch (e) { pairMsg(e.message, "bad"); return; }
-  if (!t.url) { pairMsg(EID_ONLY, "bad"); return; }
-  cancelPairing();
-  $("#cfg-ticket").value = "";
-  $("#cfg-url").value = t.url;
-  const who = t.name ?? t.url;
-  let identity;
-  try { identity = await ErisDBAuth.identity(config?.url === t.url ? config.refreshSecret : null); }
-  catch (error) { pairMsg(error.message, "bad"); return; }
-  pairing = { code: t.code, url: t.url, name: t.name, proof: identity.secret, challenge: identity.challenge, live: true };
-  const mine = pairing;
-  if (!save(PENDING_PAIR, mine)) { failPairing("Cannot save the pairing identity. Enable local storage and try again."); return; }
-  showWaiting(who, `asking ${who} for permission…`);
-
-  let r;
-  try {
-    r = await codeFetch(t.url, t.code, "POST", "/v1/pair/redeem",
-      { client: CLIENT, requested: WANTED, challenge: identity.challenge });
-  } catch {
-    if (mine.live) {
-      failPairing("Could not reach the core at " + t.url + ". Check it is running and " +
-        "that this device can reach that address, then pair again.");
-    }
-    return;
-  }
-  if (!mine.live) return;                 // cancelled while the request was out
-  if (r.status !== 200) { failPairing(redeemError(r)); return; }
-  showWaiting(who, `Compare ${r.body.body.fingerprint} with the terminal before approving on ${who}.`);
-  pollPairing(who, mine);
-}
-
-/** Why a redeem was refused, in words a person can act on. */
-function redeemError(r) {
-  if (r.status === 400) {
-    return "That pairing code has expired — a code is good for about ten minutes. " +
-      "Run erisdb pair on the core again for a fresh one.";
-  }
-  if (r.status === 401) {
-    return "This core will not accept that pairing code. Run erisdb pair on the core " +
-      "you mean to pair with, and use the code it prints.";
-  }
-  if (r.status === 409) {
-    return "That pairing code has already been used — each one pairs one app, once. " +
-      "Run erisdb pair on the core again for a fresh one.";
-  }
-  return "The core refused the pairing request: " + detail(r);
-}
-
-/**
- * Wait for the human. `requested` is the wait itself; `approved` hands the
- * token to the proven installation. Store it before proceeding; `denied`
- * is a plain answer rather than a transport error.
- */
-async function pollPairing(who, mine) {
-  while (mine.live) {
-    let r;
-    try { r = await codeFetch(mine.url, mine.code, "GET", "/v1/pair/status", undefined, mine.proof); }
-    catch { await sleep(2000); continue; }   // the core blinked; keep waiting
-    if (!mine.live) return;
-    if (r.status === 200) {
-      if (r.body?.status === "requested") showWaiting(who, `Compare ${r.body.fingerprint} with the terminal before approving on ${who}.`);
-      if (r.body?.status === "approved") {
-        if (typeof r.body.token !== "string" || !r.body.token) {
-          failPairing("The core returned an approval without a token. Update the core and pair again.");
-          return;
-        }
-        const { token, granted } = r.body;
-        const { url, name } = mine;
-        mine.live = false; pairing = null;
-        hideWaiting();
-        await connect(url, token, name, granted, mine.proof);
-        forget(PENDING_PAIR);
-        pairMsg("paired with " + who, "good");
-        setStatus("paired with " + who);
-        $("#settings").open = false;   // pairing is done: land in the app
-        return;
-      }
-      if (r.body?.status === "denied") {
-        failPairing("The request was refused on " + who + ", so this app was given " +
-          "nothing. Run erisdb pair on the core again to ask once more.");
-        return;
-      }
-    } else if (r.status === 409) {
-      failPairing("This installation changed after approval. Start a fresh pairing and approve its current permissions.");
-      return;
-    } else if (r.status === 400 || r.status === 401 || r.status === 404) {
-      failPairing("The pairing code ran out before anyone answered — a code is good for " +
-        "about ten minutes. Run erisdb pair on the core again for a fresh one.");
-      return;
-    }
-    await sleep(1500);
-  }
-}
-
-/** Stop waiting. The session on the core is left exactly as it is — the
- * operator may still answer it — but this app is no longer listening. */
-function cancelPairing() {
-  if (pairing) pairing.live = false;
-  pairing = null;
-  forget(PENDING_PAIR);
+function endSignIn() {
+  if (joining) joining.live = false;
+  joining = null;
+  forget(LS.pending);
   hideWaiting();
 }
 
-function failPairing(message) {
-  cancelPairing();
+function failSignIn(message) {
+  endSignIn();
   pairMsg(message, "bad");
-  setStatus(config ? "not paired again" : "not paired");
+  setStatus(config ? "signed in" : "not signed in");
 }
 
-/** Between redeem and answer there is a person walking to a keyboard, so
- * the wait is a state with a name, a list of what was asked for, and a way
- * out — not a spinner that could mean anything. */
-function showWaiting(who, what) {
+/** Between redeem and answer there is a person walking to a device, so the
+ * wait is a state with a name, the code to compare, what was asked for,
+ * and a way out — not a spinner that could mean anything. */
+function showWaiting(who, what, fingerprint) {
   pairMsg("");
   $("#pair-wait-who").textContent = who;
   $("#pair-wait-what").textContent = what;
+  $("#pair-fingerprint").textContent = fingerprint;
+  $("#pair-fingerprint").hidden = !fingerprint;
   $("#pair-wants").replaceChildren(...WANTED.map(g => {
     const li = document.createElement("li");
     li.textContent = WANT_SAYS[g] ?? g;
@@ -753,10 +639,10 @@ function pairMsg(text, kind) {
   el.className = text ? (kind ?? "") : "";
 }
 
-/** Unpaired, the connection card is the whole screen — the app behind it
- * has nothing to show until a core is behind it. */
+/** Signed out, the connection card is the whole screen — the app behind it
+ * has nothing to show until ErisDB is behind it. */
 function renderPairState() {
-  document.body.classList.toggle("unpaired", !config);
+  document.body.classList.toggle("signed-out", !config);
   if (!config) $("#settings").open = true;
 }
 
@@ -791,14 +677,14 @@ async function initScanning() {
   let why = null;
   if (window.isSecureContext === false) {
     why = "Scanning needs the camera, and a browser only grants one over https or on " +
-      "localhost. This page is plain http, so paste the pairing code instead — " +
-      "erisdb pair prints it as text under the QR.";
+      "localhost. This page is plain http, so paste the ticket instead — " +
+      "ErisAuth shows it as text under the QR code.";
   } else if (!navigator.mediaDevices?.getUserMedia) {
-    why = "This browser gives the page no camera, so paste the pairing code instead — " +
-      "erisdb pair prints it as text under the QR.";
+    why = "This browser gives the page no camera, so paste the ticket instead — " +
+      "ErisAuth shows it as text under the QR code.";
   } else if (!await qrDecoderAvailable()) {
     why = "This browser has no built-in QR decoder — Chrome, Edge and the Android app " +
-      "do. Paste the pairing code instead: erisdb pair prints it as text under the QR.";
+      "do. Paste the ticket instead: ErisAuth shows it as text under the QR code.";
   }
   scanAvailable = why === null;
   $("#scan-btn").hidden = !scanAvailable;
@@ -817,7 +703,7 @@ async function startScan() {
   try { detector = new BarcodeDetector({ formats: ["qr_code"] }); }
   catch {
     stopScan();
-    pairMsg("This browser cannot decode QR codes — paste the pairing code instead.", "bad");
+    pairMsg("This browser cannot decode QR codes — paste the ticket instead.", "bad");
     return;
   }
   try {
@@ -827,11 +713,11 @@ async function startScan() {
     pairMsg(
       e?.name === "NotAllowedError"
         ? "Camera permission denied. Allow the camera for this page and scan again, or " +
-          "paste the pairing code instead."
+          "paste the ticket instead."
         : e?.name === "NotFoundError"
-          ? "No camera on this device — paste the pairing code instead."
+          ? "No camera on this device — paste the ticket instead."
           : "The camera would not open (" + (e?.name ?? "unknown") + "). Paste the " +
-            "pairing code instead.",
+            "ticket instead.",
       "bad");
     return;
   }
@@ -845,7 +731,7 @@ async function startScan() {
   const video = $("#cam");
   video.srcObject = camStream;
   try { await video.play(); } catch {}
-  pairMsg("point the camera at the QR code from erisdb pair");
+  pairMsg("point the camera at the QR code ErisAuth shows");
   scanFrame(detector, video);
 }
 
@@ -858,16 +744,16 @@ async function scanFrame(detector, video) {
     if (!scanning) return;
     const hit = codes.find(c =>
       typeof c.rawValue === "string" && c.rawValue.trim().startsWith(PAIR_PREFIX));
-    if (hit) { stopScan(); pairWith(hit.rawValue); return; }
+    if (hit) { stopScan(); signIn(hit.rawValue); return; }
     if (codes.length) {
-      pairMsg("that QR code is not an ErisDB pairing code — run erisdb pair on the core");
+      pairMsg("that QR code is not a ticket from ErisAuth — choose Add a browser app there");
     }
   } catch {}                  // a frame read before the video has one
   if (scanning) scanTimer = setTimeout(() => scanFrame(detector, video), 120);
 }
 
 /** Every exit from the camera runs through here: success, cancel, error,
- * disconnect, and the page going away. A camera left running on a phone
+ * sign-out, and the page going away. A camera left running on a phone
  * is not a small thing. */
 function stopScan() {
   scanning = false;
@@ -890,9 +776,9 @@ const FACET_BODY = {
   name: FACET,
   version: FACET_VERSION,
   strict: true,
-  // Human sentences for the approval prompt, so the operator reads "add
-  // entries" rather than "lists:create". Presentation only: no grant
-  // depends on them, and a missing one shows the raw permission.
+  // Human sentences for whatever shows these permissions to a person, so
+  // they read "add entries" rather than "lists:create". Presentation only:
+  // no grant depends on them, and a missing one shows the raw permission.
   permissions: {
     read: "read your lists",
     create: "add entries",
@@ -993,8 +879,9 @@ function view() {
   return out;
 }
 
-// Statuses worth waiting out: the token can be replaced, a 5xx passes.
-// Everything else in the 4xx range is the core saying no, permanently.
+// Statuses worth waiting out: a 401 lasts until the person signs the app
+// in again, a 5xx passes. Everything else in the 4xx range is ErisDB
+// saying no, permanently.
 const retryable = s => s === 401 || s === 408 || s === 425 || s === 429 || s >= 500;
 
 const detail = r => r.body?.detail ?? r.body?.error ?? ("status " + r.status);
@@ -1135,8 +1022,7 @@ async function sync() {
   if (syncing) { syncAgain = true; return; }   // fold the request into the run in flight
   syncing = true;
   try {
-    await refreshToken();
-    // A token adopted from storage reports what it holds on the first sync,
+    // An approval adopted from storage reports what it holds on the first sync,
     // and a refused write sends the app back to ask again. Everything the
     // screen offers or withholds follows from the answer.
     permsStale = false;
@@ -1145,7 +1031,7 @@ async function sync() {
     if (cursor === null) await seed();
     const { status, body } = await api("GET",
       `/v1/changes?since=${cursor}&facet=${encodeURIComponent(FACET)}&limit=500`);
-    if (status === 401) { expired(); return; }
+    if (status === 401) { cutOff(); return; }
     if (status !== 200) throw new Error("changes " + status);
     for (const ch of body.changes) applyChange(ch);
     cursor = Math.max(cursor, body.next);   // the stream may be ahead
@@ -1180,62 +1066,39 @@ function persist() {
 }
 
 // ---------------------------------------------------------------- live stream
-// GET /v1/changes/stream is SSE, woken by Postgres NOTIFY. The capability
-// rides an Authorization header, which EventSource cannot set, so the
-// stream is read off fetch's ReadableStream instead. The cursor stays
-// client-held: every connection opens at ?since=<cursor>, so a drop costs
-// nothing but a reconnect.
+// /v1/changes/stream is SSE, woken by Postgres NOTIFY, on a QUIC stream of
+// its own; the client hands over its change rows one at a time. The cursor
+// stays client-held: every feed opens at ?since=<cursor>, so a drop costs
+// nothing but a reconnect. ErisDB closes the feed of an app it stops
+// letting in.
 
 let streamLive = false;
-let streamAbort = null;
+let streamFeed = null;
 
 async function stream() {
-  const ctl = new AbortController();
-  streamAbort = ctl;
-  let connected = false;
+  let feed;
+  try { feed = await (await erisdb()).changes(cursor, FACET); }
+  catch (e) {
+    if (e?.status === 401) cutOff();
+    else if (config) setStatus("stream lost · polling");
+    return false;
+  }
+  if (!config) { feed.close(); return false; }
+  streamFeed = feed;
+  streamLive = true;
+  setStatus("live");
   try {
-    const res = await fetch(ErisDBAuth.baseURL(config.url) +
-      `/v1/changes/stream?since=${cursor}&facet=${encodeURIComponent(FACET)}`, {
-      headers: { "Authorization": "Bearer " + config.token, "X-ErisDB-Client": CLIENT },
-      signal: ctl.signal, redirect: "error", cache: "no-store",
-    });
-    if (res.status === 401) { expired(); return false; }
-    if (!res.ok || !res.body) throw new Error("stream " + res.status);
-    connected = true;
-    streamLive = true;
-    setStatus("live");
-    const reader = res.body.getReader();
-    const decoder = new TextDecoder();
-    let buf = "";
-    for (;;) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      buf += decoder.decode(value, { stream: true }).replace(/\r\n/g, "\n");
-      // Frames are blank-line separated; keep-alive comments parse to nothing.
-      let i;
-      while ((i = buf.indexOf("\n\n")) >= 0) {
-        applyFrame(buf.slice(0, i));
-        buf = buf.slice(i + 2);
-      }
-    }
-  } catch (e) {
-    if (config) setStatus("stream lost · polling");   // a disconnect aborts on purpose
+    for (let ch; (ch = await feed.next());) applyLive(ch);
+  } catch {
+    if (config) setStatus("stream lost · polling");   // a sign-out closes it on purpose
   } finally {
     streamLive = false;
-    streamAbort = null;
+    if (streamFeed === feed) streamFeed = null;
   }
-  return connected;
+  return true;
 }
 
-function applyFrame(frame) {
-  let event = "message", data = "";
-  for (const line of frame.split("\n")) {
-    if (line.startsWith("event:")) event = line.slice(6).trim();
-    else if (line.startsWith("data:")) data += line.slice(5).replace(/^ /, "");
-  }
-  if (event !== "change" || !data) return;
-  let ch;
-  try { ch = JSON.parse(data); } catch { return; }
+function applyLive(ch) {
   applyChange(ch);
   if (ch.seq > cursor) cursor = ch.seq;
   persist();
@@ -1244,8 +1107,8 @@ function applyFrame(frame) {
 }
 
 // Catch up on the cursor, then hold a stream open; on any drop, catch up
-// again and reconnect with backoff. One loop at a time — a reconfigure
-// aborts the open stream and the same loop picks the new config up.
+// again and reconnect with backoff. One loop at a time — a new approval
+// closes the open feed and the same loop picks it up.
 let streaming = false;
 async function streamLoop() {
   if (streaming) return;
@@ -1318,10 +1181,10 @@ function textToAttrs(text) {
 }
 
 // ---------------------------------------------------------------- links
-// An item body is shared server-side state: any client holding a write
-// token — a phone, a browser, an LLM through erisdb-mcp — can set `link`.
-// An href is therefore untrusted input, and `javascript:` in one would
-// execute in this origin, where the capability token lives.
+// An item body is shared server-side state: any app with write access — a
+// phone, a browser, an LLM through erisdb-mcp — can set `link`. An href is
+// therefore untrusted input, and `javascript:` in one would execute in
+// this origin, where the app's key lives.
 //
 // The scheme is decided by the URL parser, never by string matching:
 // " javascript:x", "java\tscript:x" and "JaVaScRiPt:x" all defeat a
@@ -1361,17 +1224,12 @@ function listNames(shown) {
 
 function fmtDate(ts) { return new Date(ts).toLocaleString(); }
 
-// The token itself never reaches the DOM; this is what the panel says
-// instead of handing a password manager a secret to remember. A ticket's
-// `name` is the label when there is one — it is a courtesy to the human
-// and trusted for nothing — and the url otherwise.
+// What the panel says of the approval: which device gave it. The device's
+// name is a courtesy to the person, as the device gave it, and trusted for
+// nothing.
 function renderConfigState() {
   const el = $("#cfg-state");
-  if (!config) { el.textContent = "not connected"; return; }
-  const exp = tokenExp(config.token);
-  const who = config.name ? config.name + " · " + config.url : config.url;
-  el.textContent = "paired with " + who + " · token " +
-    (exp === null ? "never expires" : "valid until " + new Date(exp * 1000).toLocaleString());
+  el.textContent = config ? "signed in · approved on " + config.device : "not signed in";
 }
 
 // What the screen is missing when an action was refused, said as the thing
@@ -1391,17 +1249,17 @@ function permissionNote() {
   }
   if (!can("read")) {
     return "This app was not given permission to read your lists, so there is nothing to " +
-      "show. Disconnect and pair again to ask for it.";
+      "show. Sign in again with a new ticket to ask for it.";
   }
   const missing = ["create", "update", "delete"].filter(a => !can(a));
   if (missing.length === 3) {
     return "Read-only: this app was approved to read your lists and nothing else. " +
-      "Disconnect and pair again to ask for more.";
+      "Sign in again with a new ticket to ask for more.";
   }
   if (missing.length) {
     return "Approved for part of what was asked: " +
       missing.map(a => NOT_ALLOWED[a]).join(", ") +
-      ". Disconnect and pair again to ask for more.";
+      ". Sign in again with a new ticket to ask for more.";
   }
   return "";
 }
@@ -1593,61 +1451,39 @@ $("#addform").onsubmit = e => {
   $("#f-name").value = "";
 };
 
-$("#cfg-save").onclick = () => {
-  // An empty token field with a config already saved means "keep the
-  // token, change the url" — the field is empty by design, not by
-  // accident, so it must not read as "erase my credentials".
-  const token = $("#cfg-token").value.trim() || config?.token;
-  const url = $("#cfg-url").value.trim().replace(/\/$/, "");
-  if (!token || !url) { setStatus("url and token required"); return; }
-  $("#cfg-token").value = "";
-  cancelPairing();
-  pairMsg("");
-  // Hand-entered details name a core by its url; a label only ever comes
-  // from a ticket, so there is none to keep here. What the token holds is
-  // whatever it holds — connect asks the core rather than assuming.
-  connect(url, token, null).catch(error => pairMsg(error.message, "bad"));
-};
-
-$("#cfg-pair").onclick = () => pairWith($("#cfg-ticket").value);
+$("#cfg-pair").onclick = () => signIn($("#cfg-ticket").value);
 
 $("#pair-cancel").onclick = () => {
-  cancelPairing();
+  cancelSignIn();
   pairMsg("");
-  setStatus(config ? "paired" : "not paired");
+  setStatus(config ? "signed in" : "not signed in");
 };
 
-// A ticket is one line, so Enter pairs and Shift+Enter is the newline
+// A ticket is one line, so Enter signs in and Shift+Enter is the newline
 // nobody typing a ticket wants by accident.
 $("#cfg-ticket").onkeydown = e => {
   if (e.key === "Enter" && !e.shiftKey) {
     e.preventDefault();
-    pairWith($("#cfg-ticket").value);
+    signIn($("#cfg-ticket").value);
   }
 };
 
 $("#scan-btn").onclick = () => startScan();
 $("#scan-cancel").onclick = () => { stopScan(); pairMsg(""); };
 
-$("#cfg-forget").onclick = () => disconnect();
+$("#cfg-forget").onclick = () => signOut();
 
 // ---------------------------------------------------------------- boot
 
-// A stored config is a working session and stays one. Its token is still
-// valid, so it is adopted as it stands — the first sync asks the core what
-// that token holds and the screen settles onto the answer.
-if (config) $("#cfg-url").value = config.url;
+// A stored approval is a working session and stays one. It is adopted as
+// it stands — the first sync asks ErisDB what this app holds and the
+// screen settles onto the answer.
 renderPairState();
 renderConfigState();
 render();          // cache renders instantly, before any network
-initScanning();    // and the pairing screen learns whether it has a camera
-const pendingPair = load(PENDING_PAIR, null);
-if (pendingPair?.proof && pendingPair?.code && pendingPair?.url) {
-  pairing = { ...pendingPair, live: true };
-  $("#settings").open = true;
-  showWaiting(pairing.name ?? pairing.url, "resuming pairing…");
-  pollPairing(pairing.name ?? pairing.url, pairing);
-}
+initScanning();    // and the sign-in screen learns whether it has a camera
+const pendingSignIn = load(LS.pending, null);
+if (pendingSignIn && appKey()) resumeSignIn(pendingSignIn);
 streamLoop();      // then the feed trues it up: catch-up poll, then live
 // The stream is an optimization; the cursor poll is the source of
 // correctness, so it keeps running — every beat while the stream is down,

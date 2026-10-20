@@ -6,8 +6,8 @@ import org.json.JSONArray
 
 // What this app may do is decided by a person, not by this app.
 //
-// Pairing asks for a set of grants and a human answers — with all of it,
-// some of it, or no. So "what I asked for" and "what I hold" are two
+// Signing in asks ErisAuth for a set of grants and the person answers —
+// with all of it, some of it, or no. So "what I asked for" and "what I hold" are two
 // different things, and every button that writes goes through `can`.
 //
 // The grammar is docs/permissions.md's, and `covers` below is the same
@@ -16,11 +16,11 @@ import org.json.JSONArray
 // refuse. Anything else is a 403 the user did not deserve.
 
 /**
- * The grants this app asks for when it redeems a pairing code.
+ * The grants this app asks ErisAuth for when it signs in.
  *
  * Asking is free and the answer is a person, so the list is exactly what
  * the app uses and nothing wider. `create` and `update` are separate
- * permissions, so an operator can hand out "add entries but do not touch
+ * permissions, so the person can hand out "add entries but do not touch
  * mine" and this app will honour it.
  *
  * Creating items also permits initializing this app's missing schema.
@@ -38,7 +38,7 @@ val MANIFEST = listOf(
  *
  * `*` matches exactly one segment, and as a grant's **final** segment it
  * matches every remaining segment — which is what makes `*` mean
- * everything and `meta:*` reach `meta:pairing:approve`, while `*:read`
+ * everything and `meta:*` reach `meta:clients:revoke`, while `*:read`
  * ends in a literal and so stops at two segments. Read-everything and
  * administer-everything are different grants and neither implies the
  * other.
@@ -60,7 +60,7 @@ fun covers(grant: String, required: String): Boolean {
 }
 
 /**
- * The grants a token is known to hold.
+ * The grants this app is known to hold.
  *
  * `held` is null until `GET /v1/permissions` has answered once. Unknown
  * is not the same as none: an app that has never managed to ask shows its
@@ -113,10 +113,10 @@ fun readGrants(stored: String?): List<String>? = stored?.let {
 }
 
 /**
- * `GET /v1/permissions`: what this token actually holds. It requires no
+ * `GET /v1/permissions`: what this app actually holds. It requires no
  * permission of its own, so the answer is always either the truth or a
  * transport failure — and a transport failure leaves the last known set
- * in place rather than pretending the token lost its grants.
+ * in place rather than pretending the app lost its grants.
  */
 suspend fun fetchGrants(api: CoreApi): Read<Grants> {
     val r = api.request("GET", "/v1/permissions")

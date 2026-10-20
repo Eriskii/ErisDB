@@ -29,6 +29,7 @@ jobs:
           cargo audit --deny yanked --file erisdb/Cargo.lock
           cargo audit --deny yanked --no-fetch --file erisdb-client/Cargo.lock
           cargo audit --deny yanked --no-fetch --file clients/mcp/Cargo.lock
+          cargo audit --deny yanked --no-fetch --file clients/web/Cargo.lock
 
   crate:
     name: ${{ matrix.crate }}
@@ -72,11 +73,31 @@ jobs:
       - name: Test
         run: cargo test
 
-  browser:
+  # The browser client builds for wasm32 only; ring compiles C for it with the runner's clang.
+  web-client:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: clients/web
+    env:
+      CC_wasm32_unknown_unknown: clang
+      AR_wasm32_unknown_unknown: llvm-ar
     steps:
       - uses: actions/checkout@v4
+      - run: rustup target add wasm32-unknown-unknown && rustup component add clippy
+      - name: Clippy
+        run: cargo clippy --locked --release -- -D warnings
+
+  # The suite runs ErisAuth as the person's device, built from its own repository.
+  browser:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: Eriskii/ErisAuth
+          path: erisauth
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -87,6 +108,8 @@ jobs:
       - run: python3 scripts/update-csp.py --check
       - run: cargo build --locked --manifest-path erisdb/Cargo.toml --bin erisdb
       - run: npm run test:e2e
+        env:
+          ERISAUTH_SOURCE: erisauth
       - uses: actions/upload-artifact@v4
         if: failure()
         with:

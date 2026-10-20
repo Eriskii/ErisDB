@@ -1,80 +1,45 @@
-# Registered installations
+# Installations
 
-An **installation** is durable, revocable authority owned by one app installation.
-A **pairing session** is its short-lived enrollment ceremony. An **access token**
-is an expiring, signed limit on what that installation may do. These are distinct
-objects: losing an access token does not lose the installation, and possessing a
-QR ticket does not prove possession of the installation key.
+An **installation** is an app its owner's mesh let in: the app's Iroh key, the
+device that approved it, and the note the device approved it with. A device
+creates one by enrolling the app with ErisDB's passphrase; [the mesh](mesh.md)
+describes how. Its grants are the note's, or fewer once the operator narrows
+them.
 
-Postgres owns registration status and current permissions. Core replicas have no
-local authorization cache. Each registered request verifies the token, loads its
-installation, checks revocation and identity, then intersects token grants with
-current installation grants. Delegated tokens retain the installation ID, so
-revocation and permission reductions apply to them too.
-
-Re-pairing with the same installation key updates its existing active registration
-and replaces its permissions with the newly approved set. There is at most one
-active registration per proof. Revoked registrations stay revoked: a fresh human
-approval creates a new registration, so old tokens cannot return to use. Browser
-apps reuse their current proof only when pairing with the same core URL.
-Approval records the registration's current revision. Collection returns 409 if
-another approval, permission change or revocation has since changed it; an old
-approval cannot silently restore older authority.
+Postgres owns each installation's status and grants; the core's copy of the
+mesh's device list owns whether its device is still a member and its note still
+unrevoked. Every request checks both. Core replicas keep no other
+authorization state: each one's mesh node keeps its copy of the list current.
 
 Installations live in a dedicated `clients` table, outside generic item CRUD.
-Pairings remain `pair` items for history and approval. Registry changes produce
-`system` change events, with no item ID; they cannot be mistaken for a pairing
-snapshot or reverted through ordinary item routes.
+Every change to one — enrollment, a permission change, a revocation by the
+operator or by the mesh — appends a `system` change event with no item ID and
+body `{"event":"client","client":…}`; such events cannot be mistaken for item
+snapshots or reverted through the item routes.
 
-## Identity and renewal
+## The key is the credential
 
-- **Native apps:** the actual authenticated Iroh peer key is the identity.
-  Collection, every registered access token, and renewal are bound to that key.
-  Keep the same private key across process restarts. Android encrypts it and its
-  token using its installation's Android Keystore.
-- **Browser and HTTPS MCP clients:** generate a random 32-byte secret locally.
-  Redeem with `challenge = base64url(SHA256(ASCII(base64url(secret))))`. Collection
-  and renewal send the original base64url secret in `X-ErisDB-Client-Proof`.
-  Postgres and audit records contain only the commitment. The encoding uses the
-  [S256 construction](https://www.rfc-editor.org/rfc/rfc7636#section-4.2); this is
-  an installation credential, not an OAuth authorization-code implementation.
-  Access tokens are ordinary bearer credentials on HTTPS.
+An app calls ErisDB over Iroh as its key and sends nothing else: no token, no
+secret, nothing that expires or renews. ErisDB knows the app by the key the QUIC
+handshake proved, so the app keeps the same key for as long as it is the same
+app. The Android apps keep theirs in the Android Keystore; the MCP client keeps
+its own in a mode-0600 profile file; any other app keeps it where its platform
+protects a secret. A copied key is the same app until its installation is
+revoked; the app's name is never an authentication factor.
 
-Default access lifetime is seven days, maximum seven days. The installation
-renews until explicitly revoked, including when its last access token expired
-while offline. An operator may explicitly set `max_ttl_secs` at approval to make
-an installation temporary; absent that field there is no 30-day re-pairing clock.
-
-Renew with `POST /v1/clients/{id}/refresh`, body `{}` or
-`{"ttl_secs": 3600}`. A requested lifetime cannot exceed the approved access
-lifetime. No bearer token is needed: prove the installation identity instead.
-The response is `200 {token, exp, grants, client_id}`. An old token alone cannot
-recover full installation authority. The access-token payload's `client` is only
-a routing hint to clients; the server authenticates the actual key or secret.
-
-The browser apps save the renewal secret with their existing local configuration
-and save pending enrollment separately so reloads can resume collection. Serve
-these apps from an origin you control: scripts executing on that origin can read
-browser storage. MCP automatically saves its pairing in the user's configuration
-directory; optional named profiles give separate applications independent identities.
-Its credential files use mode 0600 on Unix, are replaced atomically, and never
-appear in tool results. File backups must be protected
-as credentials. A copied installation key/secret is the same identity until
-revoked; display names are never an authentication factor.
+There is at most one active installation per app key. Enrolling the app again
+updates it, with the new note's device, id and grants. A revoked installation
+stays revoked: enrolling the app again creates a new one, with a new id.
 
 ## Transport
 
-Browsers and MCP accept HTTPS remotely and HTTP only on localhost. HTTP
-redirects are refused for credential-bearing calls. Run the core's TCP listener
-on loopback behind a local TLS reverse proxy. The registry's HTTP authentication
-checks the actual loopback TCP peer, never `Forwarded` or `X-Forwarded-For`.
-A reverse proxy on another host or container needs a local forwarding hop;
-do not expose an unencrypted proxy on a remote interface. Iroh supplies its own
-mutually authenticated encryption and needs no TLS proxy.
+Apps reach ErisDB over Iroh, ALPN `erisdb/0`, which supplies its own mutually
+authenticated encryption and needs no open port, proxy or certificate. They find
+it as the app the mesh approved to serve `erisdb` and dial its endpoint id.
 
-Serve the browser apps with `apps/shared/auth.js` at its relative path. Exact
-script hashes are in each app's CSP and the shared script's integrity attribute.
-After edits, run `python3 scripts/update-csp.py`; CI checks for stale hashes.
+The TCP listener carries bearer tokens only: operator and minted tokens, the
+poker's, plugins'. Keep it on loopback, and put a local TLS reverse proxy in
+front of it for anything remote. Nothing over TCP is an installation.
 
 ## Administration
 
@@ -87,32 +52,46 @@ erisdb clients permissions CLIENT_UUID --grant tasks:read,tasks:create
 erisdb clients revoke CLIENT_UUID
 ```
 
-The API is available to a future admin UI without adding a second authority:
+The API is available to an admin UI without adding a second authority:
 
 | Route | Permission | Request / response |
 |---|---|---|
 | `GET /v1/clients` | `meta:clients:read` | `{clients: [...]}` |
-| `GET /v1/clients/{id}` | `meta:clients:read` | One registration |
-| `PUT /v1/clients/{id}` | `meta:clients:write` | `{grants, revision}` → updated registration |
-| `POST /v1/clients/{id}/revoke` | `meta:clients:revoke` | Idempotent revocation → registration |
-| `POST /v1/clients/{id}/refresh` | Installation proof | `{ttl_secs?}` → access credential |
+| `GET /v1/clients/{id}` | `meta:clients:read` | One installation |
+| `PUT /v1/clients/{id}` | `meta:clients:write` | `{grants, revision}` → updated installation |
+| `POST /v1/clients/{id}/revoke` | `meta:clients:revoke` | Idempotent revocation → installation |
 
-Permission changes must fit both the original app request and the acting
-administrator's authority. Stale revisions return 409. Reductions apply on the
-next authorization check; increases require renewal before old narrower tokens
-can use them. Revocation is irreversible: pair again to create a new registration.
+Permission changes must fit both the installation's `approved` grants — its
+note's — and the acting administrator's authority. Stale revisions return 409.
+A change applies to the app's next request. Revocation is irreversible: the app
+gets back in only through a device, as a new installation.
 
-Revocation blocks subsequent authorization and renewal on every replica. A
-Postgres notification wakes idle change subscriptions; they recheck registration
-before emitting another event and close when revoked. This does not undo data
-already delivered or transactions already authorized and in flight. Plugin
-invocations are authorized at invocation, not retroactively cancelled.
+Revocation blocks subsequent requests on every replica, and the tokens the app
+delegated. A Postgres notification wakes idle change subscriptions; they recheck
+the installation before emitting another event and close when it is revoked.
+This does not undo data already delivered or transactions already authorized and
+in flight. Plugin invocations are authorized at invocation, not retroactively
+cancelled.
 
-## Signing keys and backups
+## The mesh ends installations too
 
-Signing-key rotation invalidates old token signatures, but a registered client
-can obtain a new token using its still-valid installation proof. Revoke the
-registration to end that authority. Keep `ERISDB_IROH_SECRET` separate if a signing
-key rotation must preserve the core's address. Restore `clients` and `items` from
-the same Postgres backup; restoring an older backup can also restore authority
-that had since been revoked.
+When any device removes a device from the mesh, or revokes an app's note, the
+list reaches ErisDB at once. The affected apps are refused from that moment,
+their open streams close, and ErisDB revokes their installations in the registry
+with `{"mesh": "device removed"}` or `{"mesh": "note revoked"}` as the audit
+event's source. The person needs no access to the server to cut off a lost
+phone's apps: removing the phone from any other device does it.
+
+## Keys and backups
+
+Rotating `ERISDB_SECRET` invalidates token signatures and leaves installations
+working, since apps hold no tokens. Unless `ERISDB_IROH_SECRET` is set
+separately, it also changes the core's Iroh key, which is what its note
+approves: the core refuses to serve until it joins the mesh again, and every app
+then finds it anew as the mesh's ErisDB. Keep the Iroh seed separate when the
+signing key must rotate on its own.
+
+Restore `clients`, `items`, `mesh` and `passphrase` from the same Postgres
+backup. A restored device list catches up from the devices as soon as the core
+syncs, so a device removed since the backup stays removed; an operator's
+revocation since the backup does not survive the restore.

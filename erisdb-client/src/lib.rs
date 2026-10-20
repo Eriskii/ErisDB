@@ -1,8 +1,18 @@
 //! Dials an ErisDB over Iroh: HTTP/1.1 per QUIC bi-stream, ALPN `erisdb/0`.
 //!
-//! The async [`Client`] is the real thing; [`blocking`] wraps it in an
-//! owned runtime for FFI callers (JNI has no executor). The Android
-//! bindings live in `android` and compile only for that target.
+//! An app is let into ErisDB by a device in its owner's mesh: the device
+//! approves the app's key with a note, the person types ErisDB's
+//! passphrase, and the device enrolls the note at the mesh's ErisDB. From
+//! then on the app's key is its credential. It dials ErisDB as that key and
+//! sends no token; ErisDB knows it by the key the QUIC handshake proved.
+//!
+//! [`sign_in`] does the app's side of that through the device's ErisAuth in
+//! one call. [`Client::enroll`] and [`Client::change_passphrase`] are the
+//! device's side, for ErisAuth to call from its own endpoint.
+//!
+//! The async [`Client`] is the real thing; [`blocking`] wraps it in an owned
+//! runtime for FFI callers (JNI has no executor). The Android bindings live
+//! in `android` and compile only for that target.
 //!
 //! Two rules run through all of it. A failed call is repeated only when
 //! repeating it is provably harmless, because the protocol has no
@@ -10,21 +20,16 @@
 //! leaves the FFI surface as a panic: refusals carry a status, transport
 //! failures carry a message, and an unwind is caught before it reaches a
 //! frame that would abort the process.
-//!
-//! Getting a token is [pairing](Client::pair): a scanned ticket carries a
-//! code that grants only `meta:pairing:redeem`, the client redeems it with
-//! the permissions it wants, and a human decides. Every wait for that
-//! human is bounded and cancellable — one may never answer.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
-use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
-use base64::Engine;
+use erisoverlaynetwork::net::{self, Network};
+use erisoverlaynetwork::{Note, Snapshot};
 use http_body_util::{BodyExt, Full};
 use hyper::body::Bytes;
 use hyper_util::rt::TokioIo;
-use iroh::endpoint::{presets, Connection};
+use iroh::endpoint::Connection;
 use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey};
 use serde_json::{json, Value};
 
@@ -33,6 +38,9 @@ mod android;
 
 /// The erisdb wire protocol; must match the core's `net::ALPN`.
 pub const ALPN: &[u8] = b"erisdb/0";
+
+/// The service ErisDB provides in the mesh, and that apps are approved for.
+pub const SERVICE: &str = "erisdb";
 
 /// A request the core answered with a refusal. The status is a field, not
 /// prose, so callers — Kotlin across the FFI boundary especially — branch
@@ -95,9 +103,7 @@ impl Failed {
 /// instead of the truth, which is worse than reporting the transport
 /// failure.
 fn nullipotent(method: &str) -> bool {
-    method.eq_ignore_ascii_case("GET")
-        || method.eq_ignore_ascii_case("HEAD")
-        || method.eq_ignore_ascii_case("OPTIONS")
+    method.eq_ignore_ascii_case("GET") || method.eq_ignore_ascii_case("HEAD") || method.eq_ignore_ascii_case("OPTIONS")
 }
 
 /// A response body as a value: JSON where it is JSON, the raw text where
@@ -108,79 +114,62 @@ fn parse_body(bytes: &[u8]) -> Value {
     if bytes.is_empty() {
         return Value::Null;
     }
-    serde_json::from_slice(bytes)
-        .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(bytes).into_owned()))
+    serde_json::from_slice(bytes).unwrap_or_else(|_| Value::String(String::from_utf8_lossy(bytes).into_owned()))
 }
 
 fn strings(value: &Value) -> Vec<String> {
-    value.as_array().into_iter().flatten()
-        .filter_map(|value| value.as_str().map(str::to_string)).collect()
+    value.as_array().into_iter().flatten().filter_map(|value| value.as_str().map(str::to_string)).collect()
 }
 
-/// This unverified claim selects a renewal endpoint, never an authority.
-/// The server authenticates the installation using the actual QUIC peer.
-fn installation_id(token: &str) -> Option<String> {
-    let payload = B64.decode(token.split('.').nth(1)?).ok()?;
-    let claims: Value = serde_json::from_slice(&payload).ok()?;
-    let id = claims["client"].as_str()?;
-    (id.len() == 36 && id.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-')).then(|| id.to_string())
+/// Where the mesh's ErisDB is, as `snapshot` has it: the app approved to
+/// serve `erisdb` whose note counts, the most recently approved should there
+/// be more than one. Nothing ever talks to any other.
+pub fn locate(snapshot: &Snapshot) -> Result<EndpointAddr> {
+    snapshot
+        .provider(SERVICE)
+        .map(|presence| presence.endpoint_addr())
+        .ok_or_else(|| anyhow!("this mesh has no ErisDB, or the snapshot does not say where it is"))
 }
 
+/// One app's connection to one ErisDB.
 pub struct Client {
     endpoint: Endpoint,
     server: EndpointAddr,
-    token: tokio::sync::RwLock<String>,
     client_name: String,
     conn: tokio::sync::Mutex<Option<Connection>>,
-    renewal: tokio::sync::Mutex<()>,
 }
 
 impl Client {
-    /// Dial by whatever the user pasted: a bare endpoint id (hex, with or
-    /// without an `iroh:` prefix) resolved through discovery, or a full
-    /// JSON `EndpointAddr` for direct dialing.
-    pub async fn dial(
-        server: &str,
-        token: &str,
-        client_name: &str,
-        identity: Option<[u8; 32]>,
-    ) -> Result<Self> {
-        let server = server.trim();
-        let addr: EndpointAddr = if server.starts_with('{') {
-            serde_json::from_str(server).context("parsing endpoint addr JSON")?
-        } else {
-            let id: EndpointId = server
-                .strip_prefix("iroh:")
-                .unwrap_or(server)
-                .parse()
-                .map_err(|e| anyhow!("bad endpoint id: {e}"))?;
-            id.into()
-        };
-        Self::dial_addr(addr, token, client_name, identity).await
+    /// Dial `server` as the app holding `key`, on the network `ERIS_NETWORK`
+    /// names (the internet when it names none). `name` is stamped into
+    /// every write's source as the claimed client.
+    ///
+    /// The key is the app's credential: keep the same one across launches,
+    /// since it is the key a device approved.
+    pub async fn dial(server: EndpointAddr, key: SecretKey, name: &str) -> Result<Self> {
+        Self::dial_on(server, key, name, &Network::from_env()).await
     }
 
-    /// Dial a known address. `identity` pins the caller's own endpoint
-    /// key so `source.addr` names the same device forever; `None` is a
-    /// fresh identity per process.
-    pub async fn dial_addr(
-        server: EndpointAddr,
-        token: &str,
-        client_name: &str,
-        identity: Option<[u8; 32]>,
-    ) -> Result<Self> {
-        let mut builder = Endpoint::builder(presets::N0);
-        if let Some(bytes) = identity {
-            builder = builder.secret_key(SecretKey::from_bytes(&bytes));
-        }
-        let endpoint = builder.bind().await?;
-        Ok(Self {
-            endpoint,
-            server,
-            token: tokio::sync::RwLock::new(token.to_string()),
-            client_name: client_name.to_string(),
-            conn: tokio::sync::Mutex::new(None),
-            renewal: tokio::sync::Mutex::new(()),
-        })
+    /// [`Client::dial`] on a network the caller names.
+    pub async fn dial_on(server: EndpointAddr, key: SecretKey, name: &str, network: &Network) -> Result<Self> {
+        let endpoint = net::endpoint(key, network).await?;
+        Ok(Self::over(endpoint, server, name))
+    }
+
+    /// A client on an endpoint the caller already runs: a device's, for
+    /// ErisAuth enrolling apps as the device itself.
+    pub fn over(endpoint: Endpoint, server: EndpointAddr, name: &str) -> Self {
+        Self { endpoint, server, client_name: name.to_string(), conn: tokio::sync::Mutex::new(None) }
+    }
+
+    /// The ErisDB this client dials: what an app saves to dial it again.
+    pub fn server(&self) -> &EndpointAddr {
+        &self.server
+    }
+
+    /// The key this client calls as.
+    pub fn id(&self) -> EndpointId {
+        self.endpoint.id()
     }
 
     /// One API call: open a bi-stream on the (cached) connection, speak
@@ -193,38 +182,13 @@ impl Client {
     /// would create a second item. Two cases are safe: a failure before
     /// anything was sent (see [`Stage`]), and a nullipotent method, where
     /// asking twice cannot change the store.
-    pub async fn request(
-        &self,
-        method: &str,
-        path: &str,
-        body: Option<Value>,
-    ) -> Result<(u16, Value)> {
-        let before = self.token.read().await.clone();
-        let response = self.request_unrenewed(method, path, &body).await?;
-        if response.0 != 401 || installation_id(&before).is_none() || path.ends_with("/refresh") {
-            return Ok(response);
-        }
-        // A 401 is an explicit refusal before effects. Renewing and then
-        // retrying is safe even for a write; a transport failure is not.
-        let _renewal = self.renewal.lock().await;
-        if *self.token.read().await == before {
-            if let Err(error) = self.renew_access(None).await {
-                return match error.downcast_ref::<Refused>() {
-                    Some(_) => Ok(response),
-                    None => Err(error),
-                };
-            }
-        }
-        self.request_unrenewed(method, path, &body).await
-    }
-
-    async fn request_unrenewed(&self, method: &str, path: &str, body: &Option<Value>) -> Result<(u16, Value)> {
+    pub async fn request(&self, method: &str, path: &str, body: Option<Value>) -> Result<(u16, Value)> {
         let conn = self.connection(false).await?;
-        match self.exchange(&conn, method, path, body).await {
+        match self.exchange(&conn, method, path, &body).await {
             Ok(r) => Ok(r),
             Err(failed) if failed.stage == Stage::BeforeSend || nullipotent(method) => {
                 let conn = self.connection(true).await?;
-                self.exchange(&conn, method, path, body).await.map_err(|f| f.error)
+                self.exchange(&conn, method, path, &body).await.map_err(|f| f.error)
             }
             Err(failed) => Err(failed.error),
         }
@@ -234,34 +198,99 @@ impl Client {
     /// one fresh executable for this call and stores nothing. Any status is
     /// returned to the caller because a non-2xx response may be the external
     /// API's ordinary error format rather than a core refusal.
-    pub async fn call_plugin(
-        &self,
-        plugin: &str,
-        operation: &str,
-        input: Value,
-    ) -> Result<(u16, Value)> {
-        self.request(
-            "POST",
-            "/v1/call",
-            Some(json!({ "plugin": plugin, "operation": operation, "input": input })),
-        )
-        .await
+    pub async fn call_plugin(&self, plugin: &str, operation: &str, input: Value) -> Result<(u16, Value)> {
+        self.request("POST", "/v1/call", Some(json!({ "plugin": plugin, "operation": operation, "input": input }))).await
     }
 
     /// Invoke one plugin operation without buffering its response. This is
     /// the path for SSE and any other streamed plugin body. A `POST` is never
     /// retried after a transport failure: the external system may already
     /// have received it.
-    pub async fn stream_plugin(
-        &self,
-        plugin: &str,
-        operation: &str,
-        input: Value,
-    ) -> Result<PluginStream> {
+    pub async fn stream_plugin(&self, plugin: &str, operation: &str, input: Value) -> Result<PluginStream> {
         let conn = self.connection(false).await?;
-        self.open_response(&conn, "POST", "/v1/call",
-            &Some(json!({ "plugin": plugin, "operation": operation, "input": input })))
-            .await.map_err(|failed| failed.error)
+        let body = Some(json!({ "plugin": plugin, "operation": operation, "input": input }));
+        self.open_response(&conn, "POST", "/v1/call", &body).await.map_err(|failed| failed.error)
+    }
+
+    /// What this app holds: its grants, and the installation they belong to.
+    ///
+    /// Needs no permission, so it is the one call that always works for an
+    /// enrolled app, and the right way for one to find out what it may
+    /// offer to do.
+    pub async fn permissions(&self) -> Result<Permissions> {
+        let (status, body) = self.request("GET", "/v1/permissions", None).await?;
+        if status != 200 {
+            return Err(refused("permissions", status, body));
+        }
+        Ok(Permissions {
+            grants: strings(&body["grants"]),
+            exp: body["exp"].as_i64(),
+            max_exp: body["max_exp"].as_i64(),
+            user: body["user"].as_str().map(str::to_string),
+            client: body["client_id"].as_str().map(str::to_string),
+            raw: body,
+        })
+    }
+
+    /// Enroll the app `note` approves, as the device that signed it: the
+    /// device's side of letting an app in, which ErisAuth calls once the
+    /// person has approved and typed the passphrase. This client must run on
+    /// the device's own endpoint ([`Client::over`]), synced with ErisDB first
+    /// so ErisDB knows the device (`Node::sync_with`, or dial with
+    /// `Node::connect`).
+    ///
+    /// A wrong passphrase, a lockout and a passphrase never set are answers;
+    /// any other refusal — not a device of the mesh, a note ErisDB cannot
+    /// take — is a [`Refused`] error.
+    pub async fn enroll(&self, note: &Note, passphrase: &str) -> Result<Guarded<Enrolled>> {
+        let (status, body) =
+            self.request("POST", "/v1/enroll", Some(json!({ "note": note, "passphrase": passphrase }))).await?;
+        Guarded::read(status, body, "enrollment", |status, body| match status {
+            200 => Ok(Enrolled {
+                client: body["client"].as_str().ok_or_else(|| anyhow!("enrollment named no installation"))?.to_string(),
+                grants: strings(&body["grants"]),
+            }),
+            _ => Err(refused("enrollment", status, body)),
+        })
+    }
+
+    /// Change ErisDB's passphrase, as a device of the mesh that knows the
+    /// current one. A wrong `current` counts against the device like any
+    /// wrong guess. The new one is at least eight characters.
+    pub async fn change_passphrase(&self, current: &str, new: &str) -> Result<Guarded<()>> {
+        let (status, body) =
+            self.request("POST", "/v1/passphrase", Some(json!({ "current": current, "new": new }))).await?;
+        Guarded::read(status, body, "passphrase change", |status, body| match status {
+            204 => Ok(()),
+            _ => Err(refused("passphrase change", status, body)),
+        })
+    }
+
+    /// Subscribe to the change feed from `since` (exclusive), optionally
+    /// narrowed to one facet. The subscription holds one bi-stream open
+    /// for its lifetime and yields events as the core emits them; it ends
+    /// when the core closes it, as it does once this app stops counting.
+    ///
+    /// The caller owns the cursor. Every event carries its `seq`; when a
+    /// subscription ends — dropped connection, sleeping device, process
+    /// restart — resubscribe with the last `seq` seen and the feed picks
+    /// up exactly there, losing nothing.
+    pub async fn subscribe_changes(&self, since: i64, facet: Option<&str>) -> Result<Subscription> {
+        let mut path = format!("/v1/changes/stream?since={since}");
+        if let Some(f) = facet {
+            path.push_str("&facet=");
+            path.push_str(&urlencode(f));
+        }
+        // Subscribing is a read from a cursor the caller owns: opening it
+        // twice costs nothing and changes nothing, so any failure redials.
+        let conn = self.connection(false).await?;
+        match self.open_stream(&conn, &path).await {
+            Ok(s) => Ok(s),
+            Err(_) => {
+                let conn = self.connection(true).await?;
+                self.open_stream(&conn, &path).await
+            }
+        }
     }
 
     async fn connection(&self, force_redial: bool) -> Result<Connection> {
@@ -280,9 +309,9 @@ impl Client {
         }
         // Discovery or a dead network must not hold a blocking/JNI caller
         // forever. No application bytes have been sent at this boundary.
-        let conn = tokio::time::timeout(Duration::from_secs(30),
-            self.endpoint.connect(self.server.clone(), ALPN))
-            .await.context("connecting to the core timed out")??;
+        let conn = tokio::time::timeout(Duration::from_secs(30), self.endpoint.connect(self.server.clone(), ALPN))
+            .await
+            .context("connecting to ErisDB timed out")??;
         *slot = Some(conn.clone());
         Ok(conn)
     }
@@ -312,8 +341,7 @@ impl Client {
         // server.
         let (send, recv) = conn.open_bi().await.map_err(Failed::before_send)?;
         let io = TokioIo::new(tokio::io::join(recv, send));
-        let (mut sender, driver) =
-            hyper::client::conn::http1::handshake(io).await.map_err(Failed::before_send)?;
+        let (mut sender, driver) = hyper::client::conn::http1::handshake(io).await.map_err(Failed::before_send)?;
         let driver = tokio::spawn(driver);
 
         let mut req = hyper::Request::builder()
@@ -321,7 +349,6 @@ impl Client {
             .uri(path)
             .header("host", "erisdb")
             .header("accept", "application/json, text/event-stream")
-            .header("authorization", format!("Bearer {}", self.token.read().await))
             .header("x-erisdb-client", &self.client_name);
         let payload = match body {
             Some(v) => {
@@ -345,171 +372,129 @@ impl Client {
         })
     }
 
-    /// Trade the current token for one with the same scope and a fresh
-    /// `ttl_secs` expiry, swap it in for every later request on this
-    /// client, and hand it back.
-    ///
-    /// Persistence is the caller's job: the client holds the fresh token
-    /// only for its own lifetime, so a device that wants to survive a
-    /// restart writes the returned string to its own storage. Refresh
-    /// uses the registration's current grants for paired installations,
-    /// even after access expiry. Manual tokens retain their bounded chain.
-    pub async fn refresh_capability(&self, ttl_secs: i64) -> Result<String> {
-        let _renewal = self.renewal.lock().await;
-        self.renew_access(Some(ttl_secs)).await
-    }
-
-    async fn renew_access(&self, ttl_secs: Option<i64>) -> Result<String> {
-        let client = installation_id(&self.token.read().await);
-        let path = client.as_ref().map(|id| format!("/v1/clients/{id}/refresh"))
-            .unwrap_or_else(|| "/v1/capabilities/refresh".to_string());
-        let (status, body) = self
-            .request_unrenewed("POST", &path, &Some(serde_json::json!({"ttl_secs": ttl_secs})))
-            .await?;
-        if status != if client.is_some() { 200 } else { 201 } {
-            return Err(refused("refresh", status, body));
-        }
-        let token = body["token"]
-            .as_str()
-            .ok_or_else(|| anyhow!("refresh returned no token"))?
-            .to_string();
-        *self.token.write().await = token.clone();
-        Ok(token)
-    }
-
-    /// What this client's token holds: its grants, when it expires, when
-    /// its refresh chain ends, and the signed user it writes as.
-    ///
-    /// Needs no permission — the answer is already inside the token the
-    /// caller is carrying — so it is the one call that always works, and
-    /// the right way for an app to find out what it may offer to do.
-    pub async fn permissions(&self) -> Result<Permissions> {
-        let (status, body) = self.request("GET", "/v1/permissions", None).await?;
-        if status != 200 {
-            return Err(refused("permissions", status, body));
-        }
-        Ok(Permissions {
-            grants: strings(&body["grants"]),
-            exp: body["exp"].as_i64(),
-            max_exp: body["max_exp"].as_i64(),
-            user: body["user"].as_str().map(str::to_string),
-            raw: body,
-        })
-    }
-
-    /// Redeem a pairing code: say who this client is and which
-    /// permissions it wants. Asking is free — the answer is a person.
-    ///
-    /// The client's token must be the code from a ticket, which grants
-    /// exactly `meta:pairing:redeem` on one session. Redeeming moves that
-    /// session from pending to requested, which is a write: a lost answer
-    /// is reported rather than resent, because a second redeem against
-    /// the same session is a 409.
-    pub async fn redeem_pairing(&self, client: &str, requested: &[&str]) -> Result<Value> {
-        let body = json!({ "client": client, "requested": requested });
-        let (status, body) = self.request("POST", "/v1/pair/redeem", Some(body)).await?;
-        if status != 200 {
-            return Err(refused("redeem", status, body));
-        }
-        Ok(body)
-    }
-
-    /// Collect the result through the same authenticated installation key.
-    /// Repeating collection recovers safely after a lost response.
-    pub async fn pairing_status(&self) -> Result<Pairing> {
-        let (status, body) = self.request("GET", "/v1/pair/status", None).await?;
-        if status != 200 {
-            return Err(refused("pairing status", status, body));
-        }
-        match body["status"].as_str() {
-            Some("pending") | Some("requested") => Ok(Pairing::Waiting),
-            Some("denied") => Ok(Pairing::Denied),
-            Some("approved") if body["token"].is_string() => Ok(Pairing::Approved {
-                token: body["token"].as_str().unwrap().to_owned(), granted: strings(&body["granted"]),
-            }),
-            Some("approved" | "collected") => Err(anyhow!(
-                "this pairing was already collected: the token is handed over once, so pair again to get another"
-            )),
-            other => Err(anyhow!("pairing session is in an unknown state: {other:?}")),
-        }
-    }
-
-    /// Poll until a human answers, `within` elapses, or `cancel` fires.
-    ///
-    /// A human may never answer — the phone is in a pocket, the laptop is
-    /// shut — so this never waits forever and never has to be killed to
-    /// stop. A cancel is noticed between polls, so at worst it waits out
-    /// the request in flight.
-    pub async fn await_pairing(&self, within: Duration, cancel: &Cancel) -> Result<Pairing> {
-        let deadline = Instant::now() + within;
-        loop {
-            if cancel.is_cancelled() {
-                return Ok(Pairing::Cancelled);
-            }
-            match self.pairing_status().await? {
-                Pairing::Waiting => {}
-                settled => return Ok(settled),
-            }
-            let left = deadline.saturating_duration_since(Instant::now());
-            if left.is_zero() {
-                return Ok(Pairing::TimedOut);
-            }
-            if cancel.sleep(PAIR_POLL_INTERVAL.min(left)).await {
-                return Ok(Pairing::Cancelled);
-            }
-        }
-    }
-
-    /// The whole of the client's side of pairing: redeem the code this
-    /// client dialed with, then wait for the answer.
-    pub async fn pair(
-        &self,
-        client: &str,
-        requested: &[&str],
-        within: Duration,
-        cancel: &Cancel,
-    ) -> Result<Pairing> {
-        self.redeem_pairing(client, requested).await?;
-        self.await_pairing(within, cancel).await
-    }
-
-    /// Subscribe to the change feed from `since` (exclusive), optionally
-    /// narrowed to one facet. The subscription holds one bi-stream open
-    /// for its lifetime and yields events as the core emits them.
-    ///
-    /// The caller owns the cursor. Every event carries its `seq`; when a
-    /// subscription ends — dropped connection, sleeping device, process
-    /// restart — resubscribe with the last `seq` seen and the feed picks
-    /// up exactly there, losing nothing.
-    pub async fn subscribe_changes(&self, since: i64, facet: Option<&str>) -> Result<Subscription> {
-        let mut path = format!("/v1/changes/stream?since={since}");
-        if let Some(f) = facet {
-            path.push_str("&facet=");
-            path.push_str(&urlencode(f));
-        }
-        // Subscribing is a read from a cursor the caller owns: opening it
-        // twice costs nothing and changes nothing, so any failure redials.
-        let conn = self.connection(false).await?;
-        match self.open_stream(&conn, &path).await {
-            Ok(s) => Ok(s),
-            Err(_) => {
-                let conn = self.connection(true).await?;
-                self.open_stream(&conn, &path).await
-            }
-        }
-    }
-
     async fn open_stream(&self, conn: &Connection, path: &str) -> Result<Subscription> {
         let mut stream = self.open_response(conn, "GET", path, &None).await.map_err(|failed| failed.error)?;
         if stream.status != 200 {
             let bytes = (&mut stream.body).collect().await?.to_bytes();
             return Err(refused("change stream", stream.status, parse_body(&bytes)));
         }
-        Ok(Subscription {
-            stream,
-            buf: Vec::new(),
-            done: false,
-        })
+        Ok(Subscription { stream, buf: Vec::new(), done: false })
+    }
+}
+
+/// What an app holds, as `GET /v1/permissions` reports it.
+#[derive(Debug, Clone)]
+pub struct Permissions {
+    /// Permission patterns: `tasks:read`, `meta:facets:write`, `*`.
+    pub grants: Vec<String>,
+    /// Unix seconds when a token stops working; `None` for an app calling
+    /// by its key, which does not expire.
+    pub exp: Option<i64>,
+    /// Unix seconds past which a token's refresh chain ends.
+    pub max_exp: Option<i64>,
+    /// The signed user a token writes as. Attribution, not privilege.
+    pub user: Option<String>,
+    /// The installation these grants belong to.
+    pub client: Option<String>,
+    /// The core's answer as it sent it.
+    pub raw: Value,
+}
+
+/// An app ErisDB let in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Enrolled {
+    /// The installation's id.
+    pub client: String,
+    /// What it holds: the note's grants.
+    pub grants: Vec<String>,
+}
+
+/// How ErisDB answered a call that carries its passphrase.
+///
+/// Wrong guesses are counted per device: the first three cost nothing, the
+/// third locks the device out for a minute, and each one after doubles the
+/// wait, up to a day. A right guess clears the count.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Guarded<T> {
+    /// The passphrase was right and the call went through.
+    Passed(T),
+    /// The passphrase was wrong. `retry_after` is how many seconds the
+    /// device now waits, when this guess locked it out.
+    Wrong { retry_after: Option<u64> },
+    /// The device is locked out for `retry_after` more seconds; nothing was
+    /// checked.
+    Locked { retry_after: u64 },
+    /// ErisDB has no passphrase yet: its operator sets one on the server.
+    NoPassphrase,
+}
+
+impl<T> Guarded<T> {
+    fn read(
+        status: u16,
+        body: Value,
+        what: &'static str,
+        passed: impl FnOnce(u16, Value) -> Result<T>,
+    ) -> Result<Guarded<T>> {
+        let retry_after = body["retry_after"].as_u64();
+        match (status, body["error"].as_str()) {
+            (403, Some("wrong_passphrase")) => Ok(Guarded::Wrong { retry_after }),
+            (429, Some("locked")) => Ok(Guarded::Locked {
+                retry_after: retry_after.ok_or_else(|| anyhow!("{what}: a lockout that says no wait"))?,
+            }),
+            (503, Some("no_passphrase")) => Ok(Guarded::NoPassphrase),
+            _ => passed(status, body).map(Guarded::Passed),
+        }
+    }
+}
+
+/// How signing in through ErisAuth ended. Made once per sign-in, so its
+/// size is no matter.
+#[allow(clippy::large_enum_variant)]
+pub enum SignIn {
+    /// The person approved, and ErisDB enrolled the app: a client dialed at
+    /// the mesh's ErisDB, the note that approves the app, and the mesh as
+    /// the device saw it. Save [`Client::server`] with the key to dial
+    /// again; the note's grants may be fewer than were asked for.
+    Approved { client: Client, note: Note, snapshot: Snapshot },
+    /// The person, or ErisAuth, said no.
+    Denied(String),
+}
+
+/// Sign in through this device's ErisAuth: ask it to approve the app
+/// holding `key` for `grants` in ErisDB. The person approves on ErisAuth's
+/// screen and types ErisDB's passphrase there; ErisAuth enrolls the app at
+/// the mesh's ErisDB and answers once ErisDB has taken it. The returned
+/// client is dialed there, on the network `ERIS_NETWORK` names.
+///
+/// `None` means no ErisAuth is listening here. Dropping the future
+/// withdraws the request.
+#[cfg(unix)]
+pub async fn sign_in(key: SecretKey, name: &str, grants: &[String]) -> Result<Option<SignIn>> {
+    match erisoverlaynetwork::agent::socket_path() {
+        Some(socket) => sign_in_at(&socket, &Network::from_env(), key, name, grants).await,
+        None => Ok(None),
+    }
+}
+
+/// [`sign_in`] with ErisAuth listening at `socket`, dialing ErisDB on `network`.
+#[cfg(unix)]
+pub async fn sign_in_at(
+    socket: &std::path::Path,
+    network: &Network,
+    key: SecretKey,
+    name: &str,
+    grants: &[String],
+) -> Result<Option<SignIn>> {
+    use erisoverlaynetwork::agent::{Answer, Ask};
+    let Some(mut erisauth) = erisoverlaynetwork::agent::connect_to(socket).await? else { return Ok(None) };
+    let ask = Ask { service: SERVICE.into(), name: name.into(), grants: grants.to_vec(), serves: false, app: key.public() };
+    match erisauth.approve(&ask).await? {
+        Answer::Denied(why) => Ok(Some(SignIn::Denied(why))),
+        Answer::Approved { note, snapshot } => {
+            let server = locate(&snapshot)?;
+            let client = Client::dial_on(server, key, name, network).await?;
+            Ok(Some(SignIn::Approved { client, note, snapshot }))
+        }
     }
 }
 
@@ -548,191 +533,13 @@ impl Drop for PluginStream {
     }
 }
 
-// ---------------------------------------------------------------- pairing
-
-/// The app name in ErisDB's tickets, `erisdb://pair/…`. Reading and
-/// refusing tickets is [`erislogin::ticket`]'s: a wrong prefix, a payload
-/// that does not decode, an unknown version, no address, no code, or an
-/// endpoint id that is not 64 hex characters.
-pub const APP: &str = "erisdb";
-
-pub use erislogin::ticket::Ticket;
-
-/// How often a waiting client asks whether the human has answered.
-pub const PAIR_POLL_INTERVAL: Duration = Duration::from_millis(500);
-
-/// A stop signal for a wait, shareable and clonable. Every clone names
-/// the same signal, so the thread showing a pairing screen can hand one
-/// to the wait and keep one for the back button.
-#[derive(Clone)]
-pub struct Cancel {
-    tx: std::sync::Arc<tokio::sync::watch::Sender<bool>>,
-    rx: tokio::sync::watch::Receiver<bool>,
-}
-
-impl Default for Cancel {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Cancel {
-    pub fn new() -> Self {
-        let (tx, rx) = tokio::sync::watch::channel(false);
-        Self { tx: std::sync::Arc::new(tx), rx }
-    }
-
-    /// Stop the wait. Idempotent; a cancelled signal stays cancelled.
-    pub fn cancel(&self) {
-        let _ = self.tx.send(true);
-    }
-
-    pub fn is_cancelled(&self) -> bool {
-        *self.rx.borrow()
-    }
-
-    /// Sleep, waking early if cancelled. True means cancelled — the
-    /// watch channel carries the current value, so a cancel that lands
-    /// before the wait starts is still seen.
-    async fn sleep(&self, how_long: Duration) -> bool {
-        let mut rx = self.rx.clone();
-        if *rx.borrow_and_update() {
-            return true;
-        }
-        tokio::select! {
-            changed = rx.changed() => changed.is_ok() && *rx.borrow(),
-            _ = tokio::time::sleep(how_long) => *rx.borrow(),
-        }
-    }
-}
-
-/// Where a pairing stands, from the client's side.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Pairing {
-    /// Redeemed; no human has answered yet.
-    Waiting,
-    /// Approved. The core hands the token over exactly once, so this is
-    /// the only time it is ever seen: persist it here or pair again.
-    Approved { token: String, granted: Vec<String> },
-    /// A human said no. Nothing was granted.
-    Denied,
-    /// The deadline passed with no answer.
-    TimedOut,
-    /// The caller stopped waiting.
-    Cancelled,
-}
-
-/// What a token holds, as `GET /v1/permissions` reports it.
-#[derive(Debug, Clone)]
-pub struct Permissions {
-    /// Permission patterns: `tasks:read`, `meta:facets:write`, `*`.
-    pub grants: Vec<String>,
-    /// Unix seconds; `None` never expires.
-    pub exp: Option<i64>,
-    /// Unix seconds past which no refresh extends this line.
-    pub max_exp: Option<i64>,
-    /// The signed identity this token writes as. Attribution, not
-    /// privilege.
-    pub user: Option<String>,
-    /// The core's answer as it sent it.
-    pub raw: Value,
-}
-
-/// Pair against the core a scanned ticket names: dial it with the code,
-/// redeem the code with this client's manifest, and wait for a human.
-///
-/// The endpoint id is resolved through discovery, which is what a phone
-/// holding nothing but a QR code has. A caller that already knows the
-/// address — a test, or an app that paired here before — dials it itself
-/// and uses [`Client::pair`].
-pub async fn pair(
-    ticket: &Ticket,
-    client_name: &str,
-    requested: &[&str],
-    identity: Option<[u8; 32]>,
-    within: Duration,
-    cancel: &Cancel,
-) -> Result<Pairing> {
-    // A ticket may legally carry only a `url` — one QR serves a browser on
-    // the LAN and a phone anywhere — but this client speaks QUIC and nothing
-    // else, so it says so plainly.
-    let server = ticket.endpoint_addr().ok_or_else(|| {
-        anyhow!("this ticket carries no endpoint id, only a url; this client dials iroh")
-    })?;
-    let client = Client::dial_addr(server, &ticket.token, client_name, identity).await?;
-    client.pair(client_name, requested, within, cancel).await
-}
-
-/// Sign in through the device's ErisAuth, when one runs here: ask it for
-/// `requested`, redeem the ticket it hands over with this app's `identity`
-/// key, and wait for the person's answer on ErisAuth's screen.
-///
-/// Returns the ticket, which says where the core is, with how pairing
-/// ended; save both, and the key, as after any pairing. `None` means no
-/// ErisAuth is listening, and the app pairs by a scanned or pasted ticket
-/// with [`pair`] instead. Cancelling or timing out withdraws the request.
-#[cfg(unix)]
-pub async fn pair_via_erisauth(
-    client_name: &str,
-    requested: &[&str],
-    identity: [u8; 32],
-    within: Duration,
-    cancel: &Cancel,
-) -> Result<Option<(Ticket, Pairing)>> {
-    match erislogin::agent::socket_path() {
-        Some(socket) => pair_via_erisauth_at(&socket, client_name, requested, identity, within, cancel).await,
-        None => Ok(None),
-    }
-}
-
-/// [`pair_via_erisauth`] with ErisAuth listening at `socket`.
-#[cfg(unix)]
-pub async fn pair_via_erisauth_at(
-    socket: &std::path::Path,
-    client_name: &str,
-    requested: &[&str],
-    identity: [u8; 32],
-    within: Duration,
-    cancel: &Cancel,
-) -> Result<Option<(Ticket, Pairing)>> {
-    use erislogin::agent::{Answer, Ask};
-    let Some(mut agent) = erislogin::agent::connect_to(socket).await? else { return Ok(None) };
-    let ask = Ask {
-        service: APP.to_string(),
-        client: client_name.to_string(),
-        requested: requested.iter().map(|s| s.to_string()).collect(),
-        identity: erislogin::identity::Identity::Iroh(SecretKey::from_bytes(&identity).public().to_string()),
-    };
-    let ticket = Ticket::parse(APP, &agent.ask(&ask).await?)?;
-    let server = ticket.endpoint_addr().ok_or_else(|| anyhow!("ErisAuth handed over a ticket with no endpoint id"))?;
-    let client = Client::dial_addr(server, &ticket.token, client_name, Some(identity)).await?;
-    client.redeem_pairing(client_name, requested).await?;
-
-    let deadline = Instant::now() + within;
-    let answer = tokio::select! {
-        answer = agent.answer() => answer?,
-        _ = tokio::time::sleep_until(deadline.into()) => return Ok(Some((ticket, Pairing::TimedOut))),
-        _ = async { while !cancel.sleep(Duration::from_secs(3600)).await {} } => {
-            return Ok(Some((ticket, Pairing::Cancelled)));
-        }
-    };
-    let pairing = match answer {
-        Answer::Denied(_) => Pairing::Denied,
-        // Approved: the credential is collected from the core, not from ErisAuth.
-        Answer::Approved(_) => client.await_pairing(deadline.saturating_duration_since(Instant::now()), cancel).await?,
-    };
-    Ok(Some((ticket, pairing)))
-}
-
 /// Percent-encode everything outside the unreserved set, so a facet name
 /// survives as one query value whatever characters it uses.
 fn urlencode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
         match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(b as char)
-            }
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
             _ => out.push_str(&format!("%{b:02X}")),
         }
     }
@@ -860,6 +667,19 @@ fn find_frame_end(buf: &[u8]) -> Option<(usize, usize)> {
     None
 }
 
+/// An ErisDB address as an app keeps it: a JSON `EndpointAddr`, or a bare
+/// endpoint id (hex, with or without an `iroh:` prefix) for discovery to
+/// resolve.
+pub fn parse_server(server: &str) -> Result<EndpointAddr> {
+    let server = server.trim();
+    if server.starts_with('{') {
+        return serde_json::from_str(server).context("parsing the ErisDB address JSON");
+    }
+    let id: EndpointId =
+        server.strip_prefix("iroh:").unwrap_or(server).parse().map_err(|e| anyhow!("bad endpoint id: {e}"))?;
+    Ok(id.into())
+}
+
 /// Synchronous facade for FFI callers: one process-wide runtime and
 /// client, every answer a value.
 ///
@@ -884,13 +704,8 @@ pub mod blocking {
     fn runtime() -> &'static tokio::runtime::Runtime {
         static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
         RT.get_or_init(|| {
-            let workers =
-                std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(4, 8);
-            tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(workers)
-                .enable_all()
-                .build()
-                .expect("runtime builds")
+            let workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(4, 8);
+            tokio::runtime::Builder::new_multi_thread().worker_threads(workers).enable_all().build().expect("runtime builds")
         })
     }
 
@@ -936,7 +751,7 @@ pub mod blocking {
     /// read one character at a time: a 64-byte string of multi-byte
     /// characters is rejected rather than sliced through the middle of
     /// one.
-    pub fn decode_identity_hex(s: &str) -> Option<[u8; 32]> {
+    pub fn decode_key_hex(s: &str) -> Option<[u8; 32]> {
         let digits: Vec<char> = s.trim().chars().collect();
         if digits.len() != 64 {
             return None;
@@ -950,11 +765,23 @@ pub mod blocking {
         Some(out)
     }
 
-    /// The endpoint id an identity dials as, in hex: what an app names to
-    /// ErisAuth as the key it will redeem with. `None` for anything but
-    /// 64 hex characters.
-    pub fn endpoint_id(identity_hex: &str) -> Option<String> {
-        decode_identity_hex(identity_hex).map(|secret| SecretKey::from_bytes(&secret).public().to_string())
+    /// The endpoint id a key dials as, in hex: what an app names to
+    /// ErisAuth as itself. `None` for anything but 64 hex characters.
+    pub fn endpoint_id(key_hex: &str) -> Option<String> {
+        decode_key_hex(key_hex).map(|secret| SecretKey::from_bytes(&secret).public().to_string())
+    }
+
+    /// Where the mesh's ErisDB is, from the snapshot ErisAuth handed over
+    /// with an approval: `{"ok":true,"server":<EndpointAddr JSON>}`, or
+    /// `{"ok":false,"error":…}`. Save `server` and dial it with [`dial`].
+    pub fn locate(snapshot_json: &str) -> String {
+        let located = serde_json::from_str::<Snapshot>(snapshot_json)
+            .context("reading the snapshot")
+            .and_then(|snapshot| super::locate(&snapshot));
+        match located {
+            Ok(addr) => serde_json::json!({"ok": true, "server": addr}).to_string(),
+            Err(e) => serde_json::json!({"ok": false, "error": format!("{e:#}")}).to_string(),
+        }
     }
 
     /// The status of a refusal, or 0 when the failure was the transport's.
@@ -962,230 +789,62 @@ pub mod blocking {
         error.downcast_ref::<Refused>().map_or(0, |refused| refused.status)
     }
 
-    fn client_slot() -> &'static Mutex<Option<std::sync::Arc<Client>>> {
-        static CLIENT: OnceLock<Mutex<Option<std::sync::Arc<Client>>>> = OnceLock::new();
+    fn client_slot() -> &'static Mutex<Option<Arc<Client>>> {
+        static CLIENT: OnceLock<Mutex<Option<Arc<Client>>>> = OnceLock::new();
         CLIENT.get_or_init(|| Mutex::new(None))
     }
 
-    /// (Re)connect the process-wide client.
-    pub fn configure(
-        server: &str,
-        token: &str,
-        client_name: &str,
-        identity: &[u8],
-    ) -> std::result::Result<(), String> {
-        let identity: [u8; 32] =
-            identity.try_into().map_err(|_| "identity must be 32 bytes".to_string())?;
+    /// (Re)dial the process-wide client: `server` is what [`locate`] gave
+    /// (or a bare endpoint id), `key` the app's 32-byte key, on the network
+    /// `ERIS_NETWORK` names.
+    pub fn dial(server: &str, client_name: &str, key: &[u8]) -> std::result::Result<(), String> {
+        dial_on(server, client_name, key, &Network::from_env())
+    }
+
+    /// [`dial`] on a network the caller names.
+    pub fn dial_on(server: &str, client_name: &str, key: &[u8], network: &Network) -> std::result::Result<(), String> {
+        let key: [u8; 32] = key.try_into().map_err(|_| "key must be 32 bytes".to_string())?;
+        let server = parse_server(server).map_err(|e| e.to_string())?;
         let client = runtime()
-            .block_on(Client::dial(server, token, client_name, Some(identity)))
+            .block_on(Client::dial_on(server, SecretKey::from_bytes(&key), client_name, network))
             .map_err(|e| e.to_string())?;
-        *lock(client_slot()) = Some(std::sync::Arc::new(client));
+        *lock(client_slot()) = Some(Arc::new(client));
         Ok(())
     }
 
     /// One API call; the response is always a JSON string:
     /// `{"status": n, "body": …}` on an exchange, `{"status": 0, "error": …}`
-    /// when the transport failed or nothing is configured.
+    /// when the transport failed or nothing is dialed.
     pub fn request(method: &str, path: &str, body_json: Option<&str>) -> String {
         let client = match lock(client_slot()).clone() {
             Some(c) => c,
-            None => return r#"{"status":0,"error":"not configured"}"#.to_string(),
+            None => return r#"{"status":0,"error":"not dialed"}"#.to_string(),
         };
         let body = match body_json {
             Some(s) => match serde_json::from_str(s) {
                 Ok(v) => Some(v),
-                Err(e) => {
-                    return serde_json::json!({"status": 0, "error": format!("bad body: {e}")})
-                        .to_string()
-                }
+                Err(e) => return serde_json::json!({"status": 0, "error": format!("bad body: {e}")}).to_string(),
             },
             None => None,
         };
         match runtime().block_on(client.request(method, path, body)) {
-            Ok((status, body)) => {
-                serde_json::json!({"status": status, "body": body}).to_string()
-            }
+            Ok((status, body)) => serde_json::json!({"status": status, "body": body}).to_string(),
             Err(e) => serde_json::json!({"status": 0, "error": e.to_string()}).to_string(),
         }
     }
 
-    /// Refresh the process-wide client's capability and swap it in.
-    /// The response is always a JSON string: `{"ok":true,"token":…}` on
-    /// success, `{"ok":false,"status":n,"error":…}` otherwise. Persisting
-    /// the token is the caller's job.
-    ///
-    /// `status` is the core's answer — 401 for a token too dead to
-    /// refresh, 403 for one the core will not widen — and 0 when the call
-    /// never got an answer at all. Callers branch on that number; the
-    /// message is for humans.
-    pub fn refresh_capability(ttl_secs: i64) -> String {
-        let client = match lock(client_slot()).clone() {
-            Some(c) => c,
-            None => return r#"{"ok":false,"status":0,"error":"not configured"}"#.to_string(),
-        };
-        match runtime().block_on(client.refresh_capability(ttl_secs)) {
-            Ok(token) => serde_json::json!({"ok": true, "token": token}).to_string(),
-            Err(e) => failure(&e),
-        }
-    }
-
-    /// The caller's own grants: `{"ok":true,"permissions":{grants, exp,
-    /// max_exp, user}}`, or the usual failure envelope. Needs no
-    /// permission, so an app can always ask what it may offer to do.
+    /// The app's own grants: `{"ok":true,"permissions":{grants, client_id, …}}`,
+    /// or `{"ok":false,"status":n,"error":…}`. Needs no permission, so an
+    /// enrolled app can always ask what it may offer to do; 401 means it is
+    /// not, or no longer, let in.
     pub fn permissions() -> String {
         let client = match lock(client_slot()).clone() {
             Some(c) => c,
-            None => return r#"{"ok":false,"status":0,"error":"not configured"}"#.to_string(),
+            None => return r#"{"ok":false,"status":0,"error":"not dialed"}"#.to_string(),
         };
         match runtime().block_on(client.permissions()) {
             Ok(held) => serde_json::json!({"ok": true, "permissions": held.raw}).to_string(),
-            Err(e) => failure(&e),
-        }
-    }
-
-    /// The `{"ok":false,"status":n,"error":…}` envelope. `status` is the
-    /// core's answer, or 0 when the call never got one.
-    fn failure(e: &anyhow::Error) -> String {
-        serde_json::json!({"ok": false, "status": status_of(e), "error": e.to_string()}).to_string()
-    }
-
-    // ------------------------------------------------------------ pairing
-    //
-    // Pairing is a pull, like the change feed: redeem once, then ask for
-    // an answer with a timeout on every call. A human may never answer,
-    // so no call here blocks forever, and `pair_cancel` wakes a parked
-    // one rather than leaving a thread to run its timeout out.
-
-    /// The pairing in progress: a client dialed with the code, and the
-    /// signal that stops waiting on it.
-    struct PairingSession {
-        client: Arc<Client>,
-        cancel: Cancel,
-    }
-
-    fn pairing_slot() -> &'static Mutex<Option<PairingSession>> {
-        static PAIRING: OnceLock<Mutex<Option<PairingSession>>> = OnceLock::new();
-        PAIRING.get_or_init(|| Mutex::new(None))
-    }
-
-    /// Read a `erisdb://pair/…` ticket:
-    /// `{"ok":true,"ticket":{v, name, eid, url, token}}`, or
-    /// `{"ok":false,"error":…}` naming what was wrong with it.
-    ///
-    /// Separate from redeeming on purpose: an app shows the core's name
-    /// and asks the user before it dials anything.
-    pub fn parse_ticket(ticket: &str) -> String {
-        match Ticket::parse(APP, ticket) {
-            Ok(t) => serde_json::json!({"ok": true, "ticket": {
-                "v": t.v,
-                "name": t.name,
-                "eid": t.eid,
-                "url": t.url,
-                "token": t.token,
-            }})
-            .to_string(),
-            Err(e) => serde_json::json!({"ok": false, "error": e.to_string()}).to_string(),
-        }
-    }
-
-    /// Dial `server` with a ticket's `code` and redeem it, naming this
-    /// client and the grants it wants. `requested_json` is a JSON array
-    /// of permission strings.
-    ///
-    /// `server` is what [`configure`] takes — the ticket's `eid`, or an
-    /// `EndpointAddr` JSON for an address already known. The answer is
-    /// `{"ok":true,"pairing":…}` with the session as the core sees it,
-    /// or the usual failure envelope. Redeeming replaces any pairing
-    /// already in progress.
-    pub fn pair_redeem(
-        server: &str,
-        code: &str,
-        client_name: &str,
-        requested_json: &str,
-        identity: &[u8],
-    ) -> String {
-        let identity: [u8; 32] = match identity.try_into() {
-            Ok(bytes) => bytes,
-            Err(_) => {
-                return r#"{"ok":false,"status":0,"error":"identity must be 32 bytes"}"#.to_string()
-            }
-        };
-        let requested: Vec<String> = match serde_json::from_str(requested_json) {
-            Ok(r) => r,
-            Err(e) => {
-                return serde_json::json!({
-                    "ok": false,
-                    "status": 0,
-                    "error": format!("requested must be a JSON array of permissions: {e}"),
-                })
-                .to_string()
-            }
-        };
-        let asked: Vec<&str> = requested.iter().map(String::as_str).collect();
-
-        let outcome = runtime().block_on(async {
-            let client = Client::dial(server, code, client_name, Some(identity)).await?;
-            let session = client.redeem_pairing(client_name, &asked).await?;
-            Ok::<_, anyhow::Error>((client, session))
-        });
-        match outcome {
-            Ok((client, session)) => {
-                *lock(pairing_slot()) =
-                    Some(PairingSession { client: Arc::new(client), cancel: Cancel::new() });
-                serde_json::json!({"ok": true, "pairing": session}).to_string()
-            }
-            Err(e) => failure(&e),
-        }
-    }
-
-    /// Wait up to `timeout_ms` for the human's answer. Always a value:
-    ///
-    /// ```text
-    /// {"ok":true,"status":"waiting"}                        ask again
-    /// {"ok":true,"status":"approved","token":…,"granted":[…]}
-    /// {"ok":true,"status":"denied"}
-    /// {"ok":true,"status":"cancelled"}
-    /// {"ok":false,"status":n,"error":…}
-    /// ```
-    ///
-    /// `approved` is the only time the token is ever seen — the core
-    /// hands it over once — so persist it before returning. A settled
-    /// pairing clears the slot, and asking again says there is none.
-    pub fn pair_poll(timeout_ms: u64) -> String {
-        let (client, cancel) = match lock(pairing_slot()).as_ref() {
-            Some(s) => (s.client.clone(), s.cancel.clone()),
-            None => return r#"{"ok":false,"status":0,"error":"no pairing in progress"}"#.to_string(),
-        };
-        let waited =
-            runtime().block_on(client.await_pairing(Duration::from_millis(timeout_ms), &cancel));
-        let settled = |answer: serde_json::Value| {
-            lock(pairing_slot()).take();
-            answer.to_string()
-        };
-        match waited {
-            // A timeout is not an outcome, it is "no answer yet": the
-            // caller loops, exactly as it does on the change feed.
-            Ok(Pairing::Waiting) | Ok(Pairing::TimedOut) => {
-                r#"{"ok":true,"status":"waiting"}"#.to_string()
-            }
-            Ok(Pairing::Approved { token, granted }) => settled(
-                serde_json::json!({"ok": true, "status": "approved", "token": token, "granted": granted}),
-            ),
-            Ok(Pairing::Denied) => settled(serde_json::json!({"ok": true, "status": "denied"})),
-            Ok(Pairing::Cancelled) => {
-                settled(serde_json::json!({"ok": true, "status": "cancelled"}))
-            }
-            // A blip on the way to the core is not the end of the
-            // session: the slot stays and the caller may ask again.
-            Err(e) => failure(&e),
-        }
-    }
-
-    /// Stop waiting and drop the pairing. Wakes a parked [`pair_poll`],
-    /// which answers `cancelled`. A no-op when nothing is pairing.
-    pub fn pair_cancel() {
-        if let Some(session) = lock(pairing_slot()).take() {
-            session.cancel.cancel();
+            Err(e) => serde_json::json!({"ok": false, "status": status_of(&e), "error": e.to_string()}).to_string(),
         }
     }
 
@@ -1194,10 +853,10 @@ pub mod blocking {
     /// in [`next_change`] and gets one event per return.
     pub type SubscriptionHandle = u64;
 
-    fn subscriptions() -> &'static Mutex<HashMap<SubscriptionHandle, Arc<TokioMutex<Subscription>>>>
-    {
-        static SUBS: OnceLock<Mutex<HashMap<SubscriptionHandle, Arc<TokioMutex<Subscription>>>>> =
-            OnceLock::new();
+    type Subscriptions = Mutex<HashMap<SubscriptionHandle, Arc<TokioMutex<Subscription>>>>;
+
+    fn subscriptions() -> &'static Subscriptions {
+        static SUBS: OnceLock<Subscriptions> = OnceLock::new();
         SUBS.get_or_init(|| Mutex::new(HashMap::new()))
     }
 
@@ -1205,17 +864,12 @@ pub mod blocking {
     /// to one facet, and return its handle. The caller owns the cursor:
     /// remember the `seq` of the last event it processed and pass it as
     /// `since` on the next subscribe to resume without loss.
-    pub fn subscribe_changes(
-        since: i64,
-        facet: Option<&str>,
-    ) -> std::result::Result<SubscriptionHandle, String> {
+    pub fn subscribe_changes(since: i64, facet: Option<&str>) -> std::result::Result<SubscriptionHandle, String> {
         let client = match lock(client_slot()).clone() {
             Some(c) => c,
-            None => return Err("not configured".to_string()),
+            None => return Err("not dialed".to_string()),
         };
-        let sub = runtime()
-            .block_on(client.subscribe_changes(since, facet))
-            .map_err(|e| e.to_string())?;
+        let sub = runtime().block_on(client.subscribe_changes(since, facet)).map_err(|e| e.to_string())?;
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let handle = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         lock(subscriptions()).insert(handle, Arc::new(TokioMutex::new(sub)));
@@ -1236,12 +890,8 @@ pub mod blocking {
         runtime().block_on(async {
             let mut sub = sub.lock().await;
             match tokio::time::timeout(wait, sub.next()).await {
-                Ok(Ok(Some(event))) => {
-                    serde_json::json!({"ok": true, "change": event.raw}).to_string()
-                }
-                Ok(Ok(None)) => {
-                    r#"{"ok":false,"error":"stream ended"}"#.to_string()
-                }
+                Ok(Ok(Some(event))) => serde_json::json!({"ok": true, "change": event.raw}).to_string(),
+                Ok(Ok(None)) => r#"{"ok":false,"error":"stream ended"}"#.to_string(),
                 Ok(Err(e)) => serde_json::json!({"ok": false, "error": e.to_string()}).to_string(),
                 Err(_) => r#"{"ok":true}"#.to_string(),
             }
@@ -1273,16 +923,6 @@ pub mod blocking {
             assert_eq!(*lock(&m), vec!["before"]);
             lock(&m).push("after");
             assert_eq!(*lock(&m), vec!["before", "after"]);
-        }
-
-        /// What an app tells ErisAuth it will redeem with: the endpoint id
-        /// its identity dials as.
-        #[test]
-        fn an_identity_names_the_endpoint_it_dials_as() {
-            let secret = [7u8; 32];
-            let hex: String = secret.iter().map(|b| format!("{b:02x}")).collect();
-            assert_eq!(endpoint_id(&hex), Some(SecretKey::from_bytes(&secret).public().to_string()));
-            assert_eq!(endpoint_id("not hex"), None);
         }
     }
 }

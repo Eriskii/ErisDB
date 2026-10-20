@@ -2,7 +2,7 @@
 name = "erisdb-mcp"
 version = "0.1.0"
 edition = "2021"
-description = "An ErisDB client speaking MCP over stdio: the core's API as tools."
+description = "An ErisDB client speaking MCP over stdio: the core's API as tools, reached over Iroh as an app the mesh let in."
 license = "MIT"
 repository = "https://github.com/Eriskii/ErisDB"
 readme = "README.md"
@@ -11,13 +11,10 @@ categories = ["command-line-utilities", "api-bindings"]
 
 [dependencies]
 anyhow = "1"
-base64 = "0.22"
 clap = { version = "4", features = ["derive", "env"] }
 dirs = "6"
-erislogin = { git = "https://github.com/Eriskii/ErisLogin", tag = "v0.4.1", default-features = false }
-getrandom = "0.4"
-sha2 = "0.10"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+erisdb-client = { path = "../../erisdb-client" }
+iroh = "1"
 rmcp = { version = "3.1.4", features = ["server", "transport-io", "macros"] }
 schemars = "1.2.2"
 serde = { version = "1", features = ["derive"] }
@@ -27,7 +24,9 @@ tempfile = "3"
 
 # The end-to-end suite drives a real core and a real Postgres, both as
 # processes: a container to run the store, and the erisdb binary itself.
-# Nothing here links the erisdb crate, so this repo builds and tests on its
-# own.
+# A device node from the mesh library plays the device ErisAuth runs on.
+# Nothing here links the erisdb crate.
 [dev-dependencies]
+erisoverlaynetwork = { git = "https://github.com/Eriskii/ErisOverlayNetwork", tag = "v0.2.0" }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 testcontainers-modules = { version = "0.15", features = ["postgres"] }

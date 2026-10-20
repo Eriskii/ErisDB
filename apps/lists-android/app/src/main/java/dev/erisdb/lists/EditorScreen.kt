@@ -114,7 +114,7 @@ fun EditorScreen(
         }
         if (!maySave) {
             Text(
-                "this pairing was not granted ${describeGrant("$FACET:update")}",
+                "this app was not granted ${describeGrant("$FACET:update")}",
                 Modifier.padding(horizontal = 16.dp),
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.error)

@@ -1,14 +1,16 @@
 # Capabilities
 
-A capability is a signed upper bound on a request's authority. Registered
-installation tokens also carry a `client` UUID: the core checks that registration
-in Postgres on every request, verifies its transport binding and intersects its
-current grants with the token's grants. See [clients.md](clients.md).
+A capability is a signed upper bound on a request's authority, carried as a
+bearer token. Operators mint them, daemons such as the poker hold them, plugins
+are handed them for one call, and apps delegate them. Apps themselves hold none:
+an enrolled app calls over Iroh by its key, and the core builds its capability
+from its installation (see [installations](clients.md)).
 
-Manual/operator tokens have no registration. Their signature, scope and two
-clocks remain sufficient for authorization. The bounded refresh and delegation
-rules below describe those tokens; paired installations have independent renewal
-credentials and renew until revoked.
+A token an installation minted carries its `client` UUID: the core checks that
+installation in Postgres and in the mesh on every request, and intersects its
+current grants with the token's. Operator tokens have no installation. Their
+signature, scope and two clocks are sufficient for authorization. The bounded
+refresh and delegation rules below describe every token.
 
 ## The token
 
@@ -33,8 +35,7 @@ Three dot-separated parts, base64url without padding. The payload is JSON:
 | `exp` | Unix seconds. When *this* token stops working. Null on a `--no-expiry` token. |
 | `max_exp` | Unix seconds. The end of the refresh chain. Omitted when unset. |
 | `user` | A signed identity, stamped into `source.user`. Attribution, not privilege. Omitted when unset. |
-| `client` | Registered installation UUID, inherited by delegated tokens; enables immediate revocation. |
-| `pair` | The pairing session this token redeems. Only a pairing code carries one. Omitted otherwise. |
+| `client` | The installation that minted it, inherited by tokens delegated from it; enables immediate revocation. Omitted otherwise. |
 
 Signed, not encrypted. Anyone holding a token can read its scope, and
 clients are expected to — that is how an app knows when to refresh.
@@ -62,8 +63,8 @@ permissions and never checks that a namespace exists. `sensors:create` is
 a legal grant the moment it is typed. It permits initializing the missing
 `sensors` schema and creating readings, without authority to change existing
 schemas or initialize other namespaces. A new client needs no deploy,
-allowlist entry, or core release. The app E2E tests exercise this from a fresh
-installation with no app schemas pre-registered.
+allowlist entry, or core release. The mesh suite exercises this from a freshly
+enrolled app with no app schemas pre-registered.
 
 **Operation permissions use the same grant syntax.** For example, the shipped
 OpenAI operation requires `openai:chat`. It is delegated and bounded by the same
@@ -100,9 +101,10 @@ one, because only the CLI holds the secret.
 ## What refresh does and does not do
 
 `POST /v1/capabilities/refresh` takes `{ttl_secs}` and needs nothing but a
-valid token — no special permission, no `meta:capabilities:mint`. It is how
-an app running on a phone or in a browser outlives the lifetime an operator
-chose without that operator being present.
+valid token — no special permission, no `meta:capabilities:mint`. It is how a
+holder outlives the lifetime its minter chose without the minter being present.
+It trades a token for a token: an app calling by its key carries none, and is
+refused, since handing one out is minting.
 
 It moves time, and only time:
 
@@ -174,24 +176,23 @@ There is no HTTP spelling for a token that never expires. `ttl_secs` is
 required and must be positive, because a stateless core cannot take back
 something it never recorded.
 
-### Approving an installation
+### Changing an installation
 
-`POST /v1/pairings/{id}/approve` runs the same enclosure check against the
-approver's token. An operator holding only `tasks:*` cannot grant
-`lists:read` however loudly the client asks, and cannot answer a request
-for `*` at all — the approval is refused, not trimmed. Pairing is where
-grants are decided. Approval also cannot exceed the original app request; its durable authority is independent of the administrator token lifetime.
+`PUT /v1/clients/{id}` runs the same enclosure check against the operator's
+token. An operator holding only `tasks:*` cannot give an installation
+`lists:read`, and nobody can give it more than its note approved — the change is
+refused, not trimmed. Grants are decided on the device that approved the app.
 
 ## Revocation
 
-Use `erisdb clients revoke CLIENT_UUID` for registered installations. It blocks
-access, renewal, delegated tokens and active change subscriptions across replicas.
-Signing-key rotation alone does not revoke a registration: its proof can renew
-against the new signing key. See [clients.md](clients.md#administration).
+Use `erisdb clients revoke CLIENT_UUID` for an installation, or remove its device
+or revoke its note from any device of the mesh. Either blocks the app, the tokens
+it delegated and its active change subscriptions across replicas. See
+[clients.md](clients.md#administration).
 
-Manual tokens without a `client` claim have no individual registry
-entry. Their expiry or signing-key rotation ends them. Keep the Iroh seed separate
-if rotating the signing key must preserve the core's address.
+Tokens without a `client` claim have no individual registry entry. Their expiry
+or signing-key rotation ends them. Keep the Iroh seed separate if rotating the
+signing key must not change the core's Iroh key.
 
 ## Rate limits
 
@@ -209,11 +210,12 @@ It is checked **before** authorization, so a caller with no
 403. Eleven requests on one connection is enough to watch it happen.
 
 The key is the observed Iroh identity or TCP IP (not source port). HTTP clients
-behind the same local reverse proxy share that IP bucket. Installation renewal
-uses the same bucket. Limits are process-local; protect the public TLS edge
-against distributed floods when deploying publicly.
+behind the same local reverse proxy share that IP bucket. Limits are
+process-local; protect the public TLS edge against distributed floods when
+deploying publicly. Passphrase guesses are limited separately and durably, per
+device: see [the mesh](mesh.md#the-passphrase).
 
-## Three ways to get a token
+## Two ways to get a token
 
 ### `erisdb mint` — the root
 
@@ -246,35 +248,12 @@ rotating the secret.
 Unlike the HTTP route, the CLI applies no ceiling to `--max-ttl`: it holds
 the secret, so it is already the trusted path.
 
-### `erisdb pair` — ask a human
-
-`erisdb pair` takes no scope flags at all. It cuts a pairing code against a
-running core, shows it as a QR, and waits: the client says what it wants
-and the operator answers. Approval is bounded by the requested grants and the operator’s own authority.
-The terminal offers approve, select a subset, or deny, after fingerprint comparison.
-
-```sh
-erisdb pair --name my-laptop
-```
-
-| flag | default | notes |
-|------|---------|-------|
-| `--url` | `$ERISDB_URL`, else `http://127.0.0.1:7700` | The core to drive pairing against. Pairing is stateful, so a core must be running. |
-| `--name` | none | A label for the human, carried in the ticket. Trusted for nothing. |
-| `--ttl` | 600 | How long the code stays open, in seconds. |
-| `--token-ttl` | 604800 | Lifetime of the token an approval issues. |
-| `--client-url` | `--url` when it is not loopback | The url to put in the ticket, for clients that cannot speak QUIC. |
-| `--no-iroh` | off | Leave the endpoint id out of the ticket. With a loopback `--url` and no `--client-url`, that leaves no dialable address and the CLI refuses. |
-
-See [pairing.md](pairing.md) for the ticket format and
-[permissions.md](permissions.md#pairing) for the flow.
-
 ### `POST /v1/capabilities` — delegation
 
-Needs a token holding `meta:capabilities:mint`, and can only ever narrow.
-This is how an agent gets a short-lived, single-facet token from a
-longer-lived one without anybody touching the secret. Full parameters in
-[api.md](api.md#post-v1capabilities).
+Needs `meta:capabilities:mint`, held by a token or by an installation calling
+by its key, and can only ever narrow. This is how an agent gets a short-lived,
+single-facet token from a longer-lived authority without anybody touching the
+secret. Full parameters in [api.md](api.md#post-v1capabilities).
 
 ## Attribution is not authority
 

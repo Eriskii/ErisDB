@@ -1,12 +1,8 @@
 #!/usr/bin/env bash
+# The Android device suite: Tasks and Lists on an isolated emulator, signing in through ErisAuth
+# on the emulator to a real ErisDB in a real mesh. It needs an emulator on adb with internet access,
+# Docker, this machine's internet access, and the APKs built first (scripts/build-android.sh here
+# and in ErisAuth); e2e.py's header says it all. Arguments name the apps to run: tasks, lists.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
-ERISDB_TEST_IROH=1 node tests/browser/server.cjs > /tmp/erisdb-android-core.log 2>&1 &
-fixture_pid=$!
-trap 'kill "$fixture_pid" 2>/dev/null || true' EXIT
-for attempt in $(seq 1 600); do
-  if curl --silent --fail http://127.0.0.1:18770/ready > /dev/null; then break; fi
-  if ! kill -0 "$fixture_pid" 2>/dev/null; then cat /tmp/erisdb-android-core.log; exit 1; fi
-  sleep 1
-done
 python3 tests/android/e2e.py "$@"

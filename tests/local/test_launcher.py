@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""Exercise the launcher with real processes, Docker PostgreSQL, CLI and HTTP."""
+"""Exercise the launcher with real processes, Docker PostgreSQL, CLI and HTTP.
 
-from contextlib import ExitStack
-import base64
+ErisAuth is a stand-in (erisdb/examples/stand_in_erisauth.rs): one device in a mesh of its
+own on loopback endpoints, approving what the launcher's `erisdb join` asks.
+"""
+
+from contextlib import ExitStack, contextmanager
 import fcntl
-import hashlib
 import json
 import os
 import pty
@@ -24,6 +26,31 @@ import urllib.request
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "scripts/run-local.py"
+PASSPHRASE = "a launcher passphrase"
+
+
+@contextmanager
+def erisauth():
+    """A stand-in ErisAuth listening under a runtime directory of its own."""
+    # Built as the launcher builds ErisDB: as locked, from the filesystem root.
+    subprocess.run(["cargo", "build", "--locked", "--manifest-path", ROOT / "erisdb/Cargo.toml",
+                    "--example", "stand_in_erisauth", "--target-dir", ROOT / "erisdb/target"],
+                   cwd=ROOT.anchor, check=True)
+    with tempfile.TemporaryDirectory(prefix="erisdb-erisauth-") as runtime:
+        process = subprocess.Popen([ROOT / "erisdb/target/debug/examples/stand_in_erisauth"],
+                                   env={**os.environ, "XDG_RUNTIME_DIR": runtime},
+                                   stdout=subprocess.DEVNULL)
+        try:
+            socket_path = Path(runtime) / "erisauth/agent.sock"
+            until = time.monotonic() + 60
+            while not socket_path.exists():
+                if time.monotonic() >= until or process.poll() is not None:
+                    raise AssertionError("the stand-in ErisAuth never listened")
+                time.sleep(0.1)
+            yield {"XDG_RUNTIME_DIR": runtime, "ERIS_NETWORK": "loopback"}
+        finally:
+            process.terminate()
+            process.wait(timeout=30)
 
 
 def unused_port():
@@ -89,10 +116,15 @@ class Session:
             self.process.stdin.close()
             self.process.stdout.close()
 
-    def api(self, method, path, token, body=None, proof=None):
+    def joins(self):
+        """The first launch: ErisDB joins the stand-in's mesh, then takes its passphrase."""
+        printed = self.read_until("Choose ErisDB's passphrase", timeout=600)  # Includes the first Cargo build.
+        self.write(PASSPHRASE + "\n")
+        return printed
+
+    def api(self, method, path, token, body=None):
         request = urllib.request.Request(f"http://127.0.0.1:{self.port}" + path,
-            method=method, headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json",
-                **({"X-ErisDB-Client-Proof": proof} if proof else {})},
+            method=method, headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
             data=None if body is None else json.dumps(body).encode())
         with urllib.request.urlopen(request, timeout=10) as response:
             return json.load(response)
@@ -109,10 +141,13 @@ class LauncherTests(unittest.TestCase):
                 resources.callback(subprocess.run, ["docker", "run", "--rm", "--volume", f"{base}:/cleanup",
                     "--entrypoint", "chown", "postgres:17-alpine", "-R", f"{os.getuid()}:{os.getgid()}",
                     "/cleanup"], check=True, capture_output=True)
+                mesh = resources.enter_context(erisauth())
 
-                def start(**env):
-                    session = Session(directory, unused_port(), **env)
+                def start(joining=False, **env):
+                    session = Session(directory, unused_port(), **mesh, **env)
                     resources.callback(session.close)
+                    if joining:
+                        session.joins()
                     session.read_until("erisdb> ", timeout=600)  # Includes the first Cargo build.
                     return session
 
@@ -123,7 +158,7 @@ class LauncherTests(unittest.TestCase):
                         self.assertNotEqual(probe.connect_ex(("127.0.0.1", session.port)), 0)
                     self.assertIn("database system is shut down", (directory / "postgres.log").read_text())
 
-                first = start()
+                first = start(joining=True)
                 identity = re.search(r"\b[0-9a-f]{64}\b", first.cli("endpoint-id")).group()
                 token = re.search(r"erisdb1\.[\w-]+\.[\w-]+", first.cli("mint --grant '*' --ttl 3600")).group()
                 self.assertIn('"clients": []', first.cli("clients list"))
@@ -146,7 +181,8 @@ class LauncherTests(unittest.TestCase):
                 self.assertEqual(bindings["5432/tcp"][0]["HostIp"], "127.0.0.1")
 
                 contender = subprocess.run([sys.executable, SCRIPT, "--data-dir", directory,
-                    "--port", str(unused_port())], capture_output=True, text=True, timeout=30)
+                    "--port", str(unused_port())], capture_output=True, text=True, timeout=30,
+                    env={**os.environ, **mesh})
                 self.assertNotEqual(contender.returncode, 0)
                 self.assertIn("already using", contender.stderr)
                 self.assertEqual(first.api("GET", f"/v1/items/{item['id']}", token)["body"], item["body"])
@@ -161,7 +197,7 @@ class LauncherTests(unittest.TestCase):
                 stopped(second, 0)
 
                 failed = subprocess.run([sys.executable, SCRIPT, "--data-dir", directory,
-                    "--port", str(unused_port())], env={**os.environ,
+                    "--port", str(unused_port())], env={**os.environ, **mesh,
                     "ERISDB_PLUGIN_DIR": str(base / "missing-plugin-directory")},
                     capture_output=True, text=True, timeout=90)
                 self.assertNotEqual(failed.returncode, 0)
@@ -169,9 +205,14 @@ class LauncherTests(unittest.TestCase):
                 self.assertEqual(containers(directory), [])
 
                 interrupted = start()
-                interrupted.write("pair --name 'Launcher test'\n")
-                interrupted.read_until("erisdb://pair/")
-                children = Path(f"/proc/{interrupted.process.pid}/task/{interrupted.process.pid}/children").read_text().split()
+                # A subcommand waiting on its input: the passphrase it reads from standard input.
+                interrupted.write("passphrase set\n")
+                listing = Path(f"/proc/{interrupted.process.pid}/task/{interrupted.process.pid}/children")
+                until = time.monotonic() + 30
+                while len(listing.read_text().split()) < 2:
+                    self.assertLess(time.monotonic(), until, "the subcommand never started")
+                    time.sleep(0.05)
+                children = listing.read_text().split()
                 interrupted.process.send_signal(signal.SIGINT)
                 stopped(interrupted, 130)
                 self.assertTrue(all(not Path(f"/proc/{pid}").exists() for pid in children))
@@ -181,57 +222,39 @@ class LauncherTests(unittest.TestCase):
                 terminated.process.terminate()
                 stopped(terminated, 143)
 
-    def test_pairing_approval_in_a_real_terminal(self):
+    def test_joining_and_the_passphrase_in_a_real_terminal(self):
         with tempfile.TemporaryDirectory(prefix="erisdb-terminal-") as temporary, ExitStack() as resources:
             base = Path(temporary)
             resources.callback(subprocess.run, ["docker", "run", "--rm", "--volume", f"{base}:/cleanup",
                 "--entrypoint", "chown", "postgres:17-alpine", "-R", f"{os.getuid()}:{os.getgid()}",
                 "/cleanup"], check=True, capture_output=True)
-            session = Session(base / "db", unused_port(), terminal=True)
+            mesh = resources.enter_context(erisauth())
+            session = Session(base / "db", unused_port(), terminal=True, **mesh)
             resources.callback(session.close)
-            session.read_until("erisdb> ", timeout=600)
-            for app in ("lists", "tasks", "notes", "denied", "empty"):
-                session.write(f"pair --no-iroh --client-url http://127.0.0.1:{session.port} --name 'Terminal regression'\n")
-                printed = session.read_until("Waiting for a client.")
-                encoded = re.search(r"erisdb://pair/([A-Za-z0-9_-]+)", printed).group(1)
-                ticket = json.loads(base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)))
-                proof = base64.urlsafe_b64encode(os.urandom(32)).decode().rstrip("=")
-                challenge = base64.urlsafe_b64encode(hashlib.sha256(proof.encode()).digest()).decode().rstrip("=")
-                asked = [f"{app}:{action}" for action in ("read", "create", "update", "delete")]
-                pairing = session.api("POST", "/v1/pair/redeem", ticket["token"],
-                    {"client": f"{app} terminal test", "requested": asked, "challenge": challenge})
-                prompt = session.read_until("[d] deny")
-                self.assertIn(pairing["body"]["fingerprint"], prompt)
-                if app == "tasks":
-                    for invalid in ("\n", "typo\n"):
-                        session.write(invalid)
-                        session.read_until("Enter a, s, or d.")
-                        pending = session.api("GET", "/v1/pair/status", ticket["token"], proof=proof)
-                        self.assertEqual(pending["status"], "requested")
-                if app in ("notes", "empty"):
-                    session.write("s\n")
-                    session.read_until("Numbers to approve, comma separated (empty denies):")
-                    if app == "notes":
-                        session.write("1,999\n")
-                        session.read_until("Enter valid permission numbers")
-                        session.read_until("Numbers to approve, comma separated (empty denies):")
-                        session.write("1,2\n")
-                    else:
-                        session.write("\n")
-                else:
-                    session.write("d\n" if app == "denied" else "a\n")
-                result = session.read_until("erisdb> ")
-                approved = session.api("GET", "/v1/pair/status", ticket["token"], proof=proof)
-                if app in ("denied", "empty"):
-                    self.assertIn("denied.", result)
-                    self.assertEqual(approved["status"], "denied")
-                    self.assertNotIn("token", approved)
-                    continue
-                self.assertIn("approved:", result)
-                self.assertEqual(approved["granted"], asked[:2] if app == "notes" else asked)
-                registered = session.api("POST", "/v1/items", approved["token"],
-                    {"facet": "facet", "body": {"name": app, "schema": {"type": "object"}}}, proof=proof)
-                self.assertEqual(registered["source"]["installation"], approved["client_id"])
+            printed = session.read_until("New passphrase: ", timeout=600)
+            self.assertIn("approve it on the device", printed)
+            time.sleep(0.5)
+            session.write("short\n")
+            refused = session.read_until("erisdb> ")
+            self.assertIn("No passphrase was set", refused)
+            self.assertNotIn("short", refused.split("No passphrase")[0], "the passphrase was echoed")
+
+            # Set at the prompt instead, typed twice without echo.
+            session.write("passphrase set\n")
+            session.read_until("New passphrase: ")
+            time.sleep(0.5)
+            session.write(PASSPHRASE + "\n")
+            session.read_until("Again: ")
+            time.sleep(0.5)
+            session.write(PASSPHRASE + "\n")
+            confirmed = session.read_until("erisdb> ")
+            self.assertIn("Passphrase set", confirmed)
+            self.assertNotIn(PASSPHRASE, confirmed, "the passphrase was echoed")
+
+            # In its mesh, it is served and stays joined.
+            token = re.search(r"erisdb1\.[\w-]+\.[\w-]+", session.cli("mint --grant '*' --ttl 3600")).group()
+            self.assertEqual(session.api("GET", "/v1/clients", token)["clients"], [])
+            self.assertIn("in its mesh already", session.cli("join"))
             session.write("exit\n")
             self.assertEqual(session.process.wait(timeout=90), 0)
             self.assertEqual(containers(base / "db"), [])
@@ -254,9 +277,10 @@ class LauncherTests(unittest.TestCase):
                 "executable": "/bin/sh", "args": ["-c", "cat"], "environment": {}, "timeout_secs": 10,
                 "operations": {"say": {"description": "Say it back", "permission": "echo:say",
                                        "request_schema": {"type": "object"}}}}))
-            session = Session(directory, unused_port(), cwd=outer)
+            mesh = resources.enter_context(erisauth())
+            session = Session(directory, unused_port(), cwd=outer, **mesh)
             resources.callback(session.close)
-            started = session.read_until("erisdb> ", timeout=600)
+            started = session.joins() + session.read_until("erisdb> ", timeout=600)
             self.assertIn(f"Plugins: {directory / 'plugins'}", started)
             token = re.search(r"erisdb1\.[\w-]+\.[\w-]+", session.cli("mint --grant '*' --ttl 3600")).group()
             plugins = session.api("GET", "/v1/plugins", token)["plugins"]

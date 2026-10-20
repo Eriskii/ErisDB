@@ -6,21 +6,19 @@
     <!-- A due date passing is worth interrupting someone for. -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
-    <!-- ErisAuth signs this app in when it is installed. Android shows an
-         app only the services it says it looks for. -->
+    <!-- ErisAuth is how this app gets into ErisDB. Android shows an app
+         only the packages it says it looks for. -->
     <queries>
-        <intent>
-            <action android:name="dev.eris.auth.SIGN_IN" />
-        </intent>
+        <package android:name="dev.eris.auth" />
     </queries>
 
     <!--
       allowBackup="false" — nothing this app holds belongs in Google's
-      cloud or on a device-to-device transfer. The capability token and
-      the iroh private key are secrets, sealed under a keystore key that
-      cannot leave this phone and so would arrive elsewhere as noise; and
-      everything else is a cache of the core, which reseeds on first
-      sync. There is nothing to back up, so nothing is.
+      cloud or on a device-to-device transfer. The app's Iroh key is its
+      credential, sealed with the address of its ErisDB under a keystore
+      key that cannot leave this phone, and so would arrive elsewhere as
+      noise; and everything else is a cache of the core, which reseeds on
+      first sync. There is nothing to back up, so nothing is.
     -->
     <application
         android:allowBackup="false"
@@ -30,9 +28,9 @@
         android:supportsRtl="true"
         android:windowSoftInputMode="adjustResize"
         android:theme="@style/Theme.ErisDBTasks">
-        <!-- singleTop: a ticket scanned while the app is already up reaches
-             onNewIntent on the running activity instead of stacking a
-             second copy of it on top of the first. -->
+        <!-- singleTop: a due notice tapped while the app is already up
+             reaches the running activity instead of stacking a second copy
+             of it on top of the first. -->
         <activity
             android:name=".MainActivity"
             android:exported="true"
@@ -40,19 +38,6 @@
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
-            </intent-filter>
-            <!--
-              Pairing arrives as a link. The phone's camera app already
-              reads QR codes and opens what it finds, so `erisdb pair`
-              printing a erisdb://pair/… code is a scanner this app does not
-              have to embed — no camera permission, no library, and the
-              ticket lands in onCreate or onNewIntent.
-            -->
-            <intent-filter>
-                <action android:name="android.intent.action.VIEW" />
-                <category android:name="android.intent.category.DEFAULT" />
-                <category android:name="android.intent.category.BROWSABLE" />
-                <data android:scheme="erisdb" android:host="pair" />
             </intent-filter>
         </activity>
     </application>

@@ -2,6 +2,11 @@
 //! app can load it. Thin by design: strings in, JSON strings out, all real
 //! work in [`crate::blocking`].
 //!
+//! An Android app signs in through ErisAuth's bound service, which answers
+//! with the app's note and a snapshot of the mesh. `nativeLocate` reads
+//! where the mesh's ErisDB is from that snapshot; `nativeDial` dials it as
+//! the app's key; the rest is the API.
+//!
 //! Every entry point is wrapped in [`crate::blocking::guard`]. Unwinding
 //! out of an `extern "system"` frame aborts the process, so a panic in
 //! here would take the whole app down; instead it comes back as the same
@@ -11,7 +16,7 @@ use jni::objects::{JClass, JString};
 use jni::sys::{jlong, jstring};
 use jni::JNIEnv;
 
-use crate::blocking::{decode_identity_hex, guard, panic_envelope};
+use crate::blocking::{decode_key_hex, guard, panic_envelope};
 
 fn jstr(env: &mut JNIEnv, s: &JString) -> String {
     env.get_string(s).map(Into::into).unwrap_or_default()
@@ -31,26 +36,49 @@ fn out(env: &mut JNIEnv, s: &str) -> jstring {
     }
 }
 
-/// Connect (or reconnect) the process-wide client.
+/// The endpoint id a key dials as, in hex — the `app` an approval asks
+/// ErisAuth for; "" when the key is not 64 hex characters.
+#[no_mangle]
+pub extern "system" fn Java_dev_erisdb_client_ErisDB_nativeEndpointId(
+    mut env: JNIEnv,
+    _class: JClass,
+    key_hex: JString,
+) -> jstring {
+    let id = guard(|| crate::blocking::endpoint_id(&jstr(&mut env, &key_hex)).unwrap_or_default(), |_| String::new());
+    out(&mut env, &id)
+}
+
+/// Where the mesh's ErisDB is, from the snapshot ErisAuth answered with:
+/// `{"ok":true,"server":<address JSON>}` or `{"ok":false,"error":…}`.
+#[no_mangle]
+pub extern "system" fn Java_dev_erisdb_client_ErisDB_nativeLocate(
+    mut env: JNIEnv,
+    _class: JClass,
+    snapshot_json: JString,
+) -> jstring {
+    let response = guard(|| crate::blocking::locate(&jstr(&mut env, &snapshot_json)), panic_envelope);
+    out(&mut env, &response)
+}
+
+/// Dial (or redial) the process-wide client at `server` — the address
+/// `nativeLocate` gave, or a bare endpoint id — as the app holding the key.
 /// Returns "" on success, an error message otherwise.
 #[no_mangle]
-pub extern "system" fn Java_dev_erisdb_client_ErisDB_nativeConfigure(
+pub extern "system" fn Java_dev_erisdb_client_ErisDB_nativeDial(
     mut env: JNIEnv,
     _class: JClass,
     server: JString,
-    token: JString,
     client_name: JString,
-    identity_hex: JString,
+    key_hex: JString,
 ) -> jstring {
     let message = guard(
         || {
             let server = jstr(&mut env, &server);
-            let token = jstr(&mut env, &token);
             let client_name = jstr(&mut env, &client_name);
-            let Some(identity) = decode_identity_hex(&jstr(&mut env, &identity_hex)) else {
-                return "identity must be 64 hex characters".to_string();
+            let Some(key) = decode_key_hex(&jstr(&mut env, &key_hex)) else {
+                return "key must be 64 hex characters".to_string();
             };
-            match crate::blocking::configure(&server, &token, &client_name, &identity) {
+            match crate::blocking::dial(&server, &client_name, &key) {
                 Ok(()) => String::new(),
                 Err(e) => e,
             }
@@ -58,21 +86,6 @@ pub extern "system" fn Java_dev_erisdb_client_ErisDB_nativeConfigure(
         |panic| panic,
     );
     out(&mut env, &message)
-}
-
-/// The endpoint id an identity dials as, in hex; "" when the identity is
-/// not 64 hex characters.
-#[no_mangle]
-pub extern "system" fn Java_dev_erisdb_client_ErisDB_nativeEndpointId(
-    mut env: JNIEnv,
-    _class: JClass,
-    identity_hex: JString,
-) -> jstring {
-    let id = guard(
-        || crate::blocking::endpoint_id(&jstr(&mut env, &identity_hex)).unwrap_or_default(),
-        |_| String::new(),
-    );
-    out(&mut env, &id)
 }
 
 /// One API call; returns the blocking facade's JSON envelope.
@@ -96,100 +109,11 @@ pub extern "system" fn Java_dev_erisdb_client_ErisDB_nativeRequest(
     out(&mut env, &response)
 }
 
-/// Read a `erisdb://pair/…` ticket off a QR code: returns
-/// `{"ok":true,"ticket":{v, name, eid, url, token}}`, or
-/// `{"ok":false,"error":…}`. Dials nothing.
+/// What the app holds; returns the blocking facade's JSON envelope. Needs
+/// no permission, so an enrolled app always gets an answer.
 #[no_mangle]
-pub extern "system" fn Java_dev_erisdb_client_ErisDB_nativeParseTicket(
-    mut env: JNIEnv,
-    _class: JClass,
-    ticket: JString,
-) -> jstring {
-    let response = guard(
-        || {
-            let ticket = jstr(&mut env, &ticket);
-            crate::blocking::parse_ticket(&ticket)
-        },
-        panic_envelope,
-    );
-    out(&mut env, &response)
-}
-
-/// Redeem a ticket's code against `server`, naming this client and the
-/// grants it wants (`requestedJson` is a JSON array of permissions).
-/// Returns the blocking facade's JSON envelope; the answer to the request
-/// comes from `nativePairPoll`.
-#[no_mangle]
-pub extern "system" fn Java_dev_erisdb_client_ErisDB_nativePairRedeem(
-    mut env: JNIEnv,
-    _class: JClass,
-    server: JString,
-    code: JString,
-    client_name: JString,
-    requested_json: JString,
-    identity_hex: JString,
-) -> jstring {
-    let response = guard(
-        || {
-            let server = jstr(&mut env, &server);
-            let code = jstr(&mut env, &code);
-            let client_name = jstr(&mut env, &client_name);
-            let requested = jstr(&mut env, &requested_json);
-            let Some(identity) = decode_identity_hex(&jstr(&mut env, &identity_hex)) else {
-                return crate::blocking::panic_envelope(
-                    "identity must be 64 hex characters".to_string(),
-                );
-            };
-            crate::blocking::pair_redeem(&server, &code, &client_name, &requested, &identity)
-        },
-        panic_envelope,
-    );
-    out(&mut env, &response)
-}
-
-/// Wait up to `timeoutMs` for the human's answer; returns the blocking
-/// facade's JSON envelope. Call it from a background thread in a loop
-/// while the status is `waiting`. An `approved` answer carries the token
-/// once and only once — persist it before doing anything else.
-#[no_mangle]
-pub extern "system" fn Java_dev_erisdb_client_ErisDB_nativePairPoll(
-    mut env: JNIEnv,
-    _class: JClass,
-    timeout_ms: jlong,
-) -> jstring {
-    let response =
-        guard(|| crate::blocking::pair_poll(timeout_ms.max(0) as u64), panic_envelope);
-    out(&mut env, &response)
-}
-
-/// Stop waiting and drop the pairing — the back button on a pairing
-/// screen. Wakes a parked `nativePairPoll`, which answers `cancelled`.
-#[no_mangle]
-pub extern "system" fn Java_dev_erisdb_client_ErisDB_nativePairCancel(_env: JNIEnv, _class: JClass) {
-    guard(crate::blocking::pair_cancel, |_| ());
-}
-
-/// What this client's token holds; returns the blocking facade's JSON
-/// envelope. Needs no permission, so it always answers.
-#[no_mangle]
-pub extern "system" fn Java_dev_erisdb_client_ErisDB_nativePermissions(
-    mut env: JNIEnv,
-    _class: JClass,
-) -> jstring {
+pub extern "system" fn Java_dev_erisdb_client_ErisDB_nativePermissions(mut env: JNIEnv, _class: JClass) -> jstring {
     let response = guard(crate::blocking::permissions, panic_envelope);
-    out(&mut env, &response)
-}
-
-/// Trade the current token for one with the same scope and a fresh
-/// expiry; returns the blocking facade's JSON envelope. The app persists
-/// the returned token itself.
-#[no_mangle]
-pub extern "system" fn Java_dev_erisdb_client_ErisDB_nativeRefreshCapability(
-    mut env: JNIEnv,
-    _class: JClass,
-    ttl_secs: jlong,
-) -> jstring {
-    let response = guard(|| crate::blocking::refresh_capability(ttl_secs), panic_envelope);
     out(&mut env, &response)
 }
 
@@ -221,10 +145,8 @@ pub extern "system" fn Java_dev_erisdb_client_ErisDB_nativeNextChange(
     handle: jlong,
     timeout_ms: jlong,
 ) -> jstring {
-    let response = guard(
-        || crate::blocking::next_change(handle as u64, timeout_ms.max(0) as u64),
-        panic_envelope,
-    );
+    let response =
+        guard(|| crate::blocking::next_change(handle as u64, timeout_ms.max(0) as u64), panic_envelope);
     out(&mut env, &response)
 }
 

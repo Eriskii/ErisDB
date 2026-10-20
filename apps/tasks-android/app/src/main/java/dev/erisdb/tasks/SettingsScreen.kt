@@ -22,29 +22,20 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 
 /**
- * Connection settings: which erisdb this phone is paired with, and the
- * three ways to pair it with another.
- *
- * The token is write access to the store, so it is treated like the
- * password it is — masked until asked for, and the window is marked
- * secure while this screen is up, which keeps it out of screenshots and
- * out of the recents-screen thumbnail.
+ * Settings: what this app was granted, which ErisDB it is signed in to, and
+ * signing in again — to ask for what the person did not give the first
+ * time, or to reach a new ErisDB.
  */
 @Composable
 fun SettingsScreen(
-    coreName: String,
-    server: String,
-    token: String,
-    status: String,
-    connecting: Boolean,
+    app: String,
+    server: String?,
+    signIn: SignIn,
     grants: Grants,
-    onTicket: (String) -> Unit,
-    onConnect: (String, String) -> Unit,
-    onErisAuth: (() -> Unit)?,
+    onSignIn: () -> Unit,
+    onCancel: () -> Unit,
     onBack: () -> Unit,
 ) {
-    SecureWindow()
-
     Column(Modifier.fillMaxSize()) {
         Row(
             Modifier.fillMaxWidth().padding(horizontal = 4.dp, vertical = 2.dp),
@@ -64,28 +55,22 @@ fun SettingsScreen(
             Permissions(grants)
 
             Text(
-                "Connection",
+                "ErisDB",
                 style = MaterialTheme.typography.labelLarge,
                 modifier = Modifier.padding(top = 12.dp),
             )
-            PairingPanel(
-                coreName = coreName,
-                server = server,
-                token = token,
-                status = status,
-                connecting = connecting,
-                onTicket = onTicket,
-                onManual = onConnect,
-                onErisAuth = onErisAuth,
-            )
+            server?.let(::serverId)?.let {
+                Text("Signed in to the ErisDB at ${it.take(12)}…", style = MaterialTheme.typography.bodyLarge)
+            }
+            SignInPanel(app = app, state = signIn, signedIn = server != null, onAsk = onSignIn, onCancel = onCancel)
         }
     }
 }
 
 /**
- * What this pairing was actually granted, next to what it asked for.
+ * What this app was actually granted, next to what it asked for.
  *
- * A human answers the pairing prompt and may approve less than the whole
+ * The person answers in ErisAuth and may approve less than the whole
  * manifest, which is a legitimate answer and not an error — so the app
  * says which of its parts are switched off and why, rather than leaving
  * the user to wonder where the Add button went.
@@ -112,7 +97,7 @@ private fun Permissions(grants: Grants) {
     }
     if (missing.isNotEmpty()) {
         Text(
-            "Pair again to ask for the rest — approving is a keystroke on the core.",
+            "Sign in again to ask for the rest; you approve it in ErisAuth.",
             style = MaterialTheme.typography.labelSmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )

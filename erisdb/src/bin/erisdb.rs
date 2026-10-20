@@ -1,9 +1,19 @@
-//! The erisdb CLI: `erisdb serve` runs a core replica; `erisdb mint` cuts tokens.
+//! The erisdb CLI: `erisdb join` takes the core into its owner's mesh,
+//! `erisdb serve` runs a core replica, `erisdb passphrase` keeps the
+//! enrollment passphrase, `erisdb clients` manages installations, and
+//! `erisdb mint` cuts tokens.
 
-use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
-use sqlx::postgres::PgPoolOptions;
+use std::io::{BufRead, IsTerminal};
 use std::path::PathBuf;
+use std::sync::Arc;
+
+use anyhow::{bail, Context, Result};
+use clap::{Parser, Subcommand};
+use erisoverlaynetwork::agent::{self, Answer, Ask};
+use erisoverlaynetwork::mesh::{Config, Local, Node};
+use erisoverlaynetwork::net::Network;
+use sqlx::postgres::PgPoolOptions;
+use sqlx::PgPool;
 
 #[derive(Parser)]
 #[command(name = "erisdb", about = "Stateless personal data core.")]
@@ -12,9 +22,35 @@ struct Cli {
     command: Command,
 }
 
+/// The seeds of the core's identity: the token key, and the Iroh key when
+/// the deployment keeps them apart.
+#[derive(clap::Args)]
+struct Secrets {
+    /// HMAC secret for capability tokens.
+    #[arg(long, env = "ERISDB_SECRET", hide_env_values = true)]
+    secret: String,
+    /// Seed for the Iroh endpoint identity. Defaults to `--secret`, which
+    /// ties the server's key to the token key; set it separately to rotate
+    /// one without moving the other.
+    #[arg(long, env = "ERISDB_IROH_SECRET", hide_env_values = true)]
+    iroh_secret: Option<String>,
+}
+
+impl Secrets {
+    fn iroh_key(&self) -> iroh::SecretKey {
+        erisdb::net::key(
+            self.iroh_secret
+                .as_deref()
+                .unwrap_or(&self.secret)
+                .as_bytes(),
+        )
+    }
+}
+
 #[derive(Subcommand)]
 enum Command {
-    /// Run a core replica: migrate the store, serve TCP and Iroh.
+    /// Run a core replica: migrate the store, join the mesh's node, serve
+    /// TCP and Iroh. Refuses to start before `erisdb join`.
     Serve {
         /// Postgres connection string.
         #[arg(long, env = "DATABASE_URL")]
@@ -23,64 +59,45 @@ enum Command {
         /// bearer tokens in the clear, so anything else wants TLS in front.
         #[arg(long, env = "ERISDB_LISTEN", default_value = "127.0.0.1:7700")]
         listen: String,
-        /// HMAC secret for capability tokens.
-        #[arg(long, env = "ERISDB_SECRET", hide_env_values = true)]
-        secret: String,
-        /// Seed for the Iroh endpoint identity. Defaults to `--secret`, which
-        /// ties the server's address to the token key; set it separately to
-        /// rotate one without moving the other.
-        #[arg(long, env = "ERISDB_IROH_SECRET", hide_env_values = true)]
-        iroh_secret: Option<String>,
-        /// Skip the Iroh endpoint and serve TCP only.
-        #[arg(long)]
-        no_iroh: bool,
+        #[command(flatten)]
+        secrets: Secrets,
+        /// How the core reaches the mesh: `internet`, a relay URL, or
+        /// `loopback` (tests).
+        #[arg(long, env = "ERIS_NETWORK", default_value = "internet")]
+        network: Network,
         /// Directory of one-shot plugin JSON manifests. Executables and
         /// secrets are deployment configuration; plugin calls never touch
         /// the store.
         #[arg(long, env = "ERISDB_PLUGIN_DIR")]
         plugin_dir: Option<PathBuf>,
+        /// Seconds a device waits after its third wrong passphrase in a row;
+        /// each wrong guess after that doubles the wait, up to a day.
+        #[arg(long, env = "ERISDB_LOCKOUT_SECS", default_value_t = 60)]
+        lockout_secs: u64,
+    },
+    /// Ask this machine's ErisAuth to approve the core as the mesh's ErisDB,
+    /// and keep the approval in the store.
+    Join {
+        #[arg(long, env = "DATABASE_URL")]
+        database_url: String,
+        #[command(flatten)]
+        secrets: Secrets,
+        /// What the device shows the person, and the mesh calls this core.
+        #[arg(long, default_value = "ErisDB")]
+        name: String,
+    },
+    /// Set the enrollment passphrase, or unlock devices locked out by
+    /// wrong guesses.
+    Passphrase {
+        #[arg(long, env = "DATABASE_URL")]
+        database_url: String,
+        #[command(subcommand)]
+        action: PassphraseCommand,
     },
     /// Print the iroh endpoint id a core with this secret serves under.
     EndpointId {
-        #[arg(long, env = "ERISDB_SECRET", hide_env_values = true)]
-        secret: String,
-        /// The endpoint seed, if the deployment sets one separately.
-        #[arg(long, env = "ERISDB_IROH_SECRET", hide_env_values = true)]
-        iroh_secret: Option<String>,
-    },
-    /// Pair a client: show a code to scan, then answer what it asks for.
-    ///
-    /// The code grants nothing. A client redeems it, says who it is and
-    /// which permissions it wants, and you decide — so a photographed
-    /// screen is not a leaked capability.
-    Pair {
-        /// The core to run pairing against.
-        #[arg(long, env = "ERISDB_URL", default_value = "http://127.0.0.1:7700")]
-        url: String,
-        /// A label for the human, so the app can name what it paired with.
-        #[arg(long)]
-        name: Option<String>,
-        /// How long the code stays open, in seconds.
-        #[arg(long, default_value_t = 600)]
-        ttl: i64,
-        /// Lifetime of the token an approval issues, in seconds.
-        #[arg(long, default_value_t = 604_800)]
-        token_ttl: i64,
-        /// Also save the QR to this PNG file immediately.
-        #[arg(long)]
-        qr_output: Option<PathBuf>,
-        /// Put this url in the ticket for clients that cannot speak QUIC.
-        /// Browsers need it; phones do not. Defaults to `--url` when that
-        /// is not loopback, since a phone cannot dial your localhost.
-        #[arg(long)]
-        client_url: Option<String>,
-        /// Leave the iroh endpoint id out of the ticket.
-        #[arg(long)]
-        no_iroh: bool,
-        #[arg(long, env = "ERISDB_SECRET", hide_env_values = true)]
-        secret: String,
-        #[arg(long, env = "ERISDB_IROH_SECRET", hide_env_values = true)]
-        iroh_secret: Option<String>,
+        #[command(flatten)]
+        secrets: Secrets,
     },
     /// Inspect, change permissions, or revoke registered app installations.
     Clients {
@@ -99,7 +116,11 @@ enum Command {
         #[arg(long = "grant", required = true, value_delimiter = ',')]
         grants: Vec<String>,
         /// Token lifetime in seconds.
-        #[arg(long, conflicts_with = "no_expiry", required_unless_present = "no_expiry")]
+        #[arg(
+            long,
+            conflicts_with = "no_expiry",
+            required_unless_present = "no_expiry"
+        )]
         ttl: Option<i64>,
         /// How long the token may keep refreshing itself, in seconds.
         /// Defaults to 30 days. After that a human mints a new one — which
@@ -120,15 +141,41 @@ enum Command {
 }
 
 #[derive(Subcommand)]
+enum PassphraseCommand {
+    /// Set the passphrase, replacing any there was. Typed at the terminal,
+    /// or read as one line from standard input.
+    Set,
+    /// Clear one device's wrong guesses (its endpoint id), or every device's.
+    Unlock { device: Option<String> },
+}
+
+#[derive(Subcommand)]
 enum ClientCommand {
     List,
-    Show { id: uuid::Uuid },
+    Show {
+        id: uuid::Uuid,
+    },
     Permissions {
         id: uuid::Uuid,
         #[arg(long = "grant", required = true, value_delimiter = ',')]
         grants: Vec<String>,
     },
-    Revoke { id: uuid::Uuid },
+    Revoke {
+        id: uuid::Uuid,
+    },
+}
+
+async fn store(database_url: &str) -> Result<PgPool> {
+    let pool = PgPoolOptions::new()
+        .max_connections(16)
+        .connect(database_url)
+        .await
+        .context("connecting to the store")?;
+    erisdb::MIGRATOR
+        .run(&pool)
+        .await
+        .context("migrating the store")?;
+    Ok(pool)
 }
 
 #[tokio::main]
@@ -141,20 +188,44 @@ async fn main() -> Result<()> {
         .init();
 
     match Cli::parse().command {
-        Command::Serve { database_url, listen, secret, iroh_secret, no_iroh, plugin_dir } => {
+        Command::Serve {
+            database_url,
+            listen,
+            secrets,
+            network,
+            plugin_dir,
+            lockout_secs,
+        } => {
             let plugins = match plugin_dir {
                 Some(dir) => erisdb::PluginRegistry::load_dir(&dir)
                     .with_context(|| format!("loading plugins from {}", dir.display()))?,
                 None => erisdb::PluginRegistry::empty(),
             };
             tracing::info!(plugins = plugins.len(), "loaded one-shot plugins");
-            let pool = PgPoolOptions::new()
-                .max_connections(16)
-                .connect(&database_url)
-                .await
-                .context("connecting to the store")?;
-            erisdb::MIGRATOR.run(&pool).await.context("migrating the store")?;
-            let secret = secret.into_bytes();
+            let pool = store(&database_url).await?;
+            let key = secrets.iroh_key();
+            let Some(note) = erisdb::mesh::joined(&pool).await? else {
+                bail!("this ErisDB is in no mesh yet: run `erisdb join` where ErisAuth runs, and approve it there");
+            };
+            if note.app() != key.public() {
+                bail!(
+                    "the stored approval is for another key ({}); this secret makes {}. Run `erisdb join` again",
+                    note.app(),
+                    key.public()
+                );
+            }
+            let endpoint = erisoverlaynetwork::net::endpoint(key, &network).await?;
+            let node = Node::start(Config {
+                endpoint: endpoint.clone(),
+                network,
+                local: Local::App(note),
+                store: Arc::new(erisdb::mesh::PgStore::new(pool.clone())),
+            })
+            .await
+            .context("starting the mesh node")?;
+            let mesh = erisdb::mesh::Mesh::new(node.clone());
+            tracing::info!(mesh = ?node.mesh(), "iroh endpoint id: {}", endpoint.id());
+
             let listener = tokio::net::TcpListener::bind(&listen).await?;
             let bound = listener.local_addr()?;
             // Plugins run beside the core, so they reach it on loopback when
@@ -166,8 +237,11 @@ async fn main() -> Result<()> {
                     std::net::SocketAddr::V6(_) => std::net::Ipv6Addr::LOCALHOST.into(),
                 });
             }
-            let plugins = plugins.reachable_at(&format!("http://{reachable}"));
-            let app = erisdb::app_with_plugins(pool, secret.clone(), plugins);
+            let app = erisdb::AppState::new(pool.clone(), secrets.secret.into_bytes())
+                .with_plugins(plugins.reachable_at(&format!("http://{reachable}")))
+                .with_mesh(mesh.clone())
+                .with_lockout(std::time::Duration::from_secs(lockout_secs))
+                .router();
 
             tracing::info!("tcp: http://{bound}");
             if !bound.ip().is_loopback() {
@@ -176,111 +250,186 @@ async fn main() -> Result<()> {
                      this socket in the clear. Put TLS in front of it, or serve over iroh."
                 );
             }
-
             // Connect info feeds source.addr stamping on TCP writes.
             let tcp = app
                 .clone()
                 .into_make_service_with_connect_info::<std::net::SocketAddr>();
-            if no_iroh {
-                axum::serve(listener, tcp).await?;
-            } else {
-                let seed = iroh_secret.as_ref().map(String::as_bytes).unwrap_or(&secret);
-                let ep = erisdb::net::endpoint(seed).await?;
-                tracing::info!("iroh endpoint id: {}", ep.id());
-                let addr = erisdb::net::advertised_addr(&ep).await?;
-                tracing::info!("iroh addr: {addr:?}");
-                tokio::select! {
-                    r = axum::serve(listener, tcp) => r?,
-                    r = erisdb::net::serve(ep, app) => r?,
+            tokio::spawn(erisdb::mesh::watch(mesh, pool));
+            let mut terminate =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+            tokio::select! {
+                r = axum::serve(listener, tcp) => r?,
+                r = erisdb::net::serve(endpoint.clone(), app, node.protocol()) => r?,
+                // Told to stop, the core closes its endpoint, so that everyone connected to it
+                // hears so at once rather than when their connections time out.
+                _ = tokio::signal::ctrl_c() => {
+                    node.shutdown().await;
+                    endpoint.close().await;
+                }
+                _ = terminate.recv() => {
+                    node.shutdown().await;
+                    endpoint.close().await;
+                }
+                _ = node.closed() => bail!(
+                    "the iroh endpoint closed by itself (its sockets failed, as after a network change it could \
+                     not rebind to); start erisdb again"
+                ),
+            }
+        }
+        Command::Join {
+            database_url,
+            secrets,
+            name,
+        } => {
+            let pool = store(&database_url).await?;
+            let app = secrets.iroh_key().public();
+            let Some(mut erisauth) = agent::connect().await? else {
+                bail!("no ErisAuth is listening here ($XDG_RUNTIME_DIR/erisauth/agent.sock): run this where ErisAuth runs");
+            };
+            let ask = Ask {
+                service: erisdb::SERVICE.into(),
+                name,
+                grants: Vec::new(),
+                serves: true,
+                app,
+            };
+            println!("Asking ErisAuth to make {app} this mesh's ErisDB. Approve it on the device.");
+            let answer = tokio::select! {
+                answer = erisauth.approve(&ask) => answer?,
+                _ = tokio::signal::ctrl_c() => bail!("cancelled; the request is withdrawn"),
+            };
+            match answer {
+                Answer::Approved { note, snapshot } => {
+                    erisdb::mesh::join(&pool, &note, &snapshot).await?;
+                    let list = snapshot.list()?;
+                    let device = list
+                        .member(&note.device())
+                        .map(|m| m.name.clone())
+                        .unwrap_or_default();
+                    println!(
+                        "Joined mesh {}: {device} approved this ErisDB.",
+                        snapshot.mesh
+                    );
+                }
+                Answer::Denied(why) => bail!("ErisAuth said no: {why}"),
+            }
+        }
+        Command::Passphrase {
+            database_url,
+            action,
+        } => {
+            let pool = store(&database_url).await?;
+            match action {
+                PassphraseCommand::Set => {
+                    let passphrase = read_passphrase()?;
+                    erisdb::passphrase::set(&pool, &passphrase).await?;
+                    println!("Passphrase set. Devices type it to let apps into ErisDB.");
+                }
+                PassphraseCommand::Unlock { device } => {
+                    let device = device
+                        .map(|d| {
+                            d.parse::<erisoverlaynetwork::DeviceId>()
+                                .context("DEVICE is a 64-hex endpoint id")
+                        })
+                        .transpose()?;
+                    let cleared = erisdb::passphrase::unlock(&pool, device.as_ref()).await?;
+                    println!(
+                        "Cleared the wrong guesses of {cleared} device{}.",
+                        if cleared == 1 { "" } else { "s" }
+                    );
                 }
             }
         }
-        Command::EndpointId { secret, iroh_secret } => {
-            let seed = iroh_secret.as_deref().unwrap_or(&secret);
-            println!("{}", erisdb::net::endpoint_id(seed.as_bytes()));
+        Command::EndpointId { secrets } => {
+            println!("{}", secrets.iroh_key().public());
         }
-        Command::Pair { url, name, ttl, token_ttl, qr_output, client_url, no_iroh, secret, iroh_secret } => {
-            let base = url.trim_end_matches('/').to_string();
-            let eid = (!no_iroh).then(|| {
-                let seed = iroh_secret.as_deref().unwrap_or(&secret);
-                erisdb::net::endpoint_id(seed.as_bytes()).to_string()
-            });
-            // Inspect the actual host: substring checks miss IPv6 and
-            // 127/8 addresses, and misclassify names such as localhost.example.
-            let endpoint = reqwest::Url::parse(&base).context("invalid core URL")?;
-            let loopback = endpoint.host_str().is_some_and(|host| {
-                host.eq_ignore_ascii_case("localhost") || host.trim_matches(['[', ']'])
-                    .parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
-            });
-            let ticket_url = client_url.or_else(|| (!loopback).then(|| base.clone()));
-            if eid.is_none() && ticket_url.is_none() {
-                anyhow::bail!("--no-iroh against a loopback core leaves the ticket with no address a client could dial; pass --client-url");
-            }
-            // The CLI holds the secret, so it signs itself the short-lived
-            // token it needs to drive pairing over the ordinary API — the
-            // same one a dashboard would use.
-            let admin = erisdb::auth::mint(
-                secret.as_bytes(),
-                &["*"],
-                Some(ttl.clamp(60, 3600) + 300),
-                None,
-            )?;
-
-            let http = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build()?;
-            let cut: serde_json::Value = http
-                .post(format!("{base}/v1/pairings"))
-                .bearer_auth(&admin)
-                .json(&serde_json::json!({ "ttl_secs": ttl }))
-                .send()
-                .await
-                .with_context(|| format!("reaching a core at {base} — is it running?"))?
-                .error_for_status()?
-                .json()
-                .await
-                .context("reading the pairing the core cut")?;
-            let id = cut["id"].as_str().context("the core returned no pairing id")?.to_string();
-            let code = cut["secret"].as_str().context("the core returned no code")?.to_string();
-
-            let ticket = erislogin::ticket::Ticket::new(code, eid, ticket_url, name)?;
-            if let Err(error) = erisdb::pair::run(&http, &base, &admin, &id, &ticket, token_ttl, qr_output.as_deref()).await {
-                let _ = http.post(format!("{base}/v1/pairings/{id}/deny")).bearer_auth(&admin).send().await;
-                return Err(error);
-            }
-        }
-        Command::Clients { url, secret, action } => {
+        Command::Clients {
+            url,
+            secret,
+            action,
+        } => {
             let base = url.trim_end_matches('/');
             let token = erisdb::auth::mint(secret.as_bytes(), &["*"], Some(300), None)?;
-            let http = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build()?;
+            let http = reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()?;
             let request = match action {
                 ClientCommand::List => http.get(format!("{base}/v1/clients")),
                 ClientCommand::Show { id } => http.get(format!("{base}/v1/clients/{id}")),
                 ClientCommand::Revoke { id } => http.post(format!("{base}/v1/clients/{id}/revoke")),
                 ClientCommand::Permissions { id, grants } => {
-                    let current: serde_json::Value = http.get(format!("{base}/v1/clients/{id}"))
-                        .bearer_auth(&token).send().await?.error_for_status()?.json().await?;
-                    http.put(format!("{base}/v1/clients/{id}"))
-                        .json(&serde_json::json!({ "grants": grants, "revision": current["revision"] }))
+                    let current: serde_json::Value = http
+                        .get(format!("{base}/v1/clients/{id}"))
+                        .bearer_auth(&token)
+                        .send()
+                        .await?
+                        .error_for_status()?
+                        .json()
+                        .await?;
+                    http.put(format!("{base}/v1/clients/{id}")).json(
+                        &serde_json::json!({ "grants": grants, "revision": current["revision"] }),
+                    )
                 }
             };
             let response = request.bearer_auth(&token).send().await?;
             let status = response.status();
             let body: serde_json::Value = response.json().await?;
-            anyhow::ensure!(status.is_success(), "client operation refused ({status}): {body}");
+            anyhow::ensure!(
+                status.is_success(),
+                "client operation refused ({status}): {body}"
+            );
             println!("{}", serde_json::to_string_pretty(&body)?);
         }
-        Command::Mint { grants, ttl, max_ttl, no_expiry, user, secret } => {
+        Command::Mint {
+            grants,
+            ttl,
+            max_ttl,
+            no_expiry,
+            user,
+            secret,
+        } => {
             let grants: Vec<&str> = grants.iter().map(String::as_str).collect();
             // `--ttl 0` reads like "forever" and means "already expired": the
             // token would carry exp == now and be refused on first use. Say so
             // rather than handing over something that cannot work.
             if ttl.is_some_and(|t| t <= 0) {
-                anyhow::bail!("--ttl must be positive; for a token that never expires use --no-expiry");
+                bail!("--ttl must be positive; for a token that never expires use --no-expiry");
             }
             let ttl = if no_expiry { None } else { ttl };
-            let token =
-                erisdb::auth::mint_chain(secret.as_bytes(), &grants, ttl, max_ttl, user.as_deref())?;
+            let token = erisdb::auth::mint_chain(
+                secret.as_bytes(),
+                &grants,
+                ttl,
+                max_ttl,
+                user.as_deref(),
+            )?;
             println!("{token}");
         }
     }
     Ok(())
+}
+
+/// The new passphrase: typed twice without echo when standard input is a
+/// terminal, or one line of standard input when it is not.
+fn read_passphrase() -> Result<String> {
+    if std::io::stdin().is_terminal() {
+        // Standard input itself, not the controlling terminal: a launcher may
+        // run this in a session of its own, which has none.
+        let ask = |prompt: &str| {
+            let config = rpassword::ConfigBuilder::new()
+                .input_file_path("/dev/stdin")
+                .output_file_path("/dev/stderr")
+                .build();
+            rpassword::prompt_password_with_config(prompt, config)
+        };
+        let first = ask("New passphrase: ")?;
+        erisdb::passphrase::validate(&first)?;
+        if ask("Again: ")? != first {
+            bail!("the two did not match; nothing changed");
+        }
+        return Ok(first);
+    }
+    let mut line = String::new();
+    std::io::stdin().lock().read_line(&mut line)?;
+    Ok(line.trim_end_matches(['\r', '\n']).to_string())
 }

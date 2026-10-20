@@ -11,8 +11,8 @@ The implementation examples below show how the included clients use those routes
 | [Capabilities](capabilities.md) | Token format, delegation, expiry, and refresh. |
 | [Facets](facets.md) | Data schemas, validation, and the task and list definitions. |
 | [Change feed](change-feed.md) | Polling, SSE, history, and revert. |
-| [Installations](clients.md) | Identity, permission changes, renewal, and revocation. |
-| [Pairing](pairing.md) | QR codes, deep links, pasted tickets, and approval. |
+| [The mesh](mesh.md) | How ErisDB joins its owner's mesh, the passphrase, and how apps get in through a device. |
+| [Installations](clients.md) | The app's key as its credential, permission changes, and revocation by the operator or the mesh. |
 | [Client development](client-development.md) | Calling the server and keeping a local cache. |
 | [Operations](operations.md) | Configuration, database initialization, backups, transport, and deployment. |
 | [Plugins](plugins.md) | Implemented executable operations and their process protocol. |

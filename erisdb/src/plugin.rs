@@ -241,13 +241,17 @@ impl PluginRegistry {
                 exp: Some(exp),
                 user: Some(format!("plugin:{}", plugin.name)),
                 max_exp: Some(exp),
-                pair: None,
                 client: None,
             };
             let url = self.core_url.as_deref().ok_or_else(|| {
-                Error::PluginUnavailable(format!("plugin {plugin_name:?} has grants, but no address to use them at"))
+                Error::PluginUnavailable(format!(
+                    "plugin {plugin_name:?} has grants, but no address to use them at"
+                ))
             })?;
-            Some(CoreAccess { url, token: crate::auth::mint_capability(secret, &own)? })
+            Some(CoreAccess {
+                url,
+                token: crate::auth::mint_capability(secret, &own)?,
+            })
         };
         let invocation = Invocation {
             protocol: PLUGIN_PROTOCOL,
