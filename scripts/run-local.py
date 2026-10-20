@@ -173,8 +173,10 @@ def launch(args, resources):
     for executable in ("cargo", "docker"):
         if not shutil.which(executable):
             raise RuntimeError(f"Install {executable} first; see README.md.")
-    # Refuse an occupied API port before starting or stopping any service.
+    # Refuse an occupied API port before starting or stopping any service. The server reuses an
+    # address its last run left waiting to close, so the check does too.
     with socket.socket() as probe:
+        probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         probe.bind(("127.0.0.1", args.port))
     directory = args.data_dir.expanduser().resolve()
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
