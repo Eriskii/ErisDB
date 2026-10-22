@@ -6,7 +6,7 @@ import org.json.JSONArray
 
 // What this app may do is decided by a person, not by this app.
 //
-// Signing in asks ErisAuth for a set of grants and the person answers —
+// Signing in asks ErisOverlayNetwork for a set of grants and the person answers —
 // with all of it, some of it, or no. So "what I asked for" and "what I hold" are two
 // different things, and every button that writes goes through `can`.
 //
@@ -16,7 +16,7 @@ import org.json.JSONArray
 // refuse. Anything else is a 403 the user did not deserve.
 
 /**
- * The grants this app asks ErisAuth for when it signs in.
+ * The grants this app asks ErisOverlayNetwork for when it signs in.
  *
  * Asking is free and the answer is a person, so the list is exactly what
  * the app uses and nothing wider. `create` and `update` are separate

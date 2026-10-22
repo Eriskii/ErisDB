@@ -1,7 +1,8 @@
 # erisdb-web
 
-ErisDB for browser apps, as WebAssembly. An app signs in by a ticket from ErisAuth and calls
-ErisDB over Iroh, through a relay, as its own key. Tasks and Lists (`apps/`) load it from
+ErisDB for browser apps, as WebAssembly. An app signs in by a ticket from `eon` and calls
+the mesh's database, `database/1`, which ErisDB serves, over Iroh, through a relay, as its own
+key. Tasks and Lists (`apps/`) load it from
 `apps/shared/erisdb-web/`.
 
 - **The key.** An app is a key: 32 bytes the page makes once and keeps (Tasks and Lists keep
@@ -11,16 +12,18 @@ ErisDB over Iroh, through a relay, as its own key. Tasks and Lists (`apps/`) loa
   homed on the first relay it needs, with no other way out, as the mesh's `Network::Relay`
   does. Signing in goes through the relay the ticket names; calling ErisDB, through the one
   the mesh's snapshot names for it.
-- **Signing in.** The person opens a ticket in ErisAuth on a device of the mesh (**Add a
-  browser app**, or `erisauth add-app`). The client redeems it over `eris-pair/0`, asking for
-  a note for `erisdb` with the app's grants, not serving, and computes the request's
+- **Signing in.** The person opens a ticket in `eon` on a device of the mesh (**Add a
+  browser app**, or `eon add-app`). The client redeems it over `eris-pair/0`, asking for
+  a note to use `database/1` with the app's grants, serving nothing
+  (`{"name", "uses": {"database/1": grants}, "serves": []}`), and computes the request's
   fingerprint itself; the device shows the same one. The person compares them and approves
   on the device with ErisDB's passphrase, and the device enrolls the note at ErisDB before it
   approves. The client then collects the note and a snapshot of the mesh, checking that the
   note is for this key, from the device that showed the ticket, and counts in that mesh.
-- **Calling ErisDB.** ErisDB is the app approved to serve `erisdb` in the snapshot. Each
-  request is one HTTP/1.1 exchange (hyper's client connection) on a QUIC stream of its own,
-  under ALPN `erisdb/0`, carrying no token. A failed request is sent again on a fresh
+- **Calling ErisDB.** The database is the app the snapshot shows approved to serve
+  `database/1`, the most recently approved. Each request is one HTTP/1.1 exchange (hyper's
+  client connection) on a QUIC stream of its own, under ALPN `eris/database/1`, carrying no
+  token. A failed request is sent again on a fresh
   connection only when nothing of it was sent, or when its method changes nothing.
 - **The change feed.** `/v1/changes/stream` on a stream of its own, read as server-sent
   events and handed over one change row at a time. ErisDB closes it when it stops letting
@@ -67,7 +70,7 @@ a 401 means ErisDB no longer lets the app in. What fails otherwise throws an `Er
 | `bad_key`     | The key is not 32 bytes                                                            |
 | `bad_ticket`  | Not an `eris://pair/` ticket, or a damaged one                                     |
 | `no_relay`    | The ticket, or the mesh for its ErisDB, names no relay a browser could reach it by |
-| `no_erisdb`   | The snapshot holds no ErisDB                                                       |
+| `no_database` | The snapshot holds no database, nothing serving `database/1`                       |
 | `unreachable` | The device or ErisDB could not be reached, or stopped answering                    |
 | `used`        | The ticket was redeemed already                                                    |
 | `expired`     | The ticket ended, or no longer works                                               |
@@ -97,11 +100,11 @@ builds inside the Eris monorepo, whose Cargo configuration supplies ErisOverlayN
 ## Testing
 
 The browser suite runs Tasks and Lists in Chromium against real processes: an Iroh relay in
-plain-HTTP mode on loopback ([`tests/browser/relay`](../../tests/browser/relay)), ErisAuth as
+plain-HTTP mode on loopback ([`tests/browser/relay`](../../tests/browser/relay)), `eon` as
 the person's device starting a mesh, ErisDB's core on PostgreSQL in Docker, joined to the
 mesh through that device with its passphrase set, and the static apps. Every participant
 reaches the others through the relay alone (`ERIS_NETWORK`). The tests act as the person
-through ErisAuth's socket and look at what ErisDB holds as its operator. They cover signing
+through `eon`'s socket and look at what ErisDB holds as its operator. They cover signing
 in by ticket with the fingerprint on both screens, a reload while the person decides, a
 wrong passphrase and then the right one, part of the grants approved, the person saying no,
 create, update and delete, a change from another client arriving live, writes waiting while
@@ -112,9 +115,9 @@ npm ci && npx playwright install chromium
 npm run test:e2e
 ```
 
-It needs Docker and a Rust toolchain, and builds the relay, ErisDB's core and ErisAuth on its
-first run: ErisAuth from `ERISAUTH_SOURCE` (`../ErisAuth` beside this checkout by default),
-or ready-built from `ERISAUTH_BIN`; `ERISDB_BIN` and `ERISDB_RELAY_BIN` do the same for the
+It needs Docker and a Rust toolchain, and builds the relay, ErisDB's core and `eon` on its
+first run: `eon` from `EON_SOURCE` (`../ErisOverlayNetwork` beside this checkout by default),
+or ready-built from `EON_BIN`; `ERISDB_BIN` and `ERISDB_RELAY_BIN` do the same for the
 others. `ERISDB_CHROMIUM` names a Chromium to run instead of Playwright's, as on NixOS:
 `ERISDB_CHROMIUM=$(command -v chromium) npm run test:e2e`. It tests the client as built into
 `apps/shared/erisdb-web/`, so rebuild after changing the crate.

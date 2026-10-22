@@ -1201,8 +1201,8 @@ dependencies = [
 
 [[package]]
 name = "erisoverlaynetwork"
-version = "0.2.0"
-source = "git+https://github.com/Eriskii/ErisOverlayNetwork?tag=v0.2.0#534a11b735d485ee1747ced62ff50bfd2e4011ad"
+version = "0.3.0"
+source = "git+https://github.com/Eriskii/ErisOverlayNetwork?tag=v0.3.0#a7c0dea4e823bc26ecd053ab9fdd9a21b470ff7a"
 dependencies = [
  "base64 0.22.1",
  "getrandom 0.3.4",

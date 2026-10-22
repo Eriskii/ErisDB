@@ -3,8 +3,8 @@
 An **installation** is an app its owner's mesh let in: the app's Iroh key, the
 device that approved it, and the note the device approved it with. A device
 creates one by enrolling the app with ErisDB's passphrase; [the mesh](mesh.md)
-describes how. Its grants are the note's, or fewer once the operator narrows
-them.
+describes how. Its grants are the note's grants in `database/1`, or fewer once
+the operator narrows them.
 
 Postgres owns each installation's status and grants; the core's copy of the
 mesh's device list owns whether its device is still a member and its note still
@@ -33,9 +33,10 @@ stays revoked: enrolling the app again creates a new one, with a new id.
 
 ## Transport
 
-Apps reach ErisDB over Iroh, ALPN `erisdb/0`, which supplies its own mutually
-authenticated encryption and needs no open port, proxy or certificate. They find
-it as the app the mesh approved to serve `erisdb` and dial its endpoint id.
+Apps reach ErisDB over Iroh, ALPN `eris/database/1`, which supplies its own
+mutually authenticated encryption and needs no open port, proxy or certificate.
+They find it as the app the mesh most recently approved to serve `database/1`
+and dial its endpoint id.
 
 The TCP listener carries bearer tokens only: operator and minted tokens, the
 poker's, plugins'. Keep it on loopback, and put a local TLS reverse proxy in
@@ -88,7 +89,7 @@ Rotating `ERISDB_SECRET` invalidates token signatures and leaves installations
 working, since apps hold no tokens. Unless `ERISDB_IROH_SECRET` is set
 separately, it also changes the core's Iroh key, which is what its note
 approves: the core refuses to serve until it joins the mesh again, and every app
-then finds it anew as the mesh's ErisDB. Keep the Iroh seed separate when the
+then finds it anew as the mesh's database. Keep the Iroh seed separate when the
 signing key must rotate on its own.
 
 Restore `clients`, `items`, `mesh` and `passphrase` from the same Postgres

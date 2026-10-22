@@ -10,6 +10,7 @@ use std::sync::Arc;
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use erisoverlaynetwork::agent::{self, Answer, Ask};
+use erisoverlaynetwork::enroll::EnrollService;
 use erisoverlaynetwork::mesh::{Config, Local, Node};
 use erisoverlaynetwork::net::Network;
 use sqlx::postgres::PgPoolOptions;
@@ -75,7 +76,7 @@ enum Command {
         #[arg(long, env = "ERISDB_LOCKOUT_SECS", default_value_t = 60)]
         lockout_secs: u64,
     },
-    /// Ask this machine's ErisAuth to approve the core as the mesh's ErisDB,
+    /// Ask this machine's eon to approve the core as the mesh's database,
     /// and keep the approval in the store.
     Join {
         #[arg(long, env = "DATABASE_URL")]
@@ -205,7 +206,7 @@ async fn main() -> Result<()> {
             let pool = store(&database_url).await?;
             let key = secrets.iroh_key();
             let Some(note) = erisdb::mesh::joined(&pool).await? else {
-                bail!("this ErisDB is in no mesh yet: run `erisdb join` where ErisAuth runs, and approve it there");
+                bail!("this ErisDB is in no mesh yet: run `erisdb join` where eon runs, and approve it there");
             };
             if note.app() != key.public() {
                 bail!(
@@ -224,6 +225,11 @@ async fn main() -> Result<()> {
             .await
             .context("starting the mesh node")?;
             let mesh = erisdb::mesh::Mesh::new(node.clone());
+            let gate = erisdb::enroll::Gate::new(
+                pool.clone(),
+                std::time::Duration::from_secs(lockout_secs),
+            );
+            let enrolling = EnrollService::new(node.clone(), Arc::new(gate));
             tracing::info!(mesh = ?node.mesh(), "iroh endpoint id: {}", endpoint.id());
 
             let listener = tokio::net::TcpListener::bind(&listen).await?;
@@ -240,7 +246,6 @@ async fn main() -> Result<()> {
             let app = erisdb::AppState::new(pool.clone(), secrets.secret.into_bytes())
                 .with_plugins(plugins.reachable_at(&format!("http://{reachable}")))
                 .with_mesh(mesh.clone())
-                .with_lockout(std::time::Duration::from_secs(lockout_secs))
                 .router();
 
             tracing::info!("tcp: http://{bound}");
@@ -259,7 +264,7 @@ async fn main() -> Result<()> {
                 tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
             tokio::select! {
                 r = axum::serve(listener, tcp) => r?,
-                r = erisdb::net::serve(endpoint.clone(), app, node.protocol()) => r?,
+                r = erisdb::net::serve(endpoint.clone(), app, node.protocol(), enrolling) => r?,
                 // Told to stop, the core closes its endpoint, so that everyone connected to it
                 // hears so at once rather than when their connections time out.
                 _ = tokio::signal::ctrl_c() => {
@@ -283,19 +288,18 @@ async fn main() -> Result<()> {
         } => {
             let pool = store(&database_url).await?;
             let app = secrets.iroh_key().public();
-            let Some(mut erisauth) = agent::connect().await? else {
-                bail!("no ErisAuth is listening here ($XDG_RUNTIME_DIR/erisauth/agent.sock): run this where ErisAuth runs");
+            let Some(mut eon) = agent::connect().await? else {
+                bail!("no eon is listening here ($XDG_RUNTIME_DIR/eon/agent.sock): run this where eon runs");
             };
             let ask = Ask {
-                service: erisdb::SERVICE.into(),
                 name,
-                grants: Vec::new(),
-                serves: true,
+                uses: Default::default(),
+                serves: vec![erisdb::serves()],
                 app,
             };
-            println!("Asking ErisAuth to make {app} this mesh's ErisDB. Approve it on the device.");
+            println!("Asking eon to make {app} this mesh's database. Approve it on the device.");
             let answer = tokio::select! {
-                answer = erisauth.approve(&ask) => answer?,
+                answer = eon.approve(&ask) => answer?,
                 _ = tokio::signal::ctrl_c() => bail!("cancelled; the request is withdrawn"),
             };
             match answer {
@@ -311,7 +315,7 @@ async fn main() -> Result<()> {
                         snapshot.mesh
                     );
                 }
-                Answer::Denied(why) => bail!("ErisAuth said no: {why}"),
+                Answer::Denied(why) => bail!("eon said no: {why}"),
             }
         }
         Command::Passphrase {

@@ -2,7 +2,7 @@
 
 The lists client as an Android app, speaking erisdb's native transport:
 Iroh QUIC, HTTP/1.1 per bi-stream, no IP or port configured anywhere. It
-gets into ErisDB through [ErisAuth](https://github.com/Eriskii/ErisAuth) on
+gets into ErisDB through [ErisOverlayNetwork](https://github.com/Eriskii/ErisOverlayNetwork) on
 the phone, and its own Iroh key is its credential from then on.
 
 ## Shape
@@ -17,8 +17,8 @@ the phone, and its own Iroh key is its credential from then on.
   `Core.kt` wraps it in the `CoreApi` interface the rest of the app is
   written against, `Sync.kt` is the read path, `Outbox.kt` the write path,
   `Secrets.kt` the sealed key and the ErisDB it was let into, `SignIn.kt`
-  the conversation with ErisAuth and `SignInScreen.kt` its screen. ErisAuth's
-  client library is vendored there as it is, in `dev.eris.auth.client`.
+  the conversation with ErisOverlayNetwork and `SignInScreen.kt` its screen. ErisOverlayNetwork's
+  client library is vendored there as it is, in `dev.eris.eon.client`.
 - **Kotlin shell** — `Store.kt` is the persistence, `Grants.kt` the
   permission grammar and what this app asks for, `Facet.kt` the
   registration; `ListsApp.kt` wires them to the screens — sign-in, list
@@ -28,9 +28,9 @@ the phone, and its own Iroh key is its credential from then on.
 
 The application ID is `dev.erisdb.lists`.
 The source namespace is `dev.erisdb.lists`. The phone mints a random 32-byte
-Iroh key on first launch and keeps it: it is the key ErisAuth approves and
+Iroh key on first launch and keeps it: it is the key ErisOverlayNetwork approves and
 ErisDB lets in, and `source.addr` names it. The client string is
-`Lists (Android) v0.5` — the name the person reads on ErisAuth's prompt.
+`Lists (Android) v0.5` — the name the person reads on ErisOverlayNetwork's prompt.
 
 ## The facet
 
@@ -157,30 +157,33 @@ android.aapt2FromMavenOverride=/path/to/patched/aapt2
 
 ## Signing in
 
-The app gets into ErisDB through ErisAuth on the phone, and only so. The
-phone is a device of its owner's mesh, the mesh has an ErisDB, and ErisAuth
-holds the phone's place in it. Without ErisAuth the app's first screen says
+The app gets into ErisDB through ErisOverlayNetwork on the phone, and only so. The
+phone is a device of its owner's mesh, and ErisOverlayNetwork holds the phone's place
+in it. The app asks for a database, the capability `database/1`, not for a
+program: ErisDB is what serves `database/1` in the mesh, one per mesh, the
+most recently approved, and it takes a passphrase. Without ErisOverlayNetwork the app's first screen says
 to install it and add the phone to the mesh with it; there is no other way
 in.
 
-1. The app binds ErisAuth's `dev.eris.auth.SIGN_IN` service and asks it to
-   approve its key — its endpoint id, from `nativeEndpointId` — for the
-   service `erisdb`, as a client (`serves` false), under its client string,
-   with its manifest. It asks on its first launch, and again whenever the
-   person taps **Sign in with ErisAuth**.
-2. ErisAuth shows the person a prompt naming the app as Android names it,
+1. The app binds ErisOverlayNetwork's `dev.eris.eon.SIGN_IN` service and asks it to
+   approve its key — its endpoint id, from `nativeEndpointId` — under its
+   client string, to use `database/1` with its manifest as the grants there
+   (`"uses":{"database/1":[…]}`), serving nothing. It asks on its first launch, and again whenever the
+   person taps **Sign in with ErisOverlayNetwork**.
+2. ErisOverlayNetwork shows the person a prompt naming the app as Android names it,
    by its package and the SHA-256 of its signing certificate. They approve
    all of the manifest or part of it, and type ErisDB's passphrase.
-   ErisAuth signs the app's note and enrolls it at the mesh's ErisDB, which
-   checks the passphrase.
-3. Once ErisDB has taken the note, ErisAuth answers with it and a snapshot
+   ErisOverlayNetwork signs the app's note and brings it, with the passphrase, to the
+   mesh's ErisDB over the mesh's enroll protocol; ErisDB checks the
+   passphrase.
+3. Once ErisDB has taken the note, ErisOverlayNetwork answers with it and a snapshot
    of the mesh. `nativeLocate` reads where ErisDB is from the snapshot; the
    app seals that beside its key before anything else, then `nativeDial`s it.
 4. `GET /v1/permissions`, because the approval may be narrower than the
    request. See **Permissions**.
 
 Every later launch dials the ErisDB it kept, as its key, with nothing else.
-A denial, or a failure such as a phone in no mesh or a mesh with no ErisDB,
+A denial, or a failure such as a phone in no mesh or a mesh with no database,
 is said on the sign-in screen, with **Ask again**. Settings names the ErisDB
 the app is signed in to and signs in again, to ask for what the person did
 not give the first time or to reach a new ErisDB; a new ErisDB drops the
@@ -191,8 +194,8 @@ the mesh and its note is not revoked. When any of that ends the next request
 is refused with 401, the status line says ErisDB no longer lets the app in,
 and only signing in again brings it back.
 
-The app's half of ErisAuth's protocol is ErisAuth's client library,
-vendored in `android-shared` (`dev.eris.auth.client`); `SignIn.kt` is the
+The app's half of ErisOverlayNetwork's protocol is ErisOverlayNetwork's client library,
+vendored in `android-shared` (`dev.eris.eon.client`); `SignIn.kt` is the
 conversation and what its answers come to.
 
 ## Permissions
@@ -205,7 +208,7 @@ grant's final segment, all remaining ones — which is why `*` means
 everything, `meta:*` reaches `meta:clients:revoke`, and `*:read` does
 **not** reach `meta:facets:read`.
 
-The manifest is what this app asks ErisAuth for when it signs in:
+The manifest is what this app asks ErisOverlayNetwork for when it signs in:
 
 | grant          | what it buys |
 |----------------|--------------|
@@ -235,7 +238,7 @@ lost its permissions. Saved permissions are refreshed on the next connection.
 ## Tests on a device
 
 `tests/android/run.sh` drives both actual APKs on an isolated emulator through
-ADB, signing in through a real ErisAuth on the emulator to a real ErisDB in a
+ADB, signing in through a real ErisOverlayNetwork on the emulator to a real ErisDB in a
 real mesh. Unit fixtures do not establish transport or security guarantees; the
 device and Rust integration suites exercise those boundaries.
 

@@ -19,7 +19,7 @@ object ErisDB {
 
     private external fun nativeRequest(method: String, path: String, body: String?): String?
 
-    /** The endpoint id the key dials as, in hex — the `app` this app asks ErisAuth to
+    /** The endpoint id the key dials as, in hex — the `app` this app asks ErisOverlayNetwork to
      * approve — or null when the key is not 64 hex characters. */
     fun endpointId(keyHex: String): String? = nativeEndpointId(keyHex)?.ifEmpty { null }
 

@@ -19,15 +19,17 @@ executables for non-durable calls into external systems.
   `facet`: registering one is a `POST /v1/items`, no deploy. Writes to a
   strict facet are validated against its JSON Schema, and the schema
   version lives in the body so a grant survives it moving.
-- **Mesh** — the owner's devices, each running ErisAuth, keeping one signed
-  list of who is in. ErisDB is an app in it, the one approved to serve
-  `erisdb`: a mesh has one, and approving another revokes this one's approval.
-  Its node keeps the list current. See [the mesh](../docs/mesh.md).
+- **Mesh** — the owner's devices, each running `eon`, keeping one signed list
+  of who is in. Apps in it ask for **capabilities**, a kind and a version, not
+  for programs. ErisDB is an app in it approved to serve `database/1`, single
+  and with a passphrase: a mesh has one database, and approving another revokes
+  this one's approval. Its node keeps the list current. See
+  [the mesh](../docs/mesh.md).
 - **Client** — a separate application that calls the server.
-- **Installation** — an app a device let in: its Iroh key, the device, and
-  the note the device approved it with. The person approves on the device and
-  types ErisDB's passphrase; the device enrolls the app here. Its key is its
-  only credential. Postgres stores its grants and revocation; the mesh decides
+- **Installation** — an app a device let in to use `database/1`: its Iroh key,
+  the device, and the note the device approved it with. The person approves on
+  the device and types ErisDB's passphrase; the device enrolls the app here. Its
+  key is its only credential. Postgres stores its grants and revocation; the mesh decides
   whether its device and note still count.
 - **Plugin** — an operator-installed executable described by a manifest. One
   call starts one fresh process and streams its stdout; it never listens,
@@ -84,8 +86,6 @@ GET    /v1/permissions              what this caller holds             none
 GET    /v1/plugins                  callable operation schemas         any caller
 POST   /v1/call                     one fresh executable, streamed     manifest permission
 GET    /v1/server                   version, counts, live limits       meta:server:read
-POST   /v1/enroll                   {note, passphrase} — let an app in a device of the mesh
-POST   /v1/passphrase               {current, new}                     a device of the mesh
 GET    /v1/clients, /v1/clients/{id}                                  meta:clients:read
 PUT    /v1/clients/{id}             {grants, revision}                 meta:clients:write
 POST   /v1/clients/{id}/revoke                                        meta:clients:revoke
@@ -141,9 +141,10 @@ not cover the item's facet. That tells a caller holding the wrong token
 something true about an id it already has; item ids are v4 UUIDs, so it is
 not a way to find one.
 
-The same router is served over plain TCP and over Iroh (ALPN `erisdb/0`,
+The same router is served over plain TCP and over Iroh (ALPN `eris/database/1`,
 HTTP/1.1 per QUIC bi-stream), so an ErisDB is dialable from anywhere without
-exposing a port; the mesh's protocol, `eris-mesh/0`, shares the endpoint. The
+exposing a port; the mesh's protocol, `eris-mesh/0`, and the enroll protocol
+devices let apps in with, `eris-enroll/0`, share the endpoint. The
 iroh key is derived from `ERISDB_IROH_SECRET`, or from `ERISDB_SECRET` when that
 is unset, so it survives restarts and stays the key the mesh approved. Iroh
 authenticates the pipe, and the caller's key is an app's whole credential —
@@ -158,7 +159,7 @@ in front, or use iroh.
 ```sh
 export DATABASE_URL=postgres://…
 export ERISDB_SECRET=$(openssl rand -hex 32)
-erisdb join                   # where ErisAuth runs: a device approves the core
+erisdb join                   # where eon runs: a device approves the core to serve database/1
 erisdb passphrase set         # what devices type to let apps in
 erisdb serve                  # migrates, joins the mesh's node, serves TCP + Iroh
 erisdb mint --grant tasks:read,tasks:create --ttl 86400 --user alice
@@ -168,13 +169,15 @@ erisdb endpoint-id            # the key a device approves
 
 ## Letting apps in
 
-Apps are let in on a device, not on the server. An app asks ErisAuth on its
-device to approve its key for `erisdb` with the grants it wants; the person approves all
-of them or fewer, and types ErisDB's passphrase; ErisAuth enrolls the app here
-from the device's own endpoint (`POST /v1/enroll`), and ErisDB checks the device
-is in the mesh, the note is the device's own and counts, and the passphrase is
-right. Wrong guesses are counted per device: three free, then a minute's wait,
-doubling to a day.
+Apps are let in on a device, not on the server. An app asks `eon` on its
+device to approve its key to use `database/1` with the grants it wants; the
+person approves all of them or fewer, and types ErisDB's passphrase; `eon`
+enrolls the app here from the device's own endpoint, over the mesh library's
+enroll protocol (`eris-enroll/0`). The library checks the device is in the
+mesh and the note is the device's own, counts and uses `database/1`; ErisDB
+checks the passphrase and makes the installation, with the note's grants in
+`database/1`. Wrong guesses are counted per device: three free, then a minute's
+wait, doubling to a day.
 
 From then on the app dials ErisDB as its key and nothing else. A device removed
 from the mesh, or a note revoked, ends the app here the moment the list reaches
@@ -188,6 +191,6 @@ revoke ID`, and clears a device's lockout with `erisdb passphrase unlock`. See
 `cargo test` runs the suites: real Postgres via testcontainers (Docker
 required), real HTTP over real sockets, the real erisdb binary, and real Iroh
 QUIC. `tests/mesh.rs` builds device nodes from the mesh library in the test
-process, joins the binary to their mesh through a stand-in for ErisAuth's agent
+process, joins the binary to their mesh through a stand-in for `eon`'s agent
 socket, and enrolls, cuts off and administers apps, all on loopback endpoints.
 No mocks.

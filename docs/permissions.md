@@ -108,15 +108,15 @@ the current action list would silently widen on upgrade.
 
 Grants are decided on a device, so an app asks and a person answers.
 
-1. **Ask.** The app asks ErisAuth on its device to approve its key for
-   `erisdb`, naming the grants it wants:
-   `["tasks:read", "tasks:create", "tasks:update"]`.
+1. **Ask.** The app asks `eon` on its device to approve its key to use a
+   database, `database/1`, naming the grants it wants there:
+   `{"database/1": ["tasks:read", "tasks:create", "tasks:update"]}`.
 2. **Approve.** The person sees the app and its request on the device, and
    approves all of it, some of it, or none. Approving takes ErisDB's
    passphrase as well as the tap.
-3. **Enroll.** The device signs a note carrying the approved grants and
-   enrolls it at ErisDB, which creates the app's installation with exactly
-   those grants.
+3. **Enroll.** The device signs a note carrying the approved grants in
+   `database/1` and enrolls it at ErisDB, which creates the app's installation
+   with exactly those grants.
 
 The note is the ceiling. The operator can narrow an installation's grants and
 widen them again, never past its note's: `PUT /v1/clients/{id}` refuses

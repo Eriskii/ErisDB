@@ -1,10 +1,11 @@
 // The browser suite's world, as real processes: an Iroh relay in plain-HTTP mode, a device
-// running ErisAuth that starts a mesh, ErisDB's core on PostgreSQL in Docker, joined to the
-// mesh through that device with its passphrase set, and the static apps. Every participant
-// reaches the others through the relay alone (ERIS_NETWORK), as a browser must.
+// running ErisOverlayNetwork that starts a mesh, ErisDB's core on PostgreSQL in Docker, approved
+// through that device as the mesh's database (`database/1`) with its passphrase set, and the
+// static apps. Every participant reaches the others through the relay alone (ERIS_NETWORK), as a
+// browser must.
 //
 // Beside the apps, under /harness/, the tests act as the person at the device and as ErisDB's
-// operator: they speak to ErisAuth's socket, stop and start the core, and read where things are.
+// operator: they speak to ErisOverlayNetwork's socket, stop and start the core, and read where things are.
 "use strict";
 const { execFileSync, spawn } = require("node:child_process");
 const { createServer } = require("node:http");
@@ -20,7 +21,9 @@ const PORT = 18770;
 const CORE = "127.0.0.1:18771";
 const SECRET = "erisdb-browser-e2e-only";
 const PASSPHRASE = "correct horse battery";
-const erisauthSource = path.resolve(root, process.env.ERISAUTH_SOURCE || "../ErisAuth");
+/** What ErisDB serves, and what Tasks and Lists use. */
+const DATABASE = "database/1";
+const eonSource = path.resolve(root, process.env.EON_SOURCE || "../ErisOverlayNetwork");
 const target = path.join(__dirname, "target");
 
 const children = new Set();
@@ -76,14 +79,14 @@ function finish(child, input) {
   });
 }
 
-// ---------------------------------------------------------------- ErisAuth
+// ---------------------------------------------------------------- ErisOverlayNetwork
 // The person's device. Its socket takes the same commands its approval page sends.
 
-let erisauth;
+let eon;
 
 function say(line) {
   return new Promise((resolve, reject) => {
-    const socket = net.createConnection(erisauth.socket);
+    const socket = net.createConnection(eon.socket);
     let answer = "";
     socket.once("connect", () => socket.write(JSON.stringify(line) + "\n"));
     socket.on("data", chunk => {
@@ -95,16 +98,16 @@ function say(line) {
   });
 }
 
-async function startErisAuth(binary, relay) {
-  const data = path.join(scratch, "erisauth-data");
-  const runtime = path.join(scratch, "erisauth-runtime");
+async function startErisOverlayNetwork(binary, relay) {
+  const data = path.join(scratch, "eon-data");
+  const runtime = path.join(scratch, "eon-runtime");
   fs.mkdirSync(data, { mode: 0o700 });
   fs.mkdirSync(runtime, { mode: 0o700 });
-  erisauth = { binary, env: { XDG_DATA_HOME: data, XDG_RUNTIME_DIR: runtime, ERIS_NETWORK: relay }, runtime, socket: path.join(runtime, "erisauth/agent.sock") };
-  run(binary, ["serve", "--no-notify"], erisauth.env);
-  await until("ErisAuth listens", () => fs.existsSync(path.join(runtime, "erisauth/page")) && say({ op: "state" }));
+  eon = { binary, env: { XDG_DATA_HOME: data, XDG_RUNTIME_DIR: runtime, ERIS_NETWORK: relay }, runtime, socket: path.join(runtime, "eon/agent.sock") };
+  run(binary, ["serve", "--no-notify"], eon.env);
+  await until("ErisOverlayNetwork listens", () => fs.existsSync(path.join(runtime, "eon/page")) && say({ op: "state" }));
   const made = await say({ op: "init", name: "laptop" });
-  if (!made.ok) throw new Error("erisauth init: " + JSON.stringify(made));
+  if (!made.ok) throw new Error("eon init: " + JSON.stringify(made));
 }
 
 // ---------------------------------------------------------------- ErisDB
@@ -112,15 +115,20 @@ async function startErisAuth(binary, relay) {
 let erisdb;
 
 function coreEnv(relay, database) {
-  return { DATABASE_URL: database, ERISDB_SECRET: SECRET, ERISDB_LISTEN: CORE, ERIS_NETWORK: relay, XDG_RUNTIME_DIR: erisauth.runtime };
+  return { DATABASE_URL: database, ERISDB_SECRET: SECRET, ERISDB_LISTEN: CORE, ERIS_NETWORK: relay, XDG_RUNTIME_DIR: eon.runtime };
+}
+
+/** The mesh's database as the device has it: the servers of `database/1`, the one in use first. */
+function database(state) {
+  return state.mesh?.servers?.find(server => server.capability === DATABASE);
 }
 
 /** `erisdb join`, approved by the person at the device. */
 async function join() {
   const joining = run(erisdb.binary, ["join"], erisdb.env, { stdio: ["ignore", "pipe", "pipe"] });
   const done = finish(joining);
-  const prompt = await until("ErisAuth asks the person about ErisDB", async () =>
-    (await say({ op: "state" })).approvals.find(a => a.service === "erisdb" && a.serves));
+  const prompt = await until("ErisOverlayNetwork asks the person about ErisDB", async () =>
+    (await say({ op: "state" })).approvals.find(a => a.serves.some(served => served.capability === DATABASE)));
   const decided = await say({ op: "decide", id: prompt.id });
   if (!decided.ok) throw new Error("approving ErisDB: " + JSON.stringify(decided));
   await done;
@@ -134,7 +142,7 @@ async function setPassphrase() {
 async function startCore() {
   core = run(erisdb.binary, ["serve"], erisdb.env);
   await until("ErisDB answers over HTTP", async () => (await fetch(`http://${CORE}/v1/health`)).ok);
-  await until("the device reaches ErisDB", async () => (await say({ op: "state" })).mesh?.erisdb?.reachable === true);
+  await until("the device reaches ErisDB", async () => database(await say({ op: "state" }))?.apps[0]?.reachable === true);
 }
 
 async function stopCore() {
@@ -162,7 +170,7 @@ async function harness(request, response, route) {
   if (route === "/harness" && request.method === "GET") {
     return reply({ core: `http://${CORE}`, token: erisdb.token, passphrase: PASSPHRASE, relay: erisdb.env.ERIS_NETWORK });
   }
-  if (route === "/harness/erisauth" && request.method === "POST") return reply(await say(await body(request)));
+  if (route === "/harness/eon" && request.method === "POST") return reply(await say(await body(request)));
   if (route === "/harness/erisdb/stop" && request.method === "POST") { await stopCore(); return reply({ ok: true }); }
   if (route === "/harness/erisdb/start" && request.method === "POST") { await startCore(); return reply({ ok: true }); }
   reply({ error: "no such harness route" }, 404);
@@ -194,12 +202,12 @@ async function serve(request, response) {
   if (!process.env.ERISDB_RELAY_BIN) cargo(["build", "--manifest-path", path.join(__dirname, "relay/Cargo.toml")], { CARGO_TARGET_DIR: target });
   const coreBinary = process.env.ERISDB_BIN || path.join(root, "erisdb/target/debug/erisdb");
   if (!process.env.ERISDB_BIN) cargo(["build", "--manifest-path", "erisdb/Cargo.toml", "--bin", "erisdb"]);
-  const erisauthBinary = process.env.ERISAUTH_BIN || path.join(target, "debug/erisauth");
-  if (!process.env.ERISAUTH_BIN) {
-    if (!fs.existsSync(path.join(erisauthSource, "Cargo.toml"))) {
-      throw new Error("the suite runs ErisAuth: set ERISAUTH_SOURCE to its checkout or ERISAUTH_BIN to a built erisauth");
+  const eonBinary = process.env.EON_BIN || path.join(target, "debug/eon");
+  if (!process.env.EON_BIN) {
+    if (!fs.existsSync(path.join(eonSource, "eon/Cargo.toml"))) {
+      throw new Error("the suite runs ErisOverlayNetwork: set EON_SOURCE to its checkout or EON_BIN to a built eon");
     }
-    cargo(["build", "--manifest-path", path.join(erisauthSource, "Cargo.toml"), "--bin", "erisauth"], { CARGO_TARGET_DIR: target });
+    cargo(["build", "--manifest-path", path.join(eonSource, "eon/Cargo.toml"), "--bin", "eon"], { CARGO_TARGET_DIR: target });
   }
 
   const relayProcess = run(relayBinary, [], {}, { stdio: ["ignore", "pipe", "inherit"] });
@@ -222,7 +230,7 @@ async function serve(request, response) {
     return true;
   });
 
-  await startErisAuth(erisauthBinary, relay);
+  await startErisOverlayNetwork(eonBinary, relay);
   erisdb = { binary: coreBinary, env: coreEnv(relay, database) };
   await join();
   await setPassphrase();

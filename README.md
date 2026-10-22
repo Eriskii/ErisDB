@@ -14,8 +14,9 @@ and avoid needing to authenticate every app you want AI features in. Future plan
 for bundled plugins include IMAP and CalDAV forwarding, as well as a plugin to
 ingest Google Health data.
 
-ErisDB lives in your mesh: the devices you run [ErisAuth](https://github.com/Eriskii/ErisAuth)
-on. One of them approves ErisDB as the mesh's ErisDB, and every app gets in the same way: you
+ErisDB lives in your mesh: the devices you run [ErisOverlayNetwork](https://github.com/Eriskii/ErisOverlayNetwork)'s
+`eon` on. Apps ask a device for a database, `database/1`, and ErisDB is what serves it: one of
+your devices approves ErisDB as the mesh's database, and every app gets in the same way: you
 approve it on a device and type ErisDB's passphrase there. Removing a device from the mesh, from
 any other device, cuts its apps off at once. [The mesh](docs/mesh.md) explains it all.
 
@@ -31,9 +32,9 @@ To start the server and Postgres together and enter an interactive CLI, run:
 ./scripts/run-local.py
 ```
 
-Requires Python 3, Docker running, a Rust/C build toolchain, and ErisAuth running on this
+Requires Python 3, Docker running, a Rust/C build toolchain, and `eon` running on this
 machine. The script builds this checkout and downloads the Postgres image if needed. The first
-time, it asks ErisAuth to make this ErisDB your mesh's ErisDB — approve it on the device — and
+time, it asks `eon` to make this ErisDB your mesh's database — approve it on the device — and
 asks you for ErisDB's passphrase. At `erisdb>`, type `clients list`, `passphrase set`,
 `endpoint-id`, or `help` directly. `exit`, Ctrl-D, or Ctrl-C
 stops both services. The database and keys stay in `~/.local/share/erisdb/local/`
@@ -115,7 +116,7 @@ EOF_CONFIG
 Edit `~/.config/erisdb/server.env` and replace the database password placeholder.
 URL-encode special characters in the password. Keep this file private and retain
 the same secret across restarts: the mesh approves the key it derives. Load it,
-join your mesh where ErisAuth runs, set the passphrase, and start the server:
+join your mesh where `eon` runs, set the passphrase, and start the server:
 
 ```sh
 set -a
@@ -148,8 +149,8 @@ the same machine in front of `127.0.0.1:7700`. See
 The apps use the same server data across browser and Android installations.
 They cache data locally and queue changes while offline.
 
-The browser apps sign in by a ticket from ErisAuth: choose **Add a browser app** on
-a device in your mesh (or run `erisauth add-app` there), paste or scan the ticket,
+The browser apps sign in by a ticket from `eon`: choose **Add a browser app** on
+a device in your mesh (or run `eon add-app` there), paste or scan the ticket,
 check that both screens show the same code, and approve on the device with ErisDB's
 passphrase. They reach ErisDB over Iroh through a relay, as their own key, with
 [ErisDB's browser client](clients/web/README.md), which `scripts/build-web.sh` builds
@@ -161,15 +162,15 @@ python3 -m http.server 8080 --bind 127.0.0.1 --directory apps
 
 Open <http://127.0.0.1:8080/tasks/> or <http://127.0.0.1:8080/lists/>. For remote
 hosting, serve `apps/` over HTTPS, keeping `shared/` beside `tasks/` and `lists/`.
-`npm run test:e2e` runs both in Chromium against a real ErisAuth and ErisDB; the
+`npm run test:e2e` runs both in Chromium against a real `eon` and ErisDB; the
 [browser client's README](clients/web/README.md#testing) says what it needs.
 
 Both browser and Android apps initialize their own schemas automatically with
 their `tasks:create` or `lists:create` permission. No manual schema setup or global
 facet administration is needed; existing schemas are left unchanged.
 
-The Android apps sign in through ErisAuth on the phone, which approves them and
-enrolls them here with ErisDB's passphrase. Build the Android APKs with
+The Android apps sign in through ErisOverlayNetwork on the phone, which approves them for
+`database/1` and enrolls them here with ErisDB's passphrase. Build the Android APKs with
 `scripts/build-android.sh`; the Android READMEs above list build requirements.
 Every app a device lets in is an installation: manage
 them with `erisdb clients list`, `erisdb clients permissions`, and

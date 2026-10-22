@@ -4,10 +4,10 @@
     <!-- Iroh dials relays and hole-punches over the network. -->
     <uses-permission android:name="android.permission.INTERNET" />
 
-    <!-- ErisAuth is how this app gets into ErisDB. Android shows an app
+    <!-- ErisOverlayNetwork is how this app gets into ErisDB. Android shows an app
          only the packages it says it looks for. -->
     <queries>
-        <package android:name="dev.eris.auth" />
+        <package android:name="dev.eris.eon" />
     </queries>
 
     <!--

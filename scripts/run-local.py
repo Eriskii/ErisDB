@@ -127,10 +127,10 @@ def await_server(process, url, log):
 
 def join(binary, env):
     """Take a new ErisDB into this machine's mesh, then set its passphrase."""
-    print("ErisDB is in no mesh yet. Asking this machine's ErisAuth to make it the mesh's ErisDB;"
+    print("ErisDB is in no mesh yet. Asking this machine's eon to make it the mesh's database;"
           " approve it on the device.", flush=True)
     if execute([binary, "join"], env=env):
-        raise RuntimeError("ErisDB did not join a mesh. Run the launcher where ErisAuth runs.")
+        raise RuntimeError("ErisDB did not join a mesh. Run the launcher where eon runs.")
     print("Choose ErisDB's passphrase. Devices type it to let apps in.", flush=True)
     if execute([binary, "passphrase", "set"], env=env):
         print("No passphrase was set; type passphrase set at the prompt before letting apps in.", flush=True)

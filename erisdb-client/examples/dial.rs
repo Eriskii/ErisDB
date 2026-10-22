@@ -1,4 +1,4 @@
-//! Dial an ErisDB as an app and issue one request — a reachability probe:
+//! Dial a database as an app and issue one request — a reachability probe:
 //! `ERISDB_SERVER=<endpoint id or address JSON> ERISDB_KEY=<64 hex> cargo run --example dial`.
 
 fn main() {
@@ -12,7 +12,7 @@ fn main() {
         eprintln!("dial failed: {e}");
         std::process::exit(1);
     }
-    // `/v1/permissions` needs no permission, so any answer proves ErisDB
+    // `/v1/permissions` needs no permission, so any answer proves the database
     // reachable: what the key holds when a device enrolled it, 401 when not.
     println!("{}", erisdb_client::blocking::permissions());
 }

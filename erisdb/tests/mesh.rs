@@ -2,14 +2,16 @@
 //!
 //! A real Postgres (Docker via testcontainers), the real erisdb binary, and
 //! real device nodes built from the mesh library in this process, every one
-//! of them on loopback Iroh endpoints (`ERIS_NETWORK=loopback`). ErisAuth is
-//! a stand-in answering the agent socket the way ErisAuth does once the
-//! person says yes: it signs notes with its device's node, and approving an
-//! app to serve `erisdb` revokes every other ErisDB it approved, so the mesh
-//! has one. Devices enroll apps from their own
-//! endpoints, apps call with nothing but their keys, and devices leave the
-//! mesh the way they do in life, by an entry another device writes.
+//! of them on loopback Iroh endpoints (`ERIS_NETWORK=loopback`). eon is a
+//! stand-in answering the agent socket the way eon does once the person says
+//! yes: it signs notes with its device's node, and approving an app to serve
+//! `database/1`, which a mesh has a single server of, revokes every other
+//! server of it it approved, so the mesh has one database. Devices enroll
+//! apps from their own endpoints over the mesh library's `eris-enroll/0`,
+//! apps call with nothing but their keys, and devices leave the mesh the way
+//! they do in life, by an entry another device writes.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
@@ -17,9 +19,10 @@ use std::time::Duration;
 
 use erisoverlaynetwork::agent::{self, Reply, Request};
 use erisoverlaynetwork::devices::Op;
+use erisoverlaynetwork::enroll::{self, Outcome};
 use erisoverlaynetwork::mesh::{self, Config, Local, MemoryStore, Node};
 use erisoverlaynetwork::net::{self, Network};
-use erisoverlaynetwork::{Note, NoteId, Snapshot};
+use erisoverlaynetwork::{Error as Refused, Note, NoteId, Serves, Snapshot, Uses};
 use http_body_util::{BodyExt, Full};
 use hyper::body::Bytes;
 use hyper_util::rt::TokioIo;
@@ -38,7 +41,10 @@ use tokio::sync::OnceCell;
 
 const SECRET: &str = "mesh-e2e-secret";
 const PASSPHRASE: &str = "correct horse battery staple";
-const ALPN: &[u8] = b"erisdb/0";
+/// What ErisDB serves, and apps use.
+const DATABASE: &str = "database/1";
+/// The API's ALPN: the database's.
+const ALPN: &[u8] = b"eris/database/1";
 
 // ---------------------------------------------------------------- the store
 
@@ -83,7 +89,7 @@ async fn database() -> String {
 
 // ---------------------------------------------------------------- devices
 
-/// A device as ErisAuth runs one: its key, its node, its router.
+/// A device as eon runs one: its key, its node, its router.
 struct Device {
     name: String,
     node: Node,
@@ -144,73 +150,100 @@ impl Device {
         self.node.id()
     }
 
-    /// A note approving `app` as an ErisDB client with `grants`.
+    /// A note approving `app` to use the database with `grants`.
     fn approve(&self, app: EndpointId, grants: &[&str]) -> Note {
-        self.issue(app, "erisdb", grants, false)
+        self.issue(app, uses(DATABASE, grants), Vec::new())
     }
 
-    fn issue(&self, app: EndpointId, service: &str, grants: &[&str], serves: bool) -> Note {
-        let grants = grants.iter().map(|g| g.to_string()).collect();
+    fn issue(&self, app: EndpointId, uses: Uses, serves: Vec<Serves>) -> Note {
         self.node
-            .issue(
-                app,
-                "Tasks",
-                service,
-                grants,
-                serves,
-                Some("/usr/bin/tasks".into()),
-            )
+            .issue(app, "Tasks", uses, serves, Some("/usr/bin/tasks".into()))
             .unwrap()
     }
 
-    /// Dial the mesh's ErisDB as this device, syncing first, as ErisAuth
-    /// does. A device the mesh has removed cannot sync, and dials anyway.
-    async fn dial(&self, erisdb: EndpointId) -> Connection {
-        match self.node.connect(erisdb, ALPN).await {
-            Ok(conn) => conn,
-            Err(_) => {
-                let known = self
-                    .node
-                    .directory()
-                    .into_iter()
-                    .find(|p| p.id == erisdb)
-                    .expect("ErisDB is known");
-                self.node
-                    .endpoint()
-                    .connect(known.endpoint_addr(), ALPN)
-                    .await
-                    .unwrap()
-            }
-        }
+    /// Enroll `note` at ErisDB with `passphrase`, as eon does once the
+    /// person typed it: from the device's own endpoint, synced first.
+    async fn enroll(
+        &self,
+        erisdb: EndpointId,
+        note: &Note,
+        passphrase: &str,
+    ) -> erisoverlaynetwork::Result<Outcome> {
+        enroll::enroll(&self.node, erisdb, note, passphrase).await
     }
 
-    /// Enroll `note` at ErisDB with `passphrase`, as ErisAuth does once the
-    /// person typed it.
-    async fn enroll(&self, erisdb: EndpointId, note: &Note, passphrase: &str) -> (u16, Value) {
-        let conn = self.dial(erisdb).await;
-        http(
-            &conn,
-            "POST",
-            "/v1/enroll",
-            Some(json!({"note": note, "passphrase": passphrase})),
-            None,
-        )
-        .await
+    /// Change ErisDB's passphrase, as eon does for a person who knows it.
+    async fn change(
+        &self,
+        erisdb: EndpointId,
+        current: &str,
+        new: &str,
+    ) -> erisoverlaynetwork::Result<Outcome> {
+        enroll::change(&self.node, erisdb, current, new).await
     }
 }
 
-/// What the stand-in ErisAuth says to a request.
+/// What an app uses: one capability, with `grants` there.
+fn uses(capability: &str, grants: &[&str]) -> Uses {
+    Uses::from([(
+        capability.parse().unwrap(),
+        grants.iter().map(|g| g.to_string()).collect(),
+    )])
+}
+
+/// How ErisDB serves the database: the mesh's one, taking a passphrase.
+fn the_database() -> Serves {
+    Serves {
+        capability: DATABASE.parse().unwrap(),
+        single: true,
+        passphrase: true,
+    }
+}
+
+/// Ask ErisDB at `at` over `eris-enroll/0` from `endpoint`, without syncing
+/// first: as a stranger does, or a device the mesh removed.
+async fn ask_unsynced(
+    endpoint: &iroh::Endpoint,
+    at: iroh::EndpointAddr,
+    request: enroll::Request,
+) -> erisoverlaynetwork::Result<Outcome> {
+    let conn = endpoint.connect(at, enroll::ALPN).await.unwrap();
+    erisoverlaynetwork::wire::ask(&conn, &request).await
+}
+
+/// Ask until the answer is one `want`s, for things the mesh carries a moment
+/// later.
+async fn until_answered<T: std::fmt::Debug>(
+    what: &str,
+    want: impl Fn(&T) -> bool,
+    mut ask: impl AsyncFnMut() -> T,
+) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let got = ask().await;
+        if want(&got) {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "never the answer wanted for {what}: {got:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// What the stand-in eon says to a request.
 #[derive(Clone, Copy, PartialEq)]
 enum Person {
     Approves,
     Declines,
 }
 
-/// The agent socket of `device`'s ErisAuth, under a runtime directory of its
-/// own. It answers every request as ErisAuth does once the person has
-/// answered: an approval signs the note with the device's node, and an app
-/// approved to serve `erisdb` replaces every ErisDB before it, whose notes
-/// are revoked.
+/// The agent socket of `device`'s eon, under a runtime directory of its own.
+/// It answers every request as eon does once the person has answered: an
+/// approval signs the note with the device's node, and an app approved to
+/// serve a capability a mesh has a single server of replaces every server of
+/// it before it, whose notes are revoked.
 struct Agent {
     runtime: tempfile::TempDir,
     asked: Arc<Mutex<Vec<Request>>>,
@@ -224,7 +257,7 @@ impl Agent {
         let listener = tokio::net::UnixListener::bind(&path).unwrap();
         let asked = Arc::new(Mutex::new(Vec::new()));
         let (node, seen) = (device.node.clone(), asked.clone());
-        let mut erisdbs: Vec<NoteId> = Vec::new();
+        let mut singles: Vec<(String, NoteId)> = Vec::new();
         tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
                 let (read, mut write) = stream.into_split();
@@ -235,25 +268,24 @@ impl Agent {
                 let reply = match request {
                     Request::Approve { ask, .. } if person == Person::Approves => {
                         let note = node
-                            .issue(
-                                ask.app,
-                                &ask.name,
-                                &ask.service,
-                                ask.grants,
-                                ask.serves,
-                                None,
-                            )
+                            .issue(ask.app, &ask.name, ask.uses, ask.serves.clone(), None)
                             .unwrap();
-                        if ask.serves && ask.service == "erisdb" {
+                        for served in ask.serves.iter().filter(|s| s.single) {
+                            let capability = served.capability.to_string();
                             let known = node
-                                .providers("erisdb")
+                                .servers(&capability)
                                 .into_iter()
                                 .filter_map(|p| p.note().map(|n| n.id));
-                            let before: Vec<NoteId> = erisdbs.drain(..).chain(known).collect();
+                            let mine = singles
+                                .iter()
+                                .filter(|(c, _)| *c == capability)
+                                .map(|(_, id)| *id);
+                            let before: BTreeSet<NoteId> = mine.chain(known).collect();
                             for old in before.into_iter().filter(|old| *old != note.id) {
                                 node.append(Op::Revoke { note: old }).await.unwrap();
                             }
-                            erisdbs.push(note.id);
+                            singles.retain(|(c, _)| *c != capability);
+                            singles.push((capability, note.id));
                         }
                         Reply::Approved {
                             note,
@@ -337,31 +369,31 @@ struct Core {
 }
 
 impl Core {
-    /// Join `founder`'s mesh through its ErisAuth, set the passphrase, and serve.
+    /// Join `founder`'s mesh through its eon, set the passphrase, and serve.
     async fn up(founder: &Device) -> (Core, Agent) {
         Core::up_with(founder, &[]).await
     }
 
     async fn up_with(founder: &Device, serve_args: &[&str]) -> (Core, Agent) {
-        let erisauth = Agent::on(founder, Person::Approves).await;
+        let eon = Agent::on(founder, Person::Approves).await;
         // A deployment of its own, as every core is: its own secret, its own key.
         let secret = format!("mesh-e2e-{}", uuid::Uuid::new_v4().simple());
-        let core = Core::join(founder, &erisauth, &secret, serve_args).await;
-        (core, erisauth)
+        let core = Core::join(founder, &eon, &secret, serve_args).await;
+        (core, eon)
     }
 
-    /// A deployment with `secret`, joined through `erisauth` on `founder`,
+    /// A deployment with `secret`, joined through `eon` on `founder`,
     /// with its passphrase set, serving, and found by `founder` as the mesh's
     /// ErisDB.
-    async fn join(founder: &Device, erisauth: &Agent, secret: &str, serve_args: &[&str]) -> Core {
+    async fn join(founder: &Device, eon: &Agent, secret: &str, serve_args: &[&str]) -> Core {
         let database = database().await;
         let joined = run(
-            erisdb_as(secret, &database, erisauth.runtime()).arg("join"),
+            erisdb_as(secret, &database, eon.runtime()).arg("join"),
             None,
         )
         .await;
         assert!(joined.status.success(), "join: {}", text(&joined));
-        let core = Core::serve_as(secret, &database, erisauth.runtime(), serve_args).await;
+        let core = Core::serve_as(secret, &database, eon.runtime(), serve_args).await;
         core.passphrase(PASSPHRASE).await;
         core.found_by(founder).await;
         core
@@ -426,18 +458,14 @@ impl Core {
         assert!(set.status.success(), "passphrase set: {}", text(&set));
     }
 
-    /// Wait until `device` knows where this core is, as the mesh's ErisDB.
+    /// Wait until `device` knows where this core is, as the mesh's database.
     async fn found_by(&self, device: &Device) {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
-        while device
-            .node
-            .provider("erisdb")
-            .is_none_or(|p| p.id != self.id)
-        {
+        while device.node.server(DATABASE).is_none_or(|p| p.id != self.id) {
             let log = self.log.lock().unwrap().clone();
             assert!(
                 tokio::time::Instant::now() < deadline,
-                "{} ({}, endpoint closed: {}) never found ErisDB; directory {:?}; its log:\n{log}",
+                "{} ({}, endpoint closed: {}) never found the database; directory {:?}; its log:\n{log}",
                 device.name,
                 device.id().fmt_short(),
                 device.node.endpoint().is_closed(),
@@ -453,12 +481,12 @@ impl Core {
     }
 
     /// Where this core is, as `device`'s snapshot says: what an app gets
-    /// back from ErisAuth.
+    /// back from eon.
     async fn address(&self, device: &Device) -> iroh::EndpointAddr {
         let snapshot: Snapshot = device.node.snapshot().await.unwrap();
-        let provider = snapshot.provider("erisdb").expect("the mesh has an ErisDB");
-        assert_eq!(provider.id, self.id, "this core is the mesh's ErisDB");
-        provider.endpoint_addr()
+        let server = snapshot.server(DATABASE).expect("the mesh has a database");
+        assert_eq!(server.id, self.id, "this core is the mesh's database");
+        server.endpoint_addr()
     }
 
     fn token(&self, grants: &[&str]) -> String {
@@ -531,9 +559,17 @@ impl App {
     async fn call(&self, method: &str, path: &str, body: Option<Value>) -> (u16, Value) {
         http(&self.conn, method, path, body, None).await
     }
+
+    /// What this app holds, once a device enrolled it: its grants, and the
+    /// installation they belong to.
+    async fn held(&self) -> Value {
+        let (status, held) = self.call("GET", "/v1/permissions", None).await;
+        assert_eq!(status, 200, "{held}");
+        held
+    }
 }
 
-/// One HTTP/1.1 exchange on a fresh bi-stream: the erisdb wire.
+/// One HTTP/1.1 exchange on a fresh bi-stream: the database's wire.
 async fn http(
     conn: &Connection,
     method: &str,
@@ -661,7 +697,7 @@ async fn serve_refuses_until_a_device_approves_the_core_with_join() {
 
     let alone = run(erisdb(&database, nobody.path()).arg("join"), None).await;
     assert!(!alone.status.success());
-    assert!(text(&alone).contains("no ErisAuth"), "{}", text(&alone));
+    assert!(text(&alone).contains("no eon"), "{}", text(&alone));
 
     let declined = Agent::on(&laptop, Person::Declines).await;
     let no = run(erisdb(&database, declined.runtime()).arg("join"), None).await;
@@ -674,41 +710,40 @@ async fn serve_refuses_until_a_device_approves_the_core_with_join() {
     .await;
     assert!(text(&still).contains("erisdb join"), "{}", text(&still));
 
-    let erisauth = Agent::on(&laptop, Person::Approves).await;
-    let joined = run(erisdb(&database, erisauth.runtime()).arg("join"), None).await;
+    let eon = Agent::on(&laptop, Person::Approves).await;
+    let joined = run(erisdb(&database, eon.runtime()).arg("join"), None).await;
     assert!(joined.status.success(), "{}", text(&joined));
     let printed = run(erisdb(&database, nobody.path()).arg("endpoint-id"), None).await;
     let id: EndpointId = String::from_utf8_lossy(&printed.stdout)
         .trim()
         .parse()
         .unwrap();
-    match erisauth.asked.lock().unwrap().as_slice() {
+    match eon.asked.lock().unwrap().as_slice() {
         [Request::Approve { v, ask }] => {
             assert_eq!(*v, agent::VERSION);
+            assert_eq!(ask.app, id);
+            assert!(ask.uses.is_empty(), "ErisDB uses nothing: {ask:?}");
             assert_eq!(
-                (ask.service.as_str(), ask.serves, ask.grants.len(), ask.app),
-                ("erisdb", true, 0, id)
+                ask.serves,
+                [the_database()],
+                "ErisDB serves the database, the mesh's one, taking a passphrase"
             );
         }
-        other => panic!("ErisAuth was asked {other:?}"),
+        other => panic!("eon was asked {other:?}"),
     }
 
-    // Serving, it is the mesh's ErisDB: the device finds it providing `erisdb`, under the
-    // key `endpoint-id` names, and ErisDB knows the device.
+    // Serving, it is the mesh's database: the device finds it serving `database/1` as the
+    // mesh's one, taking a passphrase, under the key `endpoint-id` names.
     let core = Core::serve(&database, nobody.path(), &[]).await;
     assert_eq!(core.id, id);
     core.found_by(&laptop).await;
-    let (status, body) = laptop
-        .enroll(
-            id,
-            &laptop.approve(SecretKey::generate().public(), &["tasks:read"]),
-            "x",
-        )
-        .await;
+    let found = laptop.node.server(DATABASE).unwrap();
+    assert_eq!(found.serving(DATABASE), Some(&the_database()));
+    // It knows the device, and takes its notes once its operator sets a passphrase.
+    let note = laptop.approve(SecretKey::generate().public(), &["tasks:read"]);
     assert_eq!(
-        (status, body["error"].as_str()),
-        (503, Some("no_passphrase")),
-        "{body}"
+        laptop.enroll(id, &note, "x").await.unwrap(),
+        Outcome::NoPassphrase
     );
 
     // Anyone may dial it; nobody reads without an installation or a token.
@@ -751,7 +786,7 @@ async fn serve_refuses_until_a_device_approves_the_core_with_join() {
 #[tokio::test(flavor = "multi_thread")]
 async fn an_app_a_device_enrolls_works_by_its_key_alone() {
     let laptop = Device::founder("laptop").await;
-    let (core, _erisauth) = Core::up(&laptop).await;
+    let (core, _eon) = Core::up(&laptop).await;
     let app = App::new(&core, &laptop).await;
     assert_eq!(
         app.call("GET", "/v1/permissions", None).await.0,
@@ -759,20 +794,21 @@ async fn an_app_a_device_enrolls_works_by_its_key_alone() {
         "an app is nothing before it enrolls"
     );
 
+    // The laptop brings ErisDB the app's note and the passphrase, over `eris-enroll/0`.
     let note = laptop.approve(app.id(), &["tasks:read", "tasks:create", "tasks:update"]);
-    let (status, enrolled) = laptop.enroll(core.id, &note, PASSPHRASE).await;
-    assert_eq!(status, 200, "{enrolled}");
     assert_eq!(
-        enrolled["grants"],
-        json!(["tasks:read", "tasks:create", "tasks:update"])
+        laptop.enroll(core.id, &note, PASSPHRASE).await.unwrap(),
+        Outcome::Done
     );
-    let client = enrolled["client"].as_str().unwrap().to_string();
 
-    let (status, held) = app.call("GET", "/v1/permissions", None).await;
-    assert_eq!(status, 200, "{held}");
-    assert_eq!(held["grants"], enrolled["grants"]);
-    assert_eq!(held["client_id"], client);
+    let held = app.held().await;
+    assert_eq!(
+        held["grants"],
+        json!(["tasks:read", "tasks:create", "tasks:update"]),
+        "it holds what the note grants it in the database"
+    );
     assert_eq!(held["exp"], Value::Null, "a key does not expire");
+    let client = held["client_id"].as_str().unwrap().to_string();
 
     // It initializes its own missing schema, and nothing beyond it.
     let tasks = json!({"facet": "facet", "body": {"name": "tasks", "schema": {"type": "object", "required": ["title"]}}});
@@ -856,7 +892,7 @@ async fn an_app_a_device_enrolls_works_by_its_key_alone() {
     assert_eq!(record["app"], app.id().to_string());
     assert_eq!(record["device"], laptop.id().to_string());
     assert_eq!(record["note"], note.id.to_string());
-    assert_eq!(record["approved"], enrolled["grants"]);
+    assert_eq!(record["approved"], held["grants"]);
     let listed = run(core.cli().args(["clients", "list"]), None).await;
     assert!(listed.status.success(), "{}", text(&listed));
     assert!(text(&listed).contains(&client));
@@ -879,65 +915,48 @@ async fn an_app_a_device_enrolls_works_by_its_key_alone() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn enrollment_takes_only_a_devices_own_note_for_an_erisdb_client() {
+async fn enrollment_takes_only_a_member_devices_own_note_for_the_database() {
     let laptop = Device::founder("laptop").await;
     let phone = laptop.add("phone").await;
-    let (core, _erisauth) = Core::up(&laptop).await;
+    let (core, _eon) = Core::up(&laptop).await;
     core.found_by(&phone).await;
     let app = SecretKey::generate().public();
     let note = laptop.approve(app, &["tasks:read"]);
+    let enrolling = |note: &Note| enroll::Request::Enroll {
+        note: note.clone(),
+        passphrase: PASSPHRASE.into(),
+    };
 
-    // Not over TCP, where no key is anyone's.
-    let (status, body) = core
-        .tcp(
-            reqwest::Method::POST,
-            "/v1/enroll",
-            "",
-            Some(json!({"note": note, "passphrase": PASSPHRASE})),
-        )
-        .await;
-    assert_eq!(
-        (status, body["error"].as_str()),
-        (403, Some("not_a_device")),
-        "{body}"
-    );
-
-    // Not from a device of another mesh.
+    // Not from a device of another mesh, whatever note it brings.
     let stranger = Device::founder("stranger").await;
     let theirs = stranger.approve(app, &["tasks:read"]);
-    let conn = stranger
-        .node
-        .endpoint()
-        .connect(core.address(&laptop).await, ALPN)
-        .await
-        .unwrap();
     for note in [&theirs, &note] {
-        let (status, body) = http(
-            &conn,
-            "POST",
-            "/v1/enroll",
-            Some(json!({"note": note, "passphrase": PASSPHRASE})),
-            None,
-        )
-        .await;
-        assert_eq!(
-            (status, body["error"].as_str()),
-            (403, Some("not_a_device")),
-            "{body}"
+        let at = core.address(&laptop).await;
+        let refused = ask_unsynced(stranger.node.endpoint(), at, enrolling(note)).await;
+        assert!(
+            matches!(refused, Err(Refused::Forbidden { .. })),
+            "{refused:?}"
         );
     }
 
     // Not a member presenting another member's note.
-    let (status, body) = phone.enroll(core.id, &note, PASSPHRASE).await;
-    assert_eq!(
-        (status, body["error"].as_str()),
-        (403, Some("not_a_device")),
-        "{body}"
+    let refused = phone.enroll(core.id, &note, PASSPHRASE).await;
+    assert!(
+        matches!(refused, Err(Refused::Forbidden { .. })),
+        "{refused:?}"
     );
 
-    // Not a note for anything but an ErisDB client, nor one no longer counting.
-    let files = laptop.issue(app, "files", &["files:read"], false);
-    let server = laptop.issue(app, "erisdb", &[], true);
+    // Not a note that does not use the database, nor one that no longer counts, nor one no
+    // device signed.
+    let files = laptop.issue(app, uses("files/1", &["files:read"]), Vec::new());
+    let server = laptop.issue(app, Uses::new(), vec![the_database()]);
+    for bad in [&files, &server] {
+        let refused = laptop.enroll(core.id, bad, PASSPHRASE).await;
+        assert!(
+            matches!(refused, Err(Refused::BadRequest(_))),
+            "{refused:?}"
+        );
+    }
     let revoked = laptop.approve(SecretKey::generate().public(), &["tasks:read"]);
     laptop
         .node
@@ -945,31 +964,29 @@ async fn enrollment_takes_only_a_devices_own_note_for_an_erisdb_client() {
         .await
         .unwrap();
     laptop.node.sync_with(core.id).await.unwrap();
-    let conn = laptop.dial(core.id).await;
-    for bad in [
-        json!(files),
-        json!(server),
-        json!(revoked),
-        json!({"by": laptop.id(), "body": "e30", "sig": "AAAA"}),
-    ] {
-        let (status, body) = http(
-            &conn,
-            "POST",
-            "/v1/enroll",
-            Some(json!({"note": bad, "passphrase": PASSPHRASE})),
-            None,
-        )
-        .await;
-        assert_eq!(
-            (status, body["error"].as_str()),
-            (400, Some("bad_note")),
-            "{body}"
-        );
-    }
+    let refused = laptop.enroll(core.id, &revoked, PASSPHRASE).await;
+    assert!(
+        matches!(refused, Err(Refused::Forbidden { .. })),
+        "{refused:?}"
+    );
+    let conn = laptop.node.connect(core.id, enroll::ALPN).await.unwrap();
+    let forged = json!({
+        "op": "enroll",
+        "note": {"by": laptop.id(), "body": "e30", "sig": "AAAA"},
+        "passphrase": PASSPHRASE,
+    });
+    let refused: erisoverlaynetwork::Result<Outcome> =
+        erisoverlaynetwork::wire::ask(&conn, &forged).await;
+    assert!(
+        matches!(refused, Err(Refused::BadRequest(_))),
+        "{refused:?}"
+    );
 
     // None of that cost the laptop a guess, and its own note goes through.
-    let (status, body) = laptop.enroll(core.id, &note, PASSPHRASE).await;
-    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        laptop.enroll(core.id, &note, PASSPHRASE).await.unwrap(),
+        Outcome::Done
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -977,69 +994,64 @@ async fn wrong_passphrases_lock_out_one_device_at_a_time() {
     let laptop = Device::founder("laptop").await;
     let phone = laptop.add("phone").await;
     // A one-second first wait in place of a minute; the schedule is the same.
-    let (core, _erisauth) = Core::up_with(&laptop, &["--lockout-secs", "1"]).await;
+    let (core, _eon) = Core::up_with(&laptop, &["--lockout-secs", "1"]).await;
     core.found_by(&phone).await;
     let enroll = async |device: &Device, passphrase: &str| {
-        device
-            .enroll(
-                core.id,
-                &device.approve(SecretKey::generate().public(), &["tasks:read"]),
-                passphrase,
-            )
-            .await
+        let note = device.approve(SecretKey::generate().public(), &["tasks:read"]);
+        device.enroll(core.id, &note, passphrase).await.unwrap()
     };
 
     for _ in 0..2 {
-        let (status, body) = enroll(&laptop, "wrong guess").await;
         assert_eq!(
-            (status, body["error"].as_str()),
-            (403, Some("wrong_passphrase")),
-            "{body}"
-        );
-        assert!(
-            body.get("retry_after").is_none(),
-            "the first two are free: {body}"
+            enroll(&laptop, "wrong guess").await,
+            Outcome::Wrong { retry_after: None },
+            "the first two are free"
         );
     }
-    let (status, body) = enroll(&laptop, "wrong guess").await;
     assert_eq!(
-        (status, body["retry_after"].as_u64()),
-        (403, Some(1)),
-        "the third locks: {body}"
+        enroll(&laptop, "wrong guess").await,
+        Outcome::Wrong {
+            retry_after: Some(1)
+        },
+        "the third locks"
     );
-    let (status, body) = enroll(&laptop, PASSPHRASE).await;
     assert_eq!(
-        (status, body["error"].as_str()),
-        (429, Some("locked")),
-        "even a right guess waits: {body}"
+        enroll(&laptop, PASSPHRASE).await,
+        Outcome::Locked { retry_after: 1 },
+        "even a right guess waits"
     );
-    assert_eq!(body["retry_after"], 1);
 
     // The phone guesses on its own count.
-    let (status, body) = enroll(&phone, PASSPHRASE).await;
-    assert_eq!(status, 200, "{body}");
+    assert_eq!(enroll(&phone, PASSPHRASE).await, Outcome::Done);
 
     tokio::time::sleep(Duration::from_millis(1100)).await;
-    let (status, body) = enroll(&laptop, "wrong guess").await;
     assert_eq!(
-        (status, body["retry_after"].as_u64()),
-        (403, Some(2)),
-        "each further guess doubles: {body}"
+        enroll(&laptop, "wrong guess").await,
+        Outcome::Wrong {
+            retry_after: Some(2)
+        },
+        "each further guess doubles"
     );
-    assert_eq!(enroll(&laptop, PASSPHRASE).await.0, 429);
+    assert!(matches!(
+        enroll(&laptop, PASSPHRASE).await,
+        Outcome::Locked { .. }
+    ));
     tokio::time::sleep(Duration::from_millis(2100)).await;
-    let (status, body) = enroll(&laptop, PASSPHRASE).await;
-    assert_eq!(status, 200, "{body}");
-    let (status, body) = enroll(&laptop, "wrong guess").await;
-    assert_eq!(status, 403);
-    assert!(
-        body.get("retry_after").is_none(),
-        "a right guess cleared the count: {body}"
+    assert_eq!(enroll(&laptop, PASSPHRASE).await, Outcome::Done);
+    assert_eq!(
+        enroll(&laptop, "wrong guess").await,
+        Outcome::Wrong { retry_after: None },
+        "a right guess cleared the count"
     );
 
     // The operator unlocks a device on the server.
     enroll(&laptop, "wrong guess").await;
-    assert_eq!(enroll(&laptop, "wrong guess").await.1["retry_after"], 1);
+    assert_eq!(
+        enroll(&laptop, "wrong guess").await,
+        Outcome::Wrong {
+            retry_after: Some(1)
+        }
+    );
     let unlocked = run(
         core.cli()
             .args(["passphrase", "unlock", &laptop.id().to_string()]),
@@ -1048,64 +1060,67 @@ async fn wrong_passphrases_lock_out_one_device_at_a_time() {
     .await;
     assert!(unlocked.status.success(), "{}", text(&unlocked));
     assert!(text(&unlocked).contains("1 device"), "{}", text(&unlocked));
-    assert_eq!(enroll(&laptop, PASSPHRASE).await.0, 200);
+    assert_eq!(enroll(&laptop, PASSPHRASE).await, Outcome::Done);
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_device_changes_the_passphrase_by_knowing_it() {
     let laptop = Device::founder("laptop").await;
-    let (core, _erisauth) = Core::up(&laptop).await;
-    let conn = laptop.dial(core.id).await;
-    let change = async |current: &str, new: &str| {
-        http(
-            &conn,
-            "POST",
-            "/v1/passphrase",
-            Some(json!({"current": current, "new": new})),
-            None,
-        )
-        .await
-    };
-    let (status, body) = change("not it at all", "a new passphrase").await;
+    let (core, _eon) = Core::up(&laptop).await;
     assert_eq!(
-        (status, body["error"].as_str()),
-        (403, Some("wrong_passphrase")),
-        "{body}"
+        laptop
+            .change(core.id, "not it at all", "a new passphrase")
+            .await
+            .unwrap(),
+        Outcome::Wrong { retry_after: None }
     );
-    assert_eq!(change(PASSPHRASE, "short").await.0, 400);
-    assert_eq!(change(PASSPHRASE, "a new passphrase").await.0, 204);
+    let refused = laptop.change(core.id, PASSPHRASE, "short").await;
+    assert!(
+        matches!(refused, Err(Refused::BadRequest(_))),
+        "{refused:?}"
+    );
+    assert_eq!(
+        laptop
+            .change(core.id, PASSPHRASE, "a new passphrase")
+            .await
+            .unwrap(),
+        Outcome::Done
+    );
 
     let note = laptop.approve(SecretKey::generate().public(), &["tasks:read"]);
     assert_eq!(
-        laptop.enroll(core.id, &note, PASSPHRASE).await.1["error"],
-        "wrong_passphrase"
+        laptop.enroll(core.id, &note, PASSPHRASE).await.unwrap(),
+        Outcome::Wrong { retry_after: None }
     );
     assert_eq!(
-        laptop.enroll(core.id, &note, "a new passphrase").await.0,
-        200
+        laptop
+            .enroll(core.id, &note, "a new passphrase")
+            .await
+            .unwrap(),
+        Outcome::Done
     );
 
     let stranger = Device::founder("stranger").await;
-    let theirs = stranger
-        .node
-        .endpoint()
-        .connect(core.address(&laptop).await, ALPN)
-        .await
-        .unwrap();
-    let body = json!({"current": "a new passphrase", "new": "the strangers own"});
-    let (status, body) = http(&theirs, "POST", "/v1/passphrase", Some(body), None).await;
-    assert_eq!(
-        (status, body["error"].as_str()),
-        (403, Some("not_a_device")),
-        "{body}"
+    let change = enroll::Request::Change {
+        current: "a new passphrase".into(),
+        new: "the strangers own".into(),
+    };
+    let at = core.address(&laptop).await;
+    let refused = ask_unsynced(stranger.node.endpoint(), at, change).await;
+    assert!(
+        matches!(refused, Err(Refused::Forbidden { .. })),
+        "{refused:?}"
     );
 
     // The server resets it, whatever it was.
     core.passphrase("set on the server").await;
     let note = laptop.approve(SecretKey::generate().public(), &["tasks:read"]);
     assert_eq!(
-        laptop.enroll(core.id, &note, "set on the server").await.0,
-        200
+        laptop
+            .enroll(core.id, &note, "set on the server")
+            .await
+            .unwrap(),
+        Outcome::Done
     );
 }
 
@@ -1115,7 +1130,7 @@ async fn a_device_changes_the_passphrase_by_knowing_it() {
 async fn removing_a_device_cuts_its_apps_off_at_once() {
     let laptop = Device::founder("laptop").await;
     let phone = laptop.add("phone").await;
-    let (core, _erisauth) = Core::up(&laptop).await;
+    let (core, _eon) = Core::up(&laptop).await;
     core.found_by(&phone).await;
     let admin = core.token(&["*"]);
     core.tcp(
@@ -1127,26 +1142,20 @@ async fn removing_a_device_cuts_its_apps_off_at_once() {
     .await;
 
     let on_phone = App::new(&core, &phone).await;
-    let (status, enrolled) = phone
-        .enroll(
-            core.id,
-            &phone.approve(on_phone.id(), &["tasks:*", "meta:capabilities:mint"]),
-            PASSPHRASE,
-        )
-        .await;
-    assert_eq!(status, 200, "{enrolled}");
-    let client = enrolled["client"].as_str().unwrap().to_string();
-    let on_laptop = App::new(&core, &laptop).await;
+    let note = phone.approve(on_phone.id(), &["tasks:*", "meta:capabilities:mint"]);
     assert_eq!(
-        laptop
-            .enroll(
-                core.id,
-                &laptop.approve(on_laptop.id(), &["tasks:read"]),
-                PASSPHRASE
-            )
-            .await
-            .0,
-        200
+        phone.enroll(core.id, &note, PASSPHRASE).await.unwrap(),
+        Outcome::Done
+    );
+    let client = on_phone.held().await["client_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let on_laptop = App::new(&core, &laptop).await;
+    let note = laptop.approve(on_laptop.id(), &["tasks:read"]);
+    assert_eq!(
+        laptop.enroll(core.id, &note, PASSPHRASE).await.unwrap(),
+        Outcome::Done
     );
 
     assert_eq!(
@@ -1250,28 +1259,29 @@ async fn removing_a_device_cuts_its_apps_off_at_once() {
     assert_eq!(revoked["source"]["mesh"], "device removed");
 
     // And a removed device enrolls nothing more.
-    let (status, body) = phone
-        .enroll(
-            core.id,
-            &phone.approve(SecretKey::generate().public(), &["tasks:read"]),
-            PASSPHRASE,
-        )
-        .await;
-    assert_eq!(
-        (status, body["error"].as_str()),
-        (403, Some("not_a_device")),
-        "{body}"
+    let enrolling = enroll::Request::Enroll {
+        note: phone.approve(SecretKey::generate().public(), &["tasks:read"]),
+        passphrase: PASSPHRASE.into(),
+    };
+    let at = core.address(&laptop).await;
+    let refused = ask_unsynced(phone.node.endpoint(), at, enrolling).await;
+    assert!(
+        matches!(refused, Err(Refused::Forbidden { .. })),
+        "{refused:?}"
     );
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn revoking_a_note_cuts_its_app_off_and_leaves_the_device_in() {
     let laptop = Device::founder("laptop").await;
-    let (core, _erisauth) = Core::up(&laptop).await;
+    let (core, _eon) = Core::up(&laptop).await;
     let app = App::new(&core, &laptop).await;
     let note = laptop.approve(app.id(), &["tasks:read"]);
-    let (_, enrolled) = laptop.enroll(core.id, &note, PASSPHRASE).await;
-    let client = enrolled["client"].as_str().unwrap().to_string();
+    assert_eq!(
+        laptop.enroll(core.id, &note, PASSPHRASE).await.unwrap(),
+        Outcome::Done
+    );
+    let client = app.held().await["client_id"].as_str().unwrap().to_string();
     assert_eq!(app.call("GET", "/v1/items?facet=tasks", None).await.0, 200);
     let stream = subscribe(&app.conn, "/v1/changes/stream?since=1000000&facet=tasks").await;
 
@@ -1301,9 +1311,13 @@ async fn revoking_a_note_cuts_its_app_off_and_leaves_the_device_in() {
 
     // The device stays, and approving the app anew makes a new installation.
     let again = laptop.approve(app.id(), &["tasks:read", "tasks:create"]);
-    let (status, fresh) = laptop.enroll(core.id, &again, PASSPHRASE).await;
-    assert_eq!(status, 200, "{fresh}");
-    assert_ne!(fresh["client"], client);
+    assert_eq!(
+        laptop.enroll(core.id, &again, PASSPHRASE).await.unwrap(),
+        Outcome::Done
+    );
+    let fresh = app.held().await;
+    assert_ne!(fresh["client_id"], client);
+    assert_eq!(fresh["grants"], json!(["tasks:read", "tasks:create"]));
     assert_eq!(app.call("GET", "/v1/items?facet=tasks", None).await.0, 200);
 }
 
@@ -1312,7 +1326,7 @@ async fn revoking_a_note_cuts_its_app_off_and_leaves_the_device_in() {
 #[tokio::test(flavor = "multi_thread")]
 async fn the_operator_manages_enrolled_apps_from_the_cli() {
     let laptop = Device::founder("laptop").await;
-    let (core, _erisauth) = Core::up(&laptop).await;
+    let (core, _eon) = Core::up(&laptop).await;
     let admin = core.token(&["*"]);
     core.tcp(
         reqwest::Method::POST,
@@ -1321,15 +1335,16 @@ async fn the_operator_manages_enrolled_apps_from_the_cli() {
         Some(json!({"facet": "facet", "body": {"name": "tasks", "schema": {}}})),
     )
     .await;
+    let enroll = async |app: EndpointId, grants: &[&str]| {
+        let note = laptop.approve(app, grants);
+        laptop.enroll(core.id, &note, PASSPHRASE).await.unwrap()
+    };
     let app = App::new(&core, &laptop).await;
-    let (_, enrolled) = laptop
-        .enroll(
-            core.id,
-            &laptop.approve(app.id(), &["tasks:*", "*:read"]),
-            PASSPHRASE,
-        )
-        .await;
-    let id = enrolled["client"].as_str().unwrap().to_string();
+    assert_eq!(
+        enroll(app.id(), &["tasks:*", "*:read"]).await,
+        Outcome::Done
+    );
+    let id = app.held().await["client_id"].as_str().unwrap().to_string();
     let (status, item) = app
         .call(
             "POST",
@@ -1379,31 +1394,20 @@ async fn the_operator_manages_enrolled_apps_from_the_cli() {
     );
 
     // Enrolling again while active gives the same installation the new note's grants.
-    let (_, again) = laptop
-        .enroll(
-            core.id,
-            &laptop.approve(app.id(), &["tasks:read"]),
-            PASSPHRASE,
-        )
-        .await;
-    assert_eq!(again["client"], id);
-    assert_eq!(
-        app.call("GET", "/v1/permissions", None).await.1["grants"],
-        json!(["tasks:read"])
-    );
+    assert_eq!(enroll(app.id(), &["tasks:read"]).await, Outcome::Done);
+    let held = app.held().await;
+    assert_eq!(held["client_id"], id);
+    assert_eq!(held["grants"], json!(["tasks:read"]));
 
     let revoked = cli(&["revoke", &id]).await;
     assert!(revoked.status.success(), "{}", text(&revoked));
     assert_eq!(app.call("GET", "/v1/permissions", None).await.0, 401);
-    let (_, fresh) = laptop
-        .enroll(
-            core.id,
-            &laptop.approve(app.id(), &["tasks:read"]),
-            PASSPHRASE,
-        )
-        .await;
-    assert_ne!(fresh["client"], id, "a revoked installation stays revoked");
-    assert_eq!(app.call("GET", "/v1/permissions", None).await.0, 200);
+    assert_eq!(enroll(app.id(), &["tasks:read"]).await, Outcome::Done);
+    assert_ne!(
+        app.held().await["client_id"],
+        id,
+        "a revoked installation stays revoked"
+    );
 
     // Two enrollments of one new app at once make one installation.
     let twin = SecretKey::generate().public();
@@ -1415,18 +1419,24 @@ async fn the_operator_manages_enrolled_apps_from_the_cli() {
         laptop.enroll(core.id, &first, PASSPHRASE),
         laptop.enroll(core.id, &second, PASSPHRASE)
     );
-    assert_eq!((a.0, b.0), (200, 200));
-    assert_eq!(a.1["client"], b.1["client"]);
+    assert_eq!((a.unwrap(), b.unwrap()), (Outcome::Done, Outcome::Done));
     let (_, all) = core
         .tcp(reqwest::Method::GET, "/v1/clients", &admin, None)
         .await;
-    let active = all["clients"]
+    let active: Vec<&Value> = all["clients"]
         .as_array()
         .unwrap()
         .iter()
         .filter(|c| c["revoked_at"].is_null())
-        .count();
-    assert_eq!(active, 2);
+        .collect();
+    assert_eq!(active.len(), 2);
+    assert_eq!(
+        active
+            .iter()
+            .filter(|c| c["app"] == twin.to_string())
+            .count(),
+        1
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1444,26 +1454,25 @@ async fn a_plugin_is_told_which_installation_called_it() {
     )
     .unwrap();
     let laptop = Device::founder("laptop").await;
-    let (core, _erisauth) = Core::up_with(
+    let (core, _eon) = Core::up_with(
         &laptop,
         &["--plugin-dir", directory.path().to_str().unwrap()],
     )
     .await;
     let app = App::new(&core, &laptop).await;
-    let (_, enrolled) = laptop
-        .enroll(
-            core.id,
-            &laptop.approve(app.id(), &["echo:call"]),
-            PASSPHRASE,
-        )
-        .await;
+    let note = laptop.approve(app.id(), &["echo:call"]);
+    assert_eq!(
+        laptop.enroll(core.id, &note, PASSPHRASE).await.unwrap(),
+        Outcome::Done
+    );
+    let installation = app.held().await["client_id"].clone();
     let call = json!({"plugin": "echo", "operation": "call", "input": {}});
 
     let (status, invocation) = app.call("POST", "/v1/call", Some(call.clone())).await;
     assert_eq!(status, 200, "{invocation} {}", core.log.lock().unwrap());
     assert_eq!(
         invocation["context"],
-        json!({"installation": enrolled["client"]})
+        json!({ "installation": installation })
     );
     let (status, invocation) = core
         .tcp(
@@ -1481,60 +1490,53 @@ async fn a_plugin_is_told_which_installation_called_it() {
     );
 }
 
-// ---------------------------------------------------------------- one ErisDB
+// ---------------------------------------------------------------- one database
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_newer_erisdb_takes_the_apps_and_the_old_one_lets_no_more_in() {
+async fn a_newer_database_takes_the_apps_and_the_old_one_lets_no_more_in() {
     let laptop = Device::founder("laptop").await;
-    let (old, erisauth) = Core::up(&laptop).await;
+    let (old, eon) = Core::up(&laptop).await;
     let at_old = old.address(&laptop).await;
     let early = App::new(&old, &laptop).await;
+    let note = laptop.approve(early.id(), &["tasks:read"]);
     assert_eq!(
-        laptop
-            .enroll(
-                old.id,
-                &laptop.approve(early.id(), &["tasks:read"]),
-                PASSPHRASE
-            )
-            .await
-            .0,
-        200
+        laptop.enroll(old.id, &note, PASSPHRASE).await.unwrap(),
+        Outcome::Done
     );
 
-    // The person approves another ErisDB; ErisAuth revokes the first one's note.
-    let new = Core::join(&laptop, &erisauth, "another-deployment", &[]).await;
+    // The person approves another database; eon revokes the first one's note.
+    let new = Core::join(&laptop, &eon, "another-deployment", &[]).await;
     assert_ne!(new.id, old.id);
     let snapshot = laptop.node.snapshot().await.unwrap();
     assert_eq!(
-        snapshot.provider("erisdb").map(|p| p.id),
+        snapshot.server(DATABASE).map(|p| p.id),
         Some(new.id),
         "apps find the newer one"
     );
-    assert_eq!(erisauth.asked.lock().unwrap().len(), 2);
+    assert_eq!(snapshot.servers(DATABASE).len(), 1, "the mesh has one");
+    assert_eq!(eon.asked.lock().unwrap().len(), 2);
 
     // The old one hears of it, says so, and lets no app in.
-    let conn = laptop.node.endpoint().connect(at_old, ALPN).await.unwrap();
-    let note = laptop.approve(SecretKey::generate().public(), &["tasks:read"]);
-    let body = until_status("enrolling at the old ErisDB", 503, async || {
-        http(
-            &conn,
-            "POST",
-            "/v1/enroll",
-            Some(json!({"note": note, "passphrase": PASSPHRASE})),
-            None,
-        )
-        .await
-    })
+    let enrolling = enroll::Request::Enroll {
+        note: laptop.approve(SecretKey::generate().public(), &["tasks:read"]),
+        passphrase: PASSPHRASE.into(),
+    };
+    until_answered(
+        "enrolling at the old database",
+        |answer| matches!(answer, Err(Refused::Forbidden { .. })),
+        async || ask_unsynced(laptop.node.endpoint(), at_old.clone(), enrolling.clone()).await,
+    )
     .await;
-    assert_eq!(body["error"], "not_the_erisdb", "{body}");
-    let change = json!({"current": PASSPHRASE, "new": "a passphrase no one uses"});
-    let (status, body) = http(&conn, "POST", "/v1/passphrase", Some(change), None).await;
-    assert_eq!(
-        (status, body["error"].as_str()),
-        (503, Some("not_the_erisdb")),
-        "{body}"
+    let change = enroll::Request::Change {
+        current: PASSPHRASE.into(),
+        new: "a passphrase no one uses".into(),
+    };
+    let refused = ask_unsynced(laptop.node.endpoint(), at_old.clone(), change).await;
+    assert!(
+        matches!(refused, Err(Refused::Forbidden { .. })),
+        "{refused:?}"
     );
-    eventually("the old ErisDB says it is no longer the mesh's", || {
+    eventually("the old database says it is no longer the mesh's", || {
         old.log
             .lock()
             .unwrap()
@@ -1542,18 +1544,12 @@ async fn a_newer_erisdb_takes_the_apps_and_the_old_one_lets_no_more_in() {
     })
     .await;
 
-    // The newer one is where apps get in now.
+    // The newer one is where apps get in.
     let app = App::new(&new, &laptop).await;
-    let (status, enrolled) = laptop
-        .enroll(
-            new.id,
-            &laptop.approve(app.id(), &["tasks:read"]),
-            PASSPHRASE,
-        )
-        .await;
-    assert_eq!(status, 200, "{enrolled}");
+    let note = laptop.approve(app.id(), &["tasks:read"]);
     assert_eq!(
-        app.call("GET", "/v1/permissions", None).await.1["client_id"],
-        enrolled["client"]
+        laptop.enroll(new.id, &note, PASSPHRASE).await.unwrap(),
+        Outcome::Done
     );
+    assert_eq!(app.held().await["grants"], json!(["tasks:read"]));
 }

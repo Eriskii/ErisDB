@@ -1,10 +1,10 @@
 //! Signing in by ticket: the browser's side of the mesh's ceremony.
 //!
-//! The app redeems a device's `eris://pair/` ticket under its own key, asking for a note for
-//! `erisdb` with the grants it wants. Both screens show the fingerprint of the request; the
-//! person compares them and approves on the device, typing ErisDB's passphrase there. The
-//! device enrolls the app at ErisDB and only then approves, so the note the app collects is
-//! already good at ErisDB.
+//! The app redeems a device's `eris://pair/` ticket under its own key, asking for a note to use
+//! `database/1` with the grants it wants. Both screens show the fingerprint of the request; the
+//! person compares them and approves on the device, typing the database's passphrase there. The
+//! device enrolls the app at the mesh's database and only then approves, so the note the app
+//! collects is already good there.
 //!
 //! A page can go away while the person is still deciding. What it keeps of a sign-in under way
 //! — the ticket, what it asked for and the device's name — lets the next page wait for the same
@@ -12,20 +12,21 @@
 
 use std::time::Duration;
 
-use erisoverlaynetwork::Result;
 use erisoverlaynetwork::ceremony::{self, Approval, Ask};
 use erisoverlaynetwork::ticket::Ticket;
+use erisoverlaynetwork::{Result, Uses};
 use iroh::Endpoint;
 
 /// How long a sign-in waits for the person, at most. The ticket usually ends first.
 pub const PATIENCE: Duration = Duration::from_secs(3600);
 
-/// The service the app asks to take part in.
-pub const SERVICE: &str = "erisdb";
+/// What the app uses: the database ErisDB serves.
+pub const CAPABILITY: &str = "database/1";
 
-/// What the app asks for.
+/// What the app asks for: to use the database with `grants`, serving nothing.
 pub fn ask(name: &str, grants: Vec<String>) -> Ask {
-    Ask::App { name: name.to_string(), service: SERVICE.to_string(), grants, serves: false }
+    let uses = Uses::from([(CAPABILITY.parse().expect("database/1 is a capability"), grants)]);
+    Ask::App { name: name.to_string(), uses, serves: Vec::new() }
 }
 
 /// A sign-in under way, redeemed by this page or by an earlier one under the same key.

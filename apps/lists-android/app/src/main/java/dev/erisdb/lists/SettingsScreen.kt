@@ -89,7 +89,7 @@ fun SettingsScreen(
 /**
  * What this app was actually granted, next to what it asked for.
  *
- * The person answers in ErisAuth and may approve less than the whole
+ * The person answers in ErisOverlayNetwork and may approve less than the whole
  * manifest, which is a legitimate answer and not an error — so the app
  * says which of its parts are switched off and why, rather than leaving
  * the user to wonder where the Add button went.
@@ -115,7 +115,7 @@ private fun Permissions(grants: Grants) {
     }
     if (withheld(grants, MANIFEST).isNotEmpty()) {
         Text(
-            "Sign in again to ask for the rest; you approve it in ErisAuth.",
+            "Sign in again to ask for the rest; you approve it in ErisOverlayNetwork.",
             style = MaterialTheme.typography.labelSmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )

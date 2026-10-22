@@ -1,24 +1,25 @@
 #!/usr/bin/env python3
-"""Real APK UI -> ErisAuth -> JNI -> Iroh -> core -> Postgres, on an isolated emulator.
+"""Real APK UI -> ErisOverlayNetwork -> JNI -> Iroh -> core -> Postgres, on an isolated emulator.
 
 What it needs, all of it real:
 - an isolated Android emulator (API 30 or later) on adb, serial `emulator-*`, with internet access,
-  and none of dev.eris.auth, dev.erisdb.tasks or dev.erisdb.lists installed: the suite installs
+  and none of dev.eris.eon, dev.erisdb.tasks or dev.erisdb.lists installed: the suite installs
   and uninstalls them, and refuses a device holding them;
 - this machine's internet access too: the host's devices and the emulator's find each other through
   n0's relays, the only network the Android apps use;
 - Docker, for a disposable Postgres;
-- the `erisdb` binary (`ERISDB_BIN`, else built from `erisdb/`) and the `erisauth` binary
-  (`ERISAUTH_BIN`, else built from ErisAuth beside this checkout, `../ErisAuth`);
-- the debug APKs: `scripts/build-android.sh` builds Tasks and Lists, and ErisAuth's own
-  `scripts/build-android.sh` builds `ERISAUTH_APK` (else `../ErisAuth/android/app/build/outputs/
+- the `erisdb` binary (`ERISDB_BIN`, else built from `erisdb/`) and the `eon` binary
+  (`EON_BIN`, else built from ErisOverlayNetwork beside this checkout, `../ErisOverlayNetwork`);
+- the debug APKs: `scripts/build-android.sh` builds Tasks and Lists, and ErisOverlayNetwork's own
+  `scripts/build-android.sh` builds `EON_APK` (else `../ErisOverlayNetwork/android/app/build/outputs/
   apk/debug/app-debug.apk`).
 
-The mesh is made as a person makes one: ErisAuth on this machine starts it, `erisdb join` asks it
-to approve ErisDB, `erisdb passphrase set` sets the passphrase, and `erisdb serve` runs ErisDB.
-ErisAuth on the emulator joins by the host's ticket, the fingerprint on both screens. Each app then
-signs in as a person signs it in: it asks ErisAuth on the phone, and the person answers in
-ErisAuth's own screens — denying, then approving part of what was asked with a wrong passphrase
+The mesh is made as a person makes one: ErisOverlayNetwork on this machine starts it, `erisdb join` asks it
+to approve ErisDB as the mesh's database (`database/1`), `erisdb passphrase set` sets the passphrase,
+and `erisdb serve` runs ErisDB.
+ErisOverlayNetwork on the emulator joins by the host's ticket, the fingerprint on both screens. Each app then
+signs in as a person signs it in: it asks ErisOverlayNetwork on the phone, and the person answers in
+ErisOverlayNetwork's own screens — denying, then approving part of what was asked with a wrong passphrase
 and then the right one. No intercepted requests, fake clients, simulated time, or in-memory
 database.
 """
@@ -38,7 +39,7 @@ import urllib.request
 import xml.etree.ElementTree as ET
 
 ROOT = Path(__file__).resolve().parents[2]
-ERISAUTH = ROOT.parent / 'ErisAuth'
+EON = ROOT.parent / 'ErisOverlayNetwork'
 ADB = os.environ.get('ADB', 'adb')
 SECRET = 'erisdb-android-e2e-only'
 PASSPHRASE = 'correct horse battery staple'
@@ -47,14 +48,16 @@ CORE = f'http://{LISTEN}'
 CLIENTS = {'tasks': 'Tasks (Android) v0.4', 'lists': 'Lists (Android) v0.5'}
 NAMES = {'tasks': 'Tasks', 'lists': 'Lists'}
 MANIFEST = {app: [f'{app}:{action}' for action in ('read', 'create', 'update', 'delete')] for app in CLIENTS}
+DATABASE = 'database/1'  # What ErisDB serves, and what Tasks and Lists use.
 
 
-def binary(variable, crate, name):
-    """A built binary: the one `variable` names, else `crate`'s, built now."""
+def binary(variable, crate, name, target=None):
+    """A built binary: the one `variable` names, else `crate`'s, built now into `target`, the
+    crate's own `target` unless it builds in a workspace's."""
     if os.environ.get(variable):
         return Path(os.environ[variable])
     subprocess.check_call(['cargo', 'build', '--manifest-path', str(crate / 'Cargo.toml'), '--bin', name])
-    return crate / 'target/debug' / name
+    return (target or crate / 'target') / 'debug' / name
 
 
 def eventually(check, seconds=120, description='the real app/core state', diagnostics=None):
@@ -68,10 +71,10 @@ def eventually(check, seconds=120, description='the real app/core state', diagno
     raise AssertionError(f'timed out waiting for {description}{detail}')
 
 
-# ---------------------------------------------------------------- the host: ErisAuth and ErisDB
+# ---------------------------------------------------------------- the host: ErisOverlayNetwork and ErisDB
 
 class Host:
-    """This machine as a device of the mesh: ErisAuth running here, and ErisDB joined through it."""
+    """This machine as a device of the mesh: ErisOverlayNetwork running here, and ErisDB joined through it."""
 
     def __init__(self):
         self.dirs = tempfile.mkdtemp(prefix='erisdb-android-e2e-')
@@ -81,7 +84,7 @@ class Host:
         self.runtime.mkdir(mode=0o700)
         self.processes = []
         self.postgres = None
-        self.erisauth = binary('ERISAUTH_BIN', ERISAUTH, 'erisauth')
+        self.eon = binary('EON_BIN', EON / 'eon', 'eon', EON / 'target')
         self.erisdb = binary('ERISDB_BIN', ROOT / 'erisdb', 'erisdb')
 
     def start(self):
@@ -94,13 +97,15 @@ class Host:
                                            'postgres'], capture_output=True).returncode == 0,
                    seconds=60, description='postgres')
 
-        self.spawn([self.erisauth, 'serve', '--no-notify'], self.device_env())
-        eventually(self.listening, seconds=60, description='ErisAuth on this machine')
+        self.spawn([self.eon, 'serve', '--no-notify'], self.device_env())
+        eventually(self.listening, seconds=60, description='ErisOverlayNetwork on this machine')
         assert self.say({'op': 'init', 'name': 'host'}).get('ok'), 'the host starts a mesh'
 
         join = subprocess.Popen([self.erisdb, 'join'], env=self.erisdb_env() | {'XDG_RUNTIME_DIR': str(self.runtime)},
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        prompt = self.prompt(lambda p: p['becomes_erisdb'])
+        prompt = self.prompt(lambda p: any(served['capability'] == DATABASE for served in p['serves']))
+        # The mesh has one database, the most recently approved, and an app gets in with its passphrase.
+        assert prompt['serves'] == [{'capability': DATABASE, 'single': True, 'passphrase': True}], prompt
         assert self.say({'op': 'decide', 'id': prompt['id']}) == {'ok': True}
         out, err = join.communicate(timeout=120)
         assert join.returncode == 0, f'erisdb join: {err}'
@@ -109,7 +114,7 @@ class Host:
                        check=True, timeout=60)
         self.spawn([self.erisdb, 'serve'], self.erisdb_env())
         eventually(lambda: self.health(), seconds=120, description='erisdb serve')
-        eventually(self.reaches_erisdb, description='the host reaching ErisDB')
+        eventually(lambda: (self.database() or {}).get('reachable'), description='the host reaching ErisDB')
         self.admin = subprocess.check_output([self.erisdb, 'mint', '--grant', '*', '--ttl', '3600'],
                                              env=self.erisdb_env(), text=True).strip()
 
@@ -127,7 +132,7 @@ class Host:
         self.processes.append(subprocess.Popen(command, env=env))
 
     def socket(self):
-        return self.runtime / 'erisauth' / 'agent.sock'
+        return self.runtime / 'eon' / 'agent.sock'
 
     def listening(self):
         try:
@@ -137,7 +142,7 @@ class Host:
             return False
 
     def say(self, line):
-        """One command on ErisAuth's socket, as its approval page and terminal send them."""
+        """One command on ErisOverlayNetwork's socket, as its approval page and terminal send them."""
         with socket.socket(socket.AF_UNIX) as s:
             s.connect(str(self.socket()))
             s.sendall((json.dumps(line) + '\n').encode())
@@ -151,9 +156,11 @@ class Host:
         return eventually(lambda: next((p for p in self.state()['approvals'] if which(p)), None),
                           description='a request put to the person at the host')
 
-    def reaches_erisdb(self):
-        erisdb = (self.state()['mesh'] or {}).get('erisdb')
-        return bool(erisdb and erisdb.get('reachable'))
+    def database(self):
+        """The mesh's database as the host has it: the app in use among the servers of `database/1`."""
+        servers = (self.state()['mesh'] or {}).get('servers', [])
+        apps = next((server['apps'] for server in servers if server['capability'] == DATABASE), [])
+        return apps[0] if apps else None
 
     def health(self):
         try:
@@ -171,7 +178,7 @@ class Host:
             return None if response.status == 204 else json.load(response)
 
     def installation(self, app):
-        """The newest installation of `app`, by the name it asked ErisAuth under."""
+        """The newest installation of `app`, by the name it asked ErisOverlayNetwork under."""
         found = [c for c in self.api('GET', '/v1/clients')['clients'] if c['name'] == CLIENTS[app]]
         return found[-1] if found else None
 
@@ -265,20 +272,20 @@ def online():
     adb('shell', 'svc', 'data', 'enable')
 
 
-class ErisAuthApp:
-    """ErisAuth on the phone, driven through its own screens as its person drives it."""
-    package = 'dev.eris.auth'
-    component = 'dev.eris.auth/dev.eris.auth.MainActivity'
+class ErisOverlayNetworkApp:
+    """ErisOverlayNetwork on the phone, driven through its own screens as its person drives it."""
+    package = 'dev.eris.eon'
+    component = 'dev.eris.eon/dev.eris.eon.MainActivity'
 
     def install(self, host):
-        apk = Path(os.environ.get('ERISAUTH_APK', ERISAUTH / 'android/app/build/outputs/apk/debug/app-debug.apk'))
+        apk = Path(os.environ.get('EON_APK', EON / 'android/app/build/outputs/apk/debug/app-debug.apk'))
         assert apk.is_file(), f'build {apk} first'
         adb('install', '-g', str(apk))
         added = host.say({'op': 'add'})
         ticket = added['ticket']
         # A ticket opened as a link fills in the join screen, as a scanned one does.
         adb('shell', 'am', 'start', '-W', '-a', 'android.intent.action.VIEW', '-d', ticket, '-n', self.component)
-        eventually(lambda: has_text('Join your devices'), description='ErisAuth\'s join screen', diagnostics=texts)
+        eventually(lambda: has_text('Join your devices'), description='ErisOverlayNetwork\'s join screen', diagnostics=texts)
         edit(0, 'emulator')
         button('Join')
         prompt = host.prompt(lambda p: p['kind'] == 'device')
@@ -293,9 +300,9 @@ class ErisAuthApp:
         button('Requests')
 
     def asked_by(self, app):
-        """Wait for `app`'s request on ErisAuth's Requests screen."""
+        """Wait for `app`'s request on ErisOverlayNetwork's Requests screen."""
         self.requests()
-        eventually(lambda: has_text(CLIENTS[app]), description=f'{app} asking ErisAuth', diagnostics=texts)
+        eventually(lambda: has_text(CLIENTS[app]), description=f'{app} asking ErisOverlayNetwork', diagnostics=texts)
 
     def deny(self, app):
         self.asked_by(app)
@@ -320,7 +327,7 @@ class ErisAuthApp:
 
 # ---------------------------------------------------------------- one app
 
-def run(app, host, erisauth):
+def run(app, host, eon):
     package = f'dev.erisdb.{app}'
     component = f'{package}/dev.erisdb.{app}.MainActivity'
     add = 'add task' if app == 'tasks' else 'add entry'
@@ -380,28 +387,28 @@ def run(app, host, erisauth):
 
     installed = adb('shell', 'pm', 'list', 'packages', package).splitlines()
     assert f'package:{package}' not in installed, 'use an isolated emulator; existing app data must be preserved'
-    print(f'{app}: install; it asks ErisAuth on its first launch', flush=True)
+    print(f'{app}: install; it asks ErisOverlayNetwork on its first launch', flush=True)
     adb('install', '-g', str(apk))
     try:
         assert not any(item['body']['name'] == app for item in host.api('GET', '/v1/items?facet=facet')['items'])
         launch()
-        eventually(lambda: has_text('Waiting for ErisAuth'), diagnostics=texts)
+        eventually(lambda: has_text('Waiting for ErisOverlayNetwork'), diagnostics=texts)
 
-        print(f'{app}: the person says no in ErisAuth', flush=True)
-        erisauth.deny(app)
+        print(f'{app}: the person says no in ErisOverlayNetwork', flush=True)
+        eon.deny(app)
         launch()
-        eventually(lambda: has_text(f'ErisAuth did not let {NAMES[app]} in'), diagnostics=texts)
+        eventually(lambda: has_text(f'ErisOverlayNetwork did not let {NAMES[app]} in'), diagnostics=texts)
         assert host.installation(app) is None, 'a denial lets nothing in'
 
         print(f'{app}: asked again, approved in part, after a wrong passphrase', flush=True)
         button('Ask again')
-        eventually(lambda: has_text('Waiting for ErisAuth'))
-        erisauth.asked_by(app)
-        erisauth.withhold([f'{app}:update', f'{app}:delete'])
-        erisauth.approve(app, given=2, passphrase='not the passphrase')
+        eventually(lambda: has_text('Waiting for ErisOverlayNetwork'))
+        eon.asked_by(app)
+        eon.withhold([f'{app}:update', f'{app}:delete'])
+        eon.approve(app, given=2, passphrase='not the passphrase')
         eventually(lambda: has_text('That is not the passphrase.'), diagnostics=texts)
         assert host.installation(app) is None, 'a wrong passphrase lets nothing in'
-        erisauth.approve(app, given=2)
+        eon.approve(app, given=2)
         installation = eventually(lambda: host.installation(app), description=f'{app} enrolled at ErisDB')
         assert sorted(installation['approved']) == sorted([f'{app}:read', f'{app}:create']), installation
         assert installation['grants'] == installation['approved']
@@ -411,7 +418,7 @@ def run(app, host, erisauth):
         # The key and the address of the ErisDB it was let into, sealed on the phone, and nothing else.
         raw = adb('shell', 'run-as', package, 'cat', 'shared_prefs/erisdb-secrets.xml')
         assert {n.get('name') for n in ET.fromstring(raw)} == {'key', 'server'}, raw
-        assert host.state()['mesh']['erisdb']['app'] not in raw, 'the address is sealed, not in the clear'
+        assert host.database()['app'] not in raw, 'the address is sealed, not in the clear'
 
         label = f'{app}AndroidE2E{time.time_ns()}'
         button(add)
@@ -495,9 +502,9 @@ def run(app, host, erisauth):
         print(f'{app}: sign in again from Settings to ask for the rest', flush=True)
         settings()
         button('Sign in again')
-        eventually(lambda: has_text('Waiting for ErisAuth'))
-        erisauth.asked_by(app)
-        erisauth.approve(app, given=len(MANIFEST[app]))
+        eventually(lambda: has_text('Waiting for ErisOverlayNetwork'))
+        eon.asked_by(app)
+        eon.approve(app, given=len(MANIFEST[app]))
         again = eventually(lambda: (i if sorted((i := host.installation(app))['grants']) == sorted(MANIFEST[app])
                                     else None),
                            description=f'{app} granted the rest')
@@ -616,7 +623,7 @@ def run(app, host, erisauth):
         print(f'{app}: revoked, it is shut out until it signs in again', flush=True)
         host.api('POST', f"/v1/clients/{installation['id']}/revoke", {})
         eventually(lambda: has_text('ErisDB no longer lets this app in'), diagnostics=texts)
-        print(f'{app}: ErisAuth sign-in (denied, wrong passphrase, part, the rest), offline queue order/deletion/'
+        print(f'{app}: ErisOverlayNetwork sign-in (denied, wrong passphrase, part, the rest), offline queue order/deletion/'
               'rejections, revision conflict, snapshot/feed pagination, cache recovery, CRUD and revocation passed',
               flush=True)
     except Exception:
@@ -636,19 +643,19 @@ def main():
     apps = sys.argv[1:] or ['tasks', 'lists']
     assert all(app in CLIENTS for app in apps)
     held = adb('shell', 'pm', 'list', 'packages').splitlines()
-    assert 'package:dev.eris.auth' not in held, 'use an isolated emulator; ErisAuth there holds a device of a mesh'
+    assert 'package:dev.eris.eon' not in held, 'use an isolated emulator; ErisOverlayNetwork there holds a device of a mesh'
     host = Host()
-    erisauth = ErisAuthApp()
+    eon = ErisOverlayNetworkApp()
     try:
         print('host: a mesh, ErisDB joined through it, its passphrase set, serving', flush=True)
         host.start()
-        print('phone: ErisAuth joins the mesh by the host\'s ticket', flush=True)
-        erisauth.install(host)
+        print('phone: ErisOverlayNetwork joins the mesh by the host\'s ticket', flush=True)
+        eon.install(host)
         for app in apps:
-            run(app, host, erisauth)
+            run(app, host, eon)
     finally:
         try:
-            erisauth.uninstall()
+            eon.uninstall()
         except subprocess.CalledProcessError:
             pass
         host.stop()

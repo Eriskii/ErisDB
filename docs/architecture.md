@@ -8,7 +8,7 @@ owner's mesh beside them:
 | Item | `items` | A facet, JSON body, revision, timestamps, and last writer. Facet definitions are items too. |
 | Change | `changes` | An immutable item snapshot or core event, ordered by a durable cursor. The same rows serve history and synchronization. |
 | Installation | `clients` | An app a device let in: its Iroh key, the device, the note, and its grants. Its key is its credential. |
-| Mesh | `mesh` | The note that approves this core as the mesh's ErisDB, and its copy of the device list. |
+| Mesh | `mesh` | The note that approves this core to serve the mesh's database, `database/1`, and its copy of the device list. |
 | Passphrase | `passphrase`, `passphrase_guesses` | The enrollment passphrase's Argon2id hash, and each device's wrong guesses. |
 
 The HTTP API performs authentication, authorization, and schema validation.
@@ -22,15 +22,20 @@ The core's mesh node is the one long-lived thing a replica runs besides its
 listeners. It keeps the device list current — devices push every entry to it —
 and saves it to the `mesh` row. Authorization reads the list in memory: an app
 counts while its device is a member and its note unrevoked, and the core lets apps
-in while its own note counts. A watcher revokes the installations a removal or
+in while its own note counts. Devices let apps in over `eris-enroll/0`, the mesh
+library's enroll protocol: the library checks the device and the note against
+the list, and the core checks the passphrase and writes the installation. A watcher revokes the installations a removal or
 revocation ends, as soon as the list carries it, and logs when the core's own
 note stops counting.
 
 ```mermaid
 flowchart LR
-    Transport[HTTP / Iroh erisdb/0] --> API[Authorization and validation]
+    Transport[HTTP / Iroh eris/database/1] --> API[Authorization and validation]
     Devices[Devices, eris-mesh/0] --> Node[Mesh node: the device list]
+    Enrolling[Devices, eris-enroll/0] --> Gate[Passphrase and enrollment]
     Node --> API
+    Node --> Gate
+    Gate --> Write
     Node --> Watcher[Revocation watcher]
     API --> Write[Write transaction]
     Watcher --> Write
@@ -84,7 +89,7 @@ The integration suites exercise real PostgreSQL, HTTP, Iroh/QUIC, CLI processes,
 plugin executables, and real mesh participants: device nodes built from the mesh
 library, joining the erisdb binary to their mesh, enrolling apps from their own
 endpoints, and removing devices and revoking notes, all on loopback endpoints.
-ErisAuth's agent socket is a stand-in answering as ErisAuth does. Client retry
+`eon`'s agent socket is a stand-in answering as `eon` does. Client retry
 tests forward to the real core and deliberately drop a response after the
 operation commits, then check the resulting database state. They do not
 fabricate server responses. Small pure tests remain for parsing, permissions,
@@ -101,8 +106,8 @@ python3 tests/local/test_launcher.py
 ```
 
 Run browser tests with `npm run test:e2e` after installing the npm dependencies
-and Playwright Chromium; they run ErisAuth beside the core, built from
-`ERISAUTH_SOURCE` (`../ErisAuth` by default). `ERISDB_CHROMIUM` can select an
+and Playwright Chromium; they run `eon` beside the core, built from
+`EON_SOURCE` (`../ErisOverlayNetwork` by default). `ERISDB_CHROMIUM` can select an
 installed Chromium.
 Build both Android apps with `scripts/build-android.sh`, start an isolated
 emulator, then run `bash tests/android/run.sh`. The device suite covers offline

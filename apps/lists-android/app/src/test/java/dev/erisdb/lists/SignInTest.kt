@@ -1,6 +1,6 @@
 package dev.erisdb.lists
 
-import dev.eris.auth.client.ErisAuth
+import dev.eris.eon.client.ErisOverlayNetwork
 import dev.erisdb.android.*
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
@@ -10,8 +10,8 @@ import org.junit.Assert.fail
 import org.junit.Test
 
 /**
- * Signing in through ErisAuth on the phone: what this app asks it, and what its answer comes to.
- * The answers are ErisAuth's reply lines as its client library reads them; the address is the
+ * Signing in through ErisOverlayNetwork on the phone: what this app asks it, and what its answer comes to.
+ * The answers are ErisOverlayNetwork's reply lines as its client library reads them; the address is the
  * envelope erisdb-client's `nativeLocate` writes.
  */
 class SignInTest {
@@ -20,24 +20,27 @@ class SignInTest {
     private val server = """{"id":"$erisdb","addrs":[{"Relay":"https://relay.example/"},{"Ip":"192.0.2.7:4433"}]}"""
     private val note = """{"by":"9c1e","body":"eyJtZXNoIjoiNWYyZCJ9","sig":"Qm3t"}"""
     private val snapshot = """{"mesh":"5f2d","entries":[],"directory":[]}"""
-    private val approved = ErisAuth.Answer.parse("""{"approved":{"note":$note,"snapshot":$snapshot}}""")
+    private val approved = ErisOverlayNetwork.Answer.parse("""{"approved":{"note":$note,"snapshot":$snapshot}}""")
 
-    /** `nativeLocate`, answering [envelope] for the snapshot ErisAuth handed over and nothing else. */
+    /** `nativeLocate`, answering [envelope] for the snapshot ErisOverlayNetwork handed over and nothing else. */
     private fun locate(envelope: String): (String) -> String = { seen ->
-        assertEquals("the snapshot ErisAuth answered with", JSONObject(snapshot).toString(), JSONObject(seen).toString())
+        assertEquals("the snapshot ErisOverlayNetwork answered with", JSONObject(snapshot).toString(), JSONObject(seen).toString())
         envelope
     }
 
     private val nowhere: (String) -> String = { fail("nothing is located without an approval"); "" }
 
     @Test
-    fun thisAppAsksToBeLetIntoErisDBAsAClientUnderItsOwnKey() {
+    fun thisAppAsksToUseADatabaseUnderItsOwnKeyAndServesNothing() {
         val line = JSONObject(Ask(CLIENT, MANIFEST, app).line)
         assertEquals("approve", line.getString("op"))
-        assertEquals("erisdb", line.getString("service"))
+        assertEquals(3, line.getInt("v"))
         assertEquals(CLIENT, line.getString("name"))
-        assertEquals(MANIFEST, List(MANIFEST.size) { line.getJSONArray("grants").getString(it) })
-        assertEquals(false, line.getBoolean("serves"))
+        val uses = line.getJSONObject("uses")
+        assertEquals(listOf("database/1"), uses.keys().asSequence().toList())
+        val grants = uses.getJSONArray("database/1")
+        assertEquals(MANIFEST, List(grants.length()) { grants.getString(it) })
+        assertEquals(0, line.getJSONArray("serves").length())
         assertEquals(app, line.getString("app"))
     }
 
@@ -75,16 +78,16 @@ class SignInTest {
 
     @Test
     fun aDenialIsThePersonsAndKeepsNothing() {
-        val denied = ErisAuth.Answer.parse("""{"denied":"the person said no"}""")
+        val denied = ErisOverlayNetwork.Answer.parse("""{"denied":"the person said no"}""")
         assertEquals(SignIn.Denied("the person said no"), signedIn(denied, nowhere) { fail("nothing is kept") })
     }
 
     @Test
     fun aFailureSaysWhyAndKeepsNothing() {
-        val failed = ErisAuth.Answer.parse("""{"error":"that is not ErisDB's passphrase"}""")
+        val failed = ErisOverlayNetwork.Answer.parse("""{"error":"that is not ErisDB's passphrase"}""")
         assertEquals(SignIn.Failed("that is not ErisDB's passphrase"), signedIn(failed, nowhere) { fail("nothing is kept") })
-        val gone = ErisAuth.Answer.parse("""{"error":"ErisAuth went away"}""")
-        assertEquals(SignIn.Failed("ErisAuth went away"), signedIn(gone, nowhere) { fail("nothing is kept") })
+        val gone = ErisOverlayNetwork.Answer.parse("""{"error":"ErisOverlayNetwork went away"}""")
+        assertEquals(SignIn.Failed("ErisOverlayNetwork went away"), signedIn(gone, nowhere) { fail("nothing is kept") })
     }
 
     @Test

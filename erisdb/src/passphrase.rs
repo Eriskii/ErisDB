@@ -19,6 +19,7 @@ use argon2::password_hash::rand_core::OsRng;
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use argon2::Argon2;
 use erisoverlaynetwork::devices::DeviceId;
+use erisoverlaynetwork::enroll::Outcome;
 use sqlx::PgPool;
 
 use crate::error::{Error, Result};
@@ -116,14 +117,22 @@ pub async fn unlock(pool: &PgPool, device: Option<&DeviceId>) -> Result<u64> {
     Ok(cleared.rows_affected())
 }
 
-/// Check `guess` from `device`, counting it when it is wrong. While the
-/// device is locked out nothing is checked at all: the answer is how long
-/// it has left to wait. `first` is the first wait; see [`lockout`].
-pub async fn check(pool: &PgPool, device: &DeviceId, guess: &str, first: Duration) -> Result<()> {
+/// Check `guess` from `device`, counting it when it is wrong: `Done` when
+/// it is right. While the device is locked out nothing is checked at all:
+/// the answer is how long it has left to wait. `first` is the first wait;
+/// see [`lockout`].
+pub async fn check(
+    pool: &PgPool,
+    device: &DeviceId,
+    guess: &str,
+    first: Duration,
+) -> Result<Outcome> {
     let stored: Option<String> = sqlx::query_scalar("SELECT hash FROM passphrase")
         .fetch_optional(pool)
         .await?;
-    let stored = stored.ok_or(Error::NoPassphrase)?;
+    let Some(stored) = stored else {
+        return Ok(Outcome::NoPassphrase);
+    };
     let device = device.to_string();
     // The device's row stays locked while its guess is hashed, so guesses
     // sent at once are counted one after another rather than all at once.
@@ -140,7 +149,7 @@ pub async fn check(pool: &PgPool, device: &DeviceId, guess: &str, first: Duratio
     .fetch_one(&mut *tx)
     .await?;
     if let Some(left) = left.filter(|left| *left > 0.0) {
-        return Err(Error::Locked {
+        return Ok(Outcome::Locked {
             retry_after: left.ceil().max(1.0) as u64,
         });
     }
@@ -150,7 +159,7 @@ pub async fn check(pool: &PgPool, device: &DeviceId, guess: &str, first: Duratio
             .execute(&mut *tx)
             .await?;
         tx.commit().await?;
-        return Ok(());
+        return Ok(Outcome::Done);
     }
     let wrong = u32::try_from(wrong).unwrap_or(0).saturating_add(1);
     let wait = lockout(wrong, first);
@@ -166,7 +175,7 @@ pub async fn check(pool: &PgPool, device: &DeviceId, guess: &str, first: Duratio
     .await?;
     tx.commit().await?;
     tracing::warn!(device = %device, wrong, "wrong passphrase");
-    Err(Error::WrongPassphrase {
+    Ok(Outcome::Wrong {
         retry_after: wait.map(|wait| wait.as_secs().max(1)),
     })
 }

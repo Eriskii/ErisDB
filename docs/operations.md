@@ -10,7 +10,7 @@ device list in memory belong to each running server process.
 
 ## Local launcher
 
-From the checkout, run `./scripts/run-local.py` where ErisAuth runs. It builds ErisDB
+From the checkout, run `./scripts/run-local.py` where `eon` runs. It builds ErisDB
 exactly as its lockfile names, whatever Cargo configuration surrounds the checkout, starts a
 dedicated Postgres 17 Docker container, starts the server, and opens an `erisdb>` prompt. The
 server loads plugin manifests from `plugins/` in the data directory, or from
@@ -18,7 +18,7 @@ server loads plugin manifests from `plugins/` in the data directory, or from
 are required on Linux.
 
 The first time, the server is in no mesh yet: the launcher runs `erisdb join`, which asks
-this machine's ErisAuth to make it the mesh's ErisDB — approve it on the device — and then
+this machine's `eon` to make it the mesh's database — approve it on the device — and then
 `erisdb passphrase set`, which asks for the passphrase devices type to let apps in. Later
 launches find both in the database.
 
@@ -57,7 +57,7 @@ stop the launcher first; normal live backups use `pg_dump` as described below.
 ## Systemd service (Debian)
 
 After building the server and creating the database using the README, join the
-mesh and set the passphrase as yourself, where ErisAuth runs, with the server
+mesh and set the passphrase as yourself, where `eon` runs, with the server
 configuration loaded:
 
 ```sh
@@ -107,12 +107,13 @@ environment being the normal path:
 On start it loads plugin manifests when configured, connects the pool (16
 connections per replica), runs the migrations, and reads its note: without one
 it refuses to start, saying to run `erisdb join`, and with one for another key
-it refuses too. It binds the iroh endpoint under that key and starts its mesh
-node, which syncs with the mesh at once; binds the TCP listener; and serves
-both until one of them stops, with `erisdb/0` and `eris-mesh/0` on the one
-endpoint. Plugin secrets such as `OPENAI_API_KEY` are ordinary service
-environment variables; each manifest explicitly allowlists which ones its fresh
-process receives.
+it refuses too. It binds the iroh
+endpoint under that key and starts its mesh node, which syncs with the mesh at
+once; binds the TCP listener; and serves both until one of them stops, with
+`eris/database/1`, `eris-mesh/0` and `eris-enroll/0` on the one endpoint.
+Plugin secrets such as `OPENAI_API_KEY` are ordinary service environment
+variables; each manifest explicitly allowlists which ones its fresh process
+receives.
 
 `deploy/erisdb.service` passes `--listen ${ERISDB_LISTEN}` explicitly, so
 that variable must be set in `/etc/erisdb/erisdb.env`: unset, systemd
@@ -198,12 +199,13 @@ Things to know about the cadence:
 
 ## Letting apps in
 
-Apps get in through a device, not the server: the person approves the app on a
-device and types the passphrase there, and the device enrolls it here. The
-operator's part is the passphrase and the registry:
+Apps get in through a device, not the server: an app asks a device to use
+`database/1`, the person approves it there and types the passphrase, and the
+device enrolls it here over `eris-enroll/0`. The operator's part is the
+passphrase and the registry:
 
 - **`erisdb passphrase set`** sets the passphrase, or resets a forgotten one.
-  Devices can change it themselves by knowing it.
+  Devices can change it themselves by knowing it (`eon passphrase`).
 - **`erisdb passphrase unlock [DEVICE]`** clears a device's wrong guesses
   (by endpoint id), or every device's, when someone fat-fingered their way into
   a long wait.
@@ -273,7 +275,7 @@ Rotating `ERISDB_SECRET` does exactly one irreversible thing, or two:
 - **The key moves too, unless `ERISDB_IROH_SECRET` is set separately.** The
   core's note approves the old key, so it refuses to serve until `erisdb join`
   has a device approve the new one, and every app then finds it anew as the
-  mesh's ErisDB.
+  mesh's database.
 
 Revoke one installation with `erisdb clients revoke CLIENT_UUID`. This
 immediately blocks the app's requests and active change feeds. Tokens without an
@@ -288,13 +290,14 @@ needs to see the secret on disk.
 
 The HTTP and Iroh listeners serve the same API, with different transport security:
 
-**Iroh is the reachable path.** ALPN `erisdb/0`, HTTP/1.1 per QUIC
+**Iroh is the reachable path.** ALPN `eris/database/1`, HTTP/1.1 per QUIC
 bi-stream, authenticated and encrypted end to end by the transport, with
 no port to forward and no certificate to manage. The endpoint id is public
 and stable by design, so anyone may dial — and nobody reads or writes
 without an installation for their key, or a token. This is what apps use. The
 same endpoint serves `eris-mesh/0`, where devices keep the core's device list
-current.
+current, and `eris-enroll/0`, where devices let apps in and change the
+passphrase.
 
 **Plain TCP is the local path.** It defaults to `127.0.0.1:7700` and
 belongs there. Capability tokens are bearer credentials in an
@@ -310,8 +313,8 @@ in front of `127.0.0.1:7700`. Otherwise leave it on loopback and dial over
 iroh, which needs no open port at all.
 
 `GET /v1/health` needs no credential. Every other route requires an enrolled
-key over Iroh, a bearer capability, or — for enrollment and passphrase changes —
-a device of the mesh. Health answers from the process without touching the
+key over Iroh or a bearer capability. Enrollment and passphrase changes are not
+routes: they take a device of the mesh, over `eris-enroll/0`. Health answers from the process without touching the
 store, so it is liveness, not readiness — a core with a dead database still
 answers `{"ok": true}`.
 
@@ -329,7 +332,7 @@ Bounds the core enforces, and what hitting one looks like:
 | `X-ErisDB-Client` | 128 chars, printable ASCII | **400**. It lands in every change row this caller writes. |
 | Grants per token / grant length | 64 / 128 chars | **400** at mint. |
 | Refresh chain over HTTP | 365 days | **400**. The CLI has no ceiling; it holds the secret. |
-| Passphrase guesses | 3 free per device, then 1 minute doubling to a day | **429** `locked` with `retry_after` and `Retry-After`. In Postgres, so a restart forgives no one. |
+| Passphrase guesses | 3 free per device, then 1 minute doubling to a day | The device hears `locked` with `retry_after`, and nothing it sends is checked. In Postgres, so a restart forgives no one. |
 | Request body | 2 MiB; `/v1/call` 16 MiB | **413**. |
 | Plugin invocation timeout | 1 hour maximum; 10 minutes in the OpenAI manifest | Before response: **502** `plugin_failed`; during response: the stream ends with an error and the child is killed. |
 | Store pool | 16 connections | Requests queue. |
@@ -359,10 +362,10 @@ The server logs these events:
 - `enrolled` and `revoked by the mesh` — info, naming the installation and app.
   `wrong passphrase` — warn, naming the device and its count.
 - `this ErisDB's approval no longer counts` — error. The mesh approved another
-  ErisDB, or the device that approved this one left. Apps find the other one, and
-  this one refuses enrollments with `503 not_the_erisdb`; `erisdb join` makes it
-  the mesh's ErisDB again. `this ErisDB's approval counts again` — info, when it
-  does.
+  database, or the device that approved this one left. Apps find the other one,
+  and this one lets no more apps in and takes no passphrase change; `erisdb join`
+  makes it the mesh's database again. `this ErisDB's approval counts again` —
+  info, when it does.
 - `store failure` — error, carrying the real Postgres message. The caller
   got `the store failed; see the server log` and a 500, because the raw
   text carries constraint names, column names and query fragments. This

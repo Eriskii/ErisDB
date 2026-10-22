@@ -1,14 +1,16 @@
-//! Dials an ErisDB over Iroh: HTTP/1.1 per QUIC bi-stream, ALPN `erisdb/0`.
+//! The client of `database/1`, the database a mesh has one of and ErisDB
+//! serves: HTTP/1.1 per QUIC bi-stream, ALPN `eris/database/1`.
 //!
-//! An app is let into ErisDB by a device in its owner's mesh: the device
-//! approves the app's key with a note, the person types ErisDB's
-//! passphrase, and the device enrolls the note at the mesh's ErisDB. From
-//! then on the app's key is its credential. It dials ErisDB as that key and
-//! sends no token; ErisDB knows it by the key the QUIC handshake proved.
+//! An app asks a device in its owner's mesh to use [`CAPABILITY`]: the
+//! device approves the app's key with a note, the person types the
+//! database's passphrase, and the device enrolls the note at the mesh's
+//! database over the mesh library's
+//! [`enroll`](erisoverlaynetwork::enroll). From then on the app's key is its
+//! credential. It dials the database as that key and sends no token; the
+//! database knows it by the key the QUIC handshake proved.
 //!
-//! [`sign_in`] does the app's side of that through the device's ErisAuth in
-//! one call. [`Client::enroll`] and [`Client::change_passphrase`] are the
-//! device's side, for ErisAuth to call from its own endpoint.
+//! [`sign_in`] does the app's side of that through the device's eon in one
+//! call.
 //!
 //! The async [`Client`] is the real thing; [`blocking`] wraps it in an owned
 //! runtime for FFI callers (JNI has no executor). The Android bindings live
@@ -25,7 +27,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use erisoverlaynetwork::net::{self, Network};
-use erisoverlaynetwork::{Note, Snapshot};
+use erisoverlaynetwork::{Capability, Note, Snapshot};
 use http_body_util::{BodyExt, Full};
 use hyper::body::Bytes;
 use hyper_util::rt::TokioIo;
@@ -36,11 +38,19 @@ use serde_json::{json, Value};
 #[cfg(target_os = "android")]
 mod android;
 
-/// The erisdb wire protocol; must match the core's `net::ALPN`.
-pub const ALPN: &[u8] = b"erisdb/0";
+/// What this crate is a client of: the database ErisDB serves, and what
+/// apps ask a device to use.
+pub const CAPABILITY: &str = "database/1";
 
-/// The service ErisDB provides in the mesh, and that apps are approved for.
-pub const SERVICE: &str = "erisdb";
+/// [`CAPABILITY`], parsed.
+pub fn capability() -> Capability {
+    CAPABILITY.parse().expect("database/1 is a capability")
+}
+
+/// The ALPN the database answers on: `eris/database/1`.
+pub fn alpn() -> Vec<u8> {
+    capability().alpn()
+}
 
 /// A request the core answered with a refusal. The status is a field, not
 /// prose, so callers — Kotlin across the FFI boundary especially — branch
@@ -121,17 +131,17 @@ fn strings(value: &Value) -> Vec<String> {
     value.as_array().into_iter().flatten().filter_map(|value| value.as_str().map(str::to_string)).collect()
 }
 
-/// Where the mesh's ErisDB is, as `snapshot` has it: the app approved to
-/// serve `erisdb` whose note counts, the most recently approved should there
-/// be more than one. Nothing ever talks to any other.
+/// Where the mesh's database is, as `snapshot` has it: the app approved to
+/// serve `database/1` whose note counts, the most recently approved should
+/// there be more than one. Nothing ever talks to any other.
 pub fn locate(snapshot: &Snapshot) -> Result<EndpointAddr> {
     snapshot
-        .provider(SERVICE)
+        .server(CAPABILITY)
         .map(|presence| presence.endpoint_addr())
-        .ok_or_else(|| anyhow!("this mesh has no ErisDB, or the snapshot does not say where it is"))
+        .ok_or_else(|| anyhow!("this mesh has no database, or the snapshot does not say where it is"))
 }
 
-/// One app's connection to one ErisDB.
+/// One app's connection to one database.
 pub struct Client {
     endpoint: Endpoint,
     server: EndpointAddr,
@@ -156,13 +166,12 @@ impl Client {
         Ok(Self::over(endpoint, server, name))
     }
 
-    /// A client on an endpoint the caller already runs: a device's, for
-    /// ErisAuth enrolling apps as the device itself.
+    /// A client on an endpoint the caller already runs.
     pub fn over(endpoint: Endpoint, server: EndpointAddr, name: &str) -> Self {
         Self { endpoint, server, client_name: name.to_string(), conn: tokio::sync::Mutex::new(None) }
     }
 
-    /// The ErisDB this client dials: what an app saves to dial it again.
+    /// The database this client dials: what an app saves to dial it again.
     pub fn server(&self) -> &EndpointAddr {
         &self.server
     }
@@ -232,40 +241,6 @@ impl Client {
         })
     }
 
-    /// Enroll the app `note` approves, as the device that signed it: the
-    /// device's side of letting an app in, which ErisAuth calls once the
-    /// person has approved and typed the passphrase. This client must run on
-    /// the device's own endpoint ([`Client::over`]), synced with ErisDB first
-    /// so ErisDB knows the device (`Node::sync_with`, or dial with
-    /// `Node::connect`).
-    ///
-    /// A wrong passphrase, a lockout and a passphrase never set are answers;
-    /// any other refusal — not a device of the mesh, a note ErisDB cannot
-    /// take — is a [`Refused`] error.
-    pub async fn enroll(&self, note: &Note, passphrase: &str) -> Result<Guarded<Enrolled>> {
-        let (status, body) =
-            self.request("POST", "/v1/enroll", Some(json!({ "note": note, "passphrase": passphrase }))).await?;
-        Guarded::read(status, body, "enrollment", |status, body| match status {
-            200 => Ok(Enrolled {
-                client: body["client"].as_str().ok_or_else(|| anyhow!("enrollment named no installation"))?.to_string(),
-                grants: strings(&body["grants"]),
-            }),
-            _ => Err(refused("enrollment", status, body)),
-        })
-    }
-
-    /// Change ErisDB's passphrase, as a device of the mesh that knows the
-    /// current one. A wrong `current` counts against the device like any
-    /// wrong guess. The new one is at least eight characters.
-    pub async fn change_passphrase(&self, current: &str, new: &str) -> Result<Guarded<()>> {
-        let (status, body) =
-            self.request("POST", "/v1/passphrase", Some(json!({ "current": current, "new": new }))).await?;
-        Guarded::read(status, body, "passphrase change", |status, body| match status {
-            204 => Ok(()),
-            _ => Err(refused("passphrase change", status, body)),
-        })
-    }
-
     /// Subscribe to the change feed from `since` (exclusive), optionally
     /// narrowed to one facet. The subscription holds one bi-stream open
     /// for its lifetime and yields events as the core emits them; it ends
@@ -309,9 +284,9 @@ impl Client {
         }
         // Discovery or a dead network must not hold a blocking/JNI caller
         // forever. No application bytes have been sent at this boundary.
-        let conn = tokio::time::timeout(Duration::from_secs(30), self.endpoint.connect(self.server.clone(), ALPN))
+        let conn = tokio::time::timeout(Duration::from_secs(30), self.endpoint.connect(self.server.clone(), &alpn()))
             .await
-            .context("connecting to ErisDB timed out")??;
+            .context("connecting to the database timed out")??;
         *slot = Some(conn.clone());
         Ok(conn)
     }
@@ -400,74 +375,28 @@ pub struct Permissions {
     pub raw: Value,
 }
 
-/// An app ErisDB let in.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Enrolled {
-    /// The installation's id.
-    pub client: String,
-    /// What it holds: the note's grants.
-    pub grants: Vec<String>,
-}
-
-/// How ErisDB answered a call that carries its passphrase.
-///
-/// Wrong guesses are counted per device: the first three cost nothing, the
-/// third locks the device out for a minute, and each one after doubles the
-/// wait, up to a day. A right guess clears the count.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Guarded<T> {
-    /// The passphrase was right and the call went through.
-    Passed(T),
-    /// The passphrase was wrong. `retry_after` is how many seconds the
-    /// device now waits, when this guess locked it out.
-    Wrong { retry_after: Option<u64> },
-    /// The device is locked out for `retry_after` more seconds; nothing was
-    /// checked.
-    Locked { retry_after: u64 },
-    /// ErisDB has no passphrase yet: its operator sets one on the server.
-    NoPassphrase,
-}
-
-impl<T> Guarded<T> {
-    fn read(
-        status: u16,
-        body: Value,
-        what: &'static str,
-        passed: impl FnOnce(u16, Value) -> Result<T>,
-    ) -> Result<Guarded<T>> {
-        let retry_after = body["retry_after"].as_u64();
-        match (status, body["error"].as_str()) {
-            (403, Some("wrong_passphrase")) => Ok(Guarded::Wrong { retry_after }),
-            (429, Some("locked")) => Ok(Guarded::Locked {
-                retry_after: retry_after.ok_or_else(|| anyhow!("{what}: a lockout that says no wait"))?,
-            }),
-            (503, Some("no_passphrase")) => Ok(Guarded::NoPassphrase),
-            _ => passed(status, body).map(Guarded::Passed),
-        }
-    }
-}
-
-/// How signing in through ErisAuth ended. Made once per sign-in, so its
-/// size is no matter.
+/// How signing in through eon ended. Made once per sign-in, so its size is
+/// no matter.
 #[allow(clippy::large_enum_variant)]
 pub enum SignIn {
-    /// The person approved, and ErisDB enrolled the app: a client dialed at
-    /// the mesh's ErisDB, the note that approves the app, and the mesh as
-    /// the device saw it. Save [`Client::server`] with the key to dial
-    /// again; the note's grants may be fewer than were asked for.
+    /// The person approved, and the database enrolled the app: a client
+    /// dialed at the mesh's database, the note that approves the app, and the
+    /// mesh as the device saw it. Save [`Client::server`] with the key to
+    /// dial again; the note's grants in [`CAPABILITY`] may be fewer than were
+    /// asked for.
     Approved { client: Client, note: Note, snapshot: Snapshot },
-    /// The person, or ErisAuth, said no.
+    /// The person, or eon, said no.
     Denied(String),
 }
 
-/// Sign in through this device's ErisAuth: ask it to approve the app
-/// holding `key` for `grants` in ErisDB. The person approves on ErisAuth's
-/// screen and types ErisDB's passphrase there; ErisAuth enrolls the app at
-/// the mesh's ErisDB and answers once ErisDB has taken it. The returned
-/// client is dialed there, on the network `ERIS_NETWORK` names.
+/// Sign in through this device's eon: ask it to approve the app holding
+/// `key` to use the database with `grants`. The person approves on eon's
+/// screen and types the database's passphrase there; eon enrolls the app at
+/// the mesh's database and answers once the database has taken it. The
+/// returned client is dialed there, on the network `ERIS_NETWORK` names.
 ///
-/// `None` means no ErisAuth is listening here. Dropping the future
-/// withdraws the request.
+/// `None` means no eon is listening here. Dropping the future withdraws the
+/// request.
 #[cfg(unix)]
 pub async fn sign_in(key: SecretKey, name: &str, grants: &[String]) -> Result<Option<SignIn>> {
     match erisoverlaynetwork::agent::socket_path() {
@@ -476,7 +405,7 @@ pub async fn sign_in(key: SecretKey, name: &str, grants: &[String]) -> Result<Op
     }
 }
 
-/// [`sign_in`] with ErisAuth listening at `socket`, dialing ErisDB on `network`.
+/// [`sign_in`] with eon listening at `socket`, dialing the database on `network`.
 #[cfg(unix)]
 pub async fn sign_in_at(
     socket: &std::path::Path,
@@ -486,9 +415,10 @@ pub async fn sign_in_at(
     grants: &[String],
 ) -> Result<Option<SignIn>> {
     use erisoverlaynetwork::agent::{Answer, Ask};
-    let Some(mut erisauth) = erisoverlaynetwork::agent::connect_to(socket).await? else { return Ok(None) };
-    let ask = Ask { service: SERVICE.into(), name: name.into(), grants: grants.to_vec(), serves: false, app: key.public() };
-    match erisauth.approve(&ask).await? {
+    let Some(mut eon) = erisoverlaynetwork::agent::connect_to(socket).await? else { return Ok(None) };
+    let uses = erisoverlaynetwork::Uses::from([(capability(), grants.to_vec())]);
+    let ask = Ask { name: name.into(), uses, serves: Vec::new(), app: key.public() };
+    match eon.approve(&ask).await? {
         Answer::Denied(why) => Ok(Some(SignIn::Denied(why))),
         Answer::Approved { note, snapshot } => {
             let server = locate(&snapshot)?;
@@ -667,13 +597,13 @@ fn find_frame_end(buf: &[u8]) -> Option<(usize, usize)> {
     None
 }
 
-/// An ErisDB address as an app keeps it: a JSON `EndpointAddr`, or a bare
+/// A database's address as an app keeps it: a JSON `EndpointAddr`, or a bare
 /// endpoint id (hex, with or without an `iroh:` prefix) for discovery to
 /// resolve.
 pub fn parse_server(server: &str) -> Result<EndpointAddr> {
     let server = server.trim();
     if server.starts_with('{') {
-        return serde_json::from_str(server).context("parsing the ErisDB address JSON");
+        return serde_json::from_str(server).context("parsing the database's address JSON");
     }
     let id: EndpointId =
         server.strip_prefix("iroh:").unwrap_or(server).parse().map_err(|e| anyhow!("bad endpoint id: {e}"))?;
@@ -765,14 +695,14 @@ pub mod blocking {
         Some(out)
     }
 
-    /// The endpoint id a key dials as, in hex: what an app names to
-    /// ErisAuth as itself. `None` for anything but 64 hex characters.
+    /// The endpoint id a key dials as, in hex: what an app names to eon as
+    /// itself. `None` for anything but 64 hex characters.
     pub fn endpoint_id(key_hex: &str) -> Option<String> {
         decode_key_hex(key_hex).map(|secret| SecretKey::from_bytes(&secret).public().to_string())
     }
 
-    /// Where the mesh's ErisDB is, from the snapshot ErisAuth handed over
-    /// with an approval: `{"ok":true,"server":<EndpointAddr JSON>}`, or
+    /// Where the mesh's database is, from the snapshot eon handed over with
+    /// an approval: `{"ok":true,"server":<EndpointAddr JSON>}`, or
     /// `{"ok":false,"error":…}`. Save `server` and dial it with [`dial`].
     pub fn locate(snapshot_json: &str) -> String {
         let located = serde_json::from_str::<Snapshot>(snapshot_json)

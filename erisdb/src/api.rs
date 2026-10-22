@@ -1,5 +1,5 @@
-//! The v1 HTTP surface: items CRUD, the change feed, tick, minting,
-//! installations, and enrollment.
+//! The v1 HTTP surface: items CRUD, the change feed, tick, minting, and
+//! installations.
 //!
 //! Every handler is a pure function over (store, mesh, request). The process
 //! holds no state a restart would lose; replicas are interchangeable.
@@ -23,15 +23,11 @@ use sqlx::postgres::{PgListener, PgPoolOptions};
 use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
 
-use erisoverlaynetwork::devices::DeviceId;
-use erisoverlaynetwork::Note;
-
 use crate::auth::{self, Capability};
 use crate::error::{Error, Result};
 use crate::installation::{self, Installation};
 use crate::mesh::Mesh;
 use crate::net::IrohPeer;
-use crate::passphrase;
 use crate::permission;
 use crate::plugin::{PluginRegistry, MAX_PLUGIN_REQUEST_BYTES};
 use crate::store::{Change, Item, Write};
@@ -69,8 +65,6 @@ pub struct AppState {
     /// The core's node in its owner's mesh: who the devices are, which
     /// notes are revoked. A core without one serves bearer tokens only.
     mesh: Option<Mesh>,
-    /// The first wait after a device's third wrong passphrase.
-    lockout: Duration,
 }
 
 impl AppState {
@@ -91,7 +85,6 @@ impl AppState {
             minting: Arc::new(Mutex::new(RateLimiter::new(10.0, 0.2))),
             plugins: PluginRegistry::empty(),
             mesh: None,
-            lockout: passphrase::LOCKOUT,
         }
     }
 
@@ -102,14 +95,6 @@ impl AppState {
     pub fn with_mesh(self, mesh: Mesh) -> Self {
         Self {
             mesh: Some(mesh),
-            ..self
-        }
-    }
-
-    /// Shorten or lengthen the first lockout; the schedule after it is fixed.
-    pub fn with_lockout(self, first: Duration) -> Self {
-        Self {
-            lockout: first,
             ..self
         }
     }
@@ -138,8 +123,6 @@ impl AppState {
             .route("/v1/clients", get(list_clients))
             .route("/v1/clients/{id}", get(get_client).put(update_client))
             .route("/v1/clients/{id}/revoke", post(revoke_client))
-            .route("/v1/enroll", post(enroll))
-            .route("/v1/passphrase", post(change_passphrase))
             .route("/v1/server", get(server_state))
             // Browser clients are first-class; auth is the token, not the origin.
             .layer(tower_http::cors::CorsLayer::permissive())
@@ -342,11 +325,6 @@ impl SourceParts {
     /// The stamped source value: connection + token, never the body.
     fn stamp(&self, cap: &Capability) -> Value {
         json!({ "addr": self.addr, "user": cap.user, "client": self.client, "installation": cap.client })
-    }
-
-    /// The source of what a device does in its own name.
-    fn stamp_device(&self) -> Value {
-        json!({ "addr": self.addr, "user": null, "client": self.client, "installation": null })
     }
 
     /// The key a rate limit counts against: the observed address when there
@@ -958,99 +936,6 @@ async fn revoke_client(
     tx.audit_client(&client, "updated").await?;
     tx.commit().await?;
     Ok(Json(client))
-}
-
-// ---------------------------------------------------------------- enrollment
-//
-// Apps get into ErisDB through a device. The device approves the app with a
-// note, the person types the passphrase on the device, and the device brings
-// both here, calling as itself over Iroh. From then on the app calls with
-// its own key and nothing else.
-
-/// The device calling: a member of this core's mesh, calling over Iroh as
-/// itself, while this core is the mesh's ErisDB. Once a newer ErisDB is
-/// approved, apps find that one, and this one lets none in.
-fn calling_device(st: &AppState, peer: Option<&IrohPeer>) -> Result<DeviceId> {
-    let mesh = st.mesh.as_ref().ok_or(Error::NotJoined)?;
-    if !mesh.is_erisdb() {
-        return Err(Error::NotTheErisDB);
-    }
-    let peer =
-        peer.ok_or_else(|| Error::NotADevice("a device calls as itself, over Iroh".into()))?;
-    if !mesh.is_member(&peer.0) {
-        return Err(Error::NotADevice(
-            "this key is not a device in ErisDB's mesh".into(),
-        ));
-    }
-    Ok(peer.0)
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct EnrollRequest {
-    note: Value,
-    passphrase: String,
-}
-
-/// Let in the app a device's note approves, when the person typed the
-/// passphrase: create its installation, or give the one it has the note's
-/// grants.
-async fn enroll(
-    State(st): State<AppState>,
-    peer: Option<axum::Extension<IrohPeer>>,
-    src: SourceParts,
-    Json(req): Json<EnrollRequest>,
-) -> Result<Json<Value>> {
-    let device = calling_device(&st, peer.as_deref())?;
-    let note: Note = serde_json::from_value(req.note).map_err(|e| Error::BadNote(e.to_string()))?;
-    if note.device() != device {
-        return Err(Error::NotADevice(
-            "a device enrolls apps with its own notes".into(),
-        ));
-    }
-    let mesh = st.mesh.as_ref().ok_or(Error::NotJoined)?;
-    mesh.check(&note)
-        .map_err(|e| Error::BadNote(e.to_string()))?;
-    if note.body.service != crate::SERVICE {
-        return Err(Error::BadNote(format!(
-            "it approves {:?}, not {:?}",
-            note.body.service,
-            crate::SERVICE
-        )));
-    }
-    if note.body.serves {
-        return Err(Error::BadNote(
-            "it approves an app to serve erisdb; ErisDB enrolls apps that call it".into(),
-        ));
-    }
-    passphrase::check(&st.pool, &device, &req.passphrase, st.lockout).await?;
-    let client = installation::enroll(&st.pool, &note, src.stamp_device()).await?;
-    tracing::info!(installation = %client.id, app = %client.name, device = %device, "enrolled");
-    Ok(Json(
-        json!({ "client": client.id, "grants": client.grants }),
-    ))
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct PassphraseChange {
-    current: String,
-    new: String,
-}
-
-/// A member device changes the passphrase by knowing it. A wrong `current`
-/// counts against the device like any other wrong guess.
-async fn change_passphrase(
-    State(st): State<AppState>,
-    peer: Option<axum::Extension<IrohPeer>>,
-    Json(req): Json<PassphraseChange>,
-) -> Result<axum::http::StatusCode> {
-    let device = calling_device(&st, peer.as_deref())?;
-    passphrase::validate(&req.new)?;
-    passphrase::check(&st.pool, &device, &req.current, st.lockout).await?;
-    passphrase::set(&st.pool, &req.new).await?;
-    tracing::info!(device = %device, "passphrase changed");
-    Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
 // ---------------------------------------------------------------- dashboard

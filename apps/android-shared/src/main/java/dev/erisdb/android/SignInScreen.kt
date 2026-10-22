@@ -25,7 +25,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 
 /**
- * The front door, the first thing a phone sees until the app is let in: ErisAuth on this phone
+ * The front door, the first thing a phone sees until the app is let in: ErisOverlayNetwork on this phone
  * is the way in, and the only one. [asked] is what the app asks for, in the words its screens use.
  */
 @Composable
@@ -43,7 +43,7 @@ fun SignInScreen(app: String, state: SignIn, asked: List<String>, onAsk: () -> U
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
             Text(
-                "$app keeps its data in your ErisDB, and ErisAuth on this phone lets it in. You approve " +
+                "$app keeps its data in your ErisDB, and ErisOverlayNetwork on this phone lets it in. You approve " +
                     "$app there, choose what it may do, and type ErisDB's passphrase.",
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -55,24 +55,24 @@ fun SignInScreen(app: String, state: SignIn, asked: List<String>, onAsk: () -> U
 }
 
 /**
- * Asking ErisAuth, as one block: on the front door, and in settings to sign in again — to ask
+ * Asking ErisOverlayNetwork, as one block: on the front door, and in settings to sign in again — to ask
  * for what the person did not give the first time, or to reach a new ErisDB.
  */
 @Composable
 fun SignInPanel(app: String, state: SignIn, signedIn: Boolean, onAsk: () -> Unit, onCancel: () -> Unit) {
-    val ask = if (signedIn) "Sign in again" else "Sign in with ErisAuth"
+    val ask = if (signedIn) "Sign in again" else "Sign in with ErisOverlayNetwork"
     when (state) {
         is SignIn.Asking -> {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 CircularProgressIndicator(Modifier.size(22.dp), strokeWidth = 2.dp)
                 Text(
-                    "Waiting for ErisAuth…",
+                    "Waiting for ErisOverlayNetwork…",
                     style = MaterialTheme.typography.titleMedium,
                     modifier = Modifier.padding(start = 14.dp),
                 )
             }
             Text(
-                "Approve $app in ErisAuth: open its notification, choose what $app may do, and type " +
+                "Approve $app in ErisOverlayNetwork: open its notification, choose what $app may do, and type " +
                     "ErisDB's passphrase.",
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -80,12 +80,12 @@ fun SignInPanel(app: String, state: SignIn, signedIn: Boolean, onAsk: () -> Unit
             TextButton(onClick = onCancel) { Text("Cancel") }
         }
 
-        is SignIn.NoErisAuth -> {
+        is SignIn.NoErisOverlayNetwork -> {
             Card(colors = CardDefaults.cardColors(MaterialTheme.colorScheme.errorContainer)) {
                 Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                    Text("ErisAuth is not on this phone", style = MaterialTheme.typography.titleSmall)
+                    Text("ErisOverlayNetwork is not on this phone", style = MaterialTheme.typography.titleSmall)
                     Text(
-                        "Install ErisAuth and add this phone to your devices with it. It is how $app " +
+                        "Install ErisOverlayNetwork and add this phone to your devices with it. It is how $app " +
                             "gets into your ErisDB, and there is no other way in.",
                         style = MaterialTheme.typography.bodySmall,
                     )
@@ -95,7 +95,7 @@ fun SignInPanel(app: String, state: SignIn, signedIn: Boolean, onAsk: () -> Unit
         }
 
         is SignIn.Denied -> {
-            Problem("ErisAuth did not let $app in: ${state.why}")
+            Problem("ErisOverlayNetwork did not let $app in: ${state.why}")
             Button(onClick = onAsk) { Text("Ask again") }
         }
 
@@ -113,7 +113,7 @@ private fun Problem(text: String) {
     Text(text, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.error)
 }
 
-/** What the app asks for, as the person will see it in ErisAuth. */
+/** What the app asks for, as the person will see it in ErisOverlayNetwork. */
 @Composable
 private fun Asked(app: String, asked: List<String>) {
     Card(colors = CardDefaults.cardColors(MaterialTheme.colorScheme.surfaceVariant)) {

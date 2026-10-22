@@ -39,18 +39,22 @@ the target server, inspect its handler and existing integration tests.
 
 ## Get in through a device, and keep the key
 
-- An app is let in by a device of its owner's mesh, never by the server. It asks
-  the device's ErisAuth to approve its Iroh key for service `erisdb`, not serving,
-  with the grants it wants: over the agent socket on a desktop
-  (`$XDG_RUNTIME_DIR/erisauth/agent.sock`), through ErisAuth's bound service on
-  Android, or by redeeming a device's `eris://pair/` ticket where no ErisAuth runs
-  beside it. The person approves on the device, possibly fewer grants, and types
-  ErisDB's passphrase; ErisAuth enrolls the app and then answers with its note and
-  a snapshot of the mesh.
-- ErisDB is the app the snapshot shows approved to serve `erisdb` (the most
-  recently approved, should there be more than one). Dial its endpoint id with ALPN
-  `erisdb/0` — HTTP/1.1 over QUIC streams — as the app's key, with no
-  `Authorization` header. Prefer the Rust SDK to recreating the transport:
+- An app is let in by a device of its owner's mesh, never by the server. Apps
+  ask for capabilities, not programs: it asks the device's `eon` to approve its
+  Iroh key to use a database, `database/1`, with the grants it wants there,
+  serving nothing (`"uses": {"database/1": [grants]}, "serves": []`): over the
+  agent socket on a desktop (`$XDG_RUNTIME_DIR/eon/agent.sock`, protocol v3),
+  through ErisOverlayNetwork's bound service on Android
+  (`approve(name, mapOf("database/1" to grants), app = …)`), or by redeeming a
+  device's `eris://pair/` ticket where no `eon` runs beside it. The person
+  approves on the device, possibly fewer grants, and types ErisDB's passphrase;
+  `eon` enrolls the app at the database and then answers with its note and a
+  snapshot of the mesh.
+- The database is the app the snapshot shows approved to serve `database/1`
+  (the most recently approved, should there be more than one); ErisDB is what
+  serves it. Dial its endpoint id with ALPN `eris/database/1` — HTTP/1.1 over
+  QUIC streams — as the app's key, with no `Authorization` header. Prefer the
+  Rust SDK to recreating the transport:
   `sign_in` does the whole of the above, `Client::dial` reconnects later, and
   Android apps use its JNI surface (`nativeLocate`, `nativeDial`).
 - The key is the credential. Generate it once, keep the same 32 bytes across
@@ -150,7 +154,7 @@ Use the browser, executable, or device runtime the app will actually use; retain
 useful pure tests without substituting mocked server responses for integration
 coverage. The Rust integration suites (`erisdb/tests/mesh.rs`,
 `erisdb-client/tests/client.rs`, `clients/mcp/tests/e2e.rs`) run a real core with
-device nodes from the mesh library and a stand-in for ErisAuth's agent socket;
+device nodes from the mesh library and a stand-in for `eon`'s agent socket;
 copy that harness. Use a disposable emulator for tests that clear app data, not
 the user's phone.
 

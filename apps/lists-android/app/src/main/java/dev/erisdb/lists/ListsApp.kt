@@ -33,7 +33,7 @@ import java.util.UUID
  * so a grant survives a schema upgrade. */
 const val FACET = "lists"
 
-/** What this app calls itself to ErisAuth, and in `source`. */
+/** What this app calls itself to ErisOverlayNetwork, and in `source`. */
 const val CLIENT = "Lists (Android) v0.5"
 
 /** What this app is called on its own screens. */
@@ -56,12 +56,12 @@ fun ListsApp() {
     val store = remember { Store(ctx) }
     val gate = remember { SyncGate() }
     val scope = rememberCoroutineScope()
-    // ErisAuth on this phone: the way in.
-    val erisAuth = remember { ErisAuthSignIn(ctx) }
+    // ErisOverlayNetwork on this phone: the way in.
+    val eon = remember { ErisOverlayNetworkSignIn(ctx) }
 
-    // Where this app's ErisDB is, once ErisAuth has let it in.
+    // Where this app's ErisDB is, once ErisOverlayNetwork has let it in.
     var server by remember { mutableStateOf(store.credentials.server) }
-    var signIn by remember { mutableStateOf<SignIn>(if (erisAuth.installed) SignIn.Ready else SignIn.NoErisAuth) }
+    var signIn by remember { mutableStateOf<SignIn>(if (eon.installed) SignIn.Ready else SignIn.NoErisOverlayNetwork) }
     // What ErisDB last said this app holds. Unknown until it answers, and
     // unknown draws every button — a 403 is what corrects a guess, not a
     // greyed-out Add on a phone that simply has no signal yet.
@@ -101,16 +101,16 @@ fun ListsApp() {
     }
 
     /**
-     * Ask ErisAuth on this phone to let this app in. The address its
+     * Ask ErisOverlayNetwork on this phone to let this app in. The address its
      * approval names is kept beside the key before anything is dialed.
      */
-    fun askErisAuth() {
+    fun askErisOverlayNetwork() {
         scope.launch {
             val app = withContext(Dispatchers.IO) { ErisDB.endpointId(store.credentials.key()) }
                 ?: return@launch run { signIn = SignIn.Failed("this app's key cannot be read") }
             signIn = SignIn.Asking
-            erisAuth.ask(Ask(CLIENT, MANIFEST, app)) { answer ->
-                if (answer == null) return@ask run { signIn = SignIn.NoErisAuth }
+            eon.ask(Ask(CLIENT, MANIFEST, app)) { answer ->
+                if (answer == null) return@ask run { signIn = SignIn.NoErisOverlayNetwork }
                 scope.launch {
                     var moved = false
                     val next = withContext(Dispatchers.IO) {
@@ -123,9 +123,9 @@ fun ListsApp() {
         }
     }
 
-    /** Take back the request ErisAuth is asking the person about. */
+    /** Take back the request ErisOverlayNetwork is asking the person about. */
     fun cancelSignIn() {
-        erisAuth.stop()
+        eon.stop()
         signIn = SignIn.Ready
     }
 
@@ -242,9 +242,9 @@ fun ListsApp() {
     }
 
     // Dial what was kept; poll while connected. A phone never let in asks
-    // ErisAuth straight away.
+    // ErisOverlayNetwork straight away.
     LaunchedEffect(Unit) {
-        if (server != null) connect() else if (erisAuth.installed) askErisAuth()
+        if (server != null) connect() else if (eon.installed) askErisOverlayNetwork()
         while (true) {
             delay(10_000)
             if (connected) sync() else if (server != null) connect()
@@ -252,9 +252,9 @@ fun ListsApp() {
     }
     LaunchedEffect(syncTick) { if (syncTick > 0 && connected) sync() }
 
-    // Back from installing ErisAuth: ask it.
+    // Back from installing ErisOverlayNetwork: ask it.
     LifecycleResumeEffect(Unit) {
-        if (server == null && signIn is SignIn.NoErisAuth && erisAuth.installed) askErisAuth()
+        if (server == null && signIn is SignIn.NoErisOverlayNetwork && eon.installed) askErisOverlayNetwork()
         onPauseOrDispose { }
     }
 
@@ -266,7 +266,7 @@ fun ListsApp() {
 
     // The front door has nothing behind it: back from there leaves the app.
     BackHandler(enabled = screen != Screen.Main && screen != Screen.SignIn) { screen = Screen.Main }
-    DisposableEffect(Unit) { onDispose { erisAuth.stop() } }
+    DisposableEffect(Unit) { onDispose { eon.stop() } }
 
     // Sub-screens slide in from the right; going back slides them out.
     fun depth(s: Screen) = if (s is Screen.Main || s is Screen.SignIn) 0 else 1
@@ -343,7 +343,7 @@ fun ListsApp() {
             grants = grants,
             linkPreviews = linkPreviews,
             onLinkPreviews = { linkPreviews = it; store.linkPreviews = it },
-            onSignIn = ::askErisAuth,
+            onSignIn = ::askErisOverlayNetwork,
             onCancel = ::cancelSignIn,
             onBack = { screen = Screen.Main },
         )
@@ -351,14 +351,14 @@ fun ListsApp() {
             app = APP,
             state = signIn,
             asked = MANIFEST.map(::describeGrant),
-            onAsk = ::askErisAuth,
+            onAsk = ::askErisOverlayNetwork,
             onCancel = ::cancelSignIn,
         )
         }
     }
     }
 
-    // Dial again whenever ErisAuth lets this app in anew — a new approval is
+    // Dial again whenever ErisOverlayNetwork lets this app in anew — a new approval is
     // a command, not a condition.
     LaunchedEffect(connectTick) {
         if (connectTick > 0 && server != null && !connecting) connect()

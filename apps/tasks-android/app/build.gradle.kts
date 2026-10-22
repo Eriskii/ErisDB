@@ -13,7 +13,7 @@ android {
         applicationId = "dev.erisdb.tasks"
         minSdk = 24
         targetSdk = 36
-        // Matches the CLIENT string this app asks ErisAuth and writes
+        // Matches the CLIENT string this app asks ErisOverlayNetwork and writes
         // under, which is what the person reads on the approval prompt.
         versionCode = 2
         versionName = "0.4"

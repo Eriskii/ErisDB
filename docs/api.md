@@ -2,8 +2,9 @@
 
 The server exposes the HTTP routes below over TCP and authenticated Iroh.
 Routes are implemented in [api.rs](../erisdb/src/api.rs), with installation
-authorization in [installation.rs](../erisdb/src/installation.rs) and the
-passphrase in [passphrase.rs](../erisdb/src/passphrase.rs).
+authorization in [installation.rs](../erisdb/src/installation.rs); devices let
+apps in over the mesh library's enroll protocol, with the passphrase in
+[passphrase.rs](../erisdb/src/passphrase.rs).
 Examples use illustrative IDs, timestamps and credentials; obtain those values
 from your running server.
 
@@ -27,14 +28,17 @@ from your running server.
 ## Conventions and authentication
 
 The core serves `/v1` on plain HTTP, default `127.0.0.1:7700`, and on HTTP/1.1
-streams inside authenticated Iroh QUIC using ALPN `erisdb/0`. The routes and
-payloads are shared; the transport decides which credentials a request can carry.
+streams inside authenticated Iroh QUIC using ALPN `eris/database/1`, the ALPN of
+the `database/1` capability ErisDB serves in its mesh. The routes and payloads
+are shared; the transport decides which credentials a request can carry.
 
 | Credential | Used for | How it is sent |
 |---|---|---|
 | An enrolled app's key | Routes its installation's grants allow | Nothing in the request: over Iroh, with no `Authorization` header, the peer's key the QUIC handshake proved |
-| A device of the mesh | `POST /v1/enroll` and `POST /v1/passphrase` | The device calling over Iroh as itself |
 | Operator, minted or delegated token | Routes its grants allow | `Authorization: Bearer erisdb1.…`, over TCP or Iroh |
+
+A device of the mesh calls none of these routes: it lets apps in, and changes
+the passphrase, over ALPN `eris-enroll/0` ([enrollment](#enrollment)).
 
 Only the health route is unauthenticated. A request with a bearer token is
 authorized by the token; one without, over Iroh, by the installation of its key;
@@ -57,7 +61,7 @@ SSE, framework rejections, and plugin-defined responses. Core responses carry
 `Cache-Control: no-store`. Do not follow redirects with credentials. CORS is
 permissive; possession of authority, not the browser origin, authorizes requests.
 Extra fields in top-level request envelopes are ignored except for
-`POST /v1/call`, `POST /v1/enroll` and `POST /v1/passphrase`, which reject them.
+`POST /v1/call`, which rejects them.
 Item bodies follow their own facet schema. The router also supplies HEAD for GET
 routes and unauthenticated CORS OPTIONS preflights. These framework methods are
 implicit, not additional application operations in the route table.
@@ -197,8 +201,6 @@ See [permission matching](permissions.md) for enclosure and wildcard rules.
 | POST | `/v1/tick` | `meta:system:tick` |
 | POST | `/v1/capabilities` | `meta:capabilities:mint`, plus grant/lifetime enclosure |
 | POST | `/v1/capabilities/refresh` | A valid bearer token |
-| POST | `/v1/enroll` | A device of the mesh over Iroh, its own note, and the passphrase |
-| POST | `/v1/passphrase` | A device of the mesh over Iroh, and the current passphrase |
 | GET | `/v1/clients` | `meta:clients:read` |
 | GET | `/v1/clients/{id}` | `meta:clients:read` |
 | PUT | `/v1/clients/{id}` | `meta:clients:write`, plus approved/acting grant enclosure |
@@ -224,12 +226,9 @@ Branch on the status and `error`; `detail` is human-readable and may change.
 
 | HTTP | `error` | Cause |
 |---|---|---|
-| 400 | `bad_request` | Invalid grants, unsupported lifetime, invalid client label, short new passphrase, refresh without a bearer token, forbidden schema reference, or invalid snapshot |
-| 400 | `bad_note` | An enrollment's note does not read, does not count in the mesh, or does not approve an app to call `erisdb` |
+| 400 | `bad_request` | Invalid grants, unsupported lifetime, invalid client label, refresh without a bearer token, forbidden schema reference, or invalid snapshot |
 | 401 | `unauthorized` | Missing/invalid/expired token, an unenrolled key, or an installation that is revoked or no longer counts in the mesh |
 | 403 | `forbidden` | Missing permission or grants/lifetime outside the caller's authority |
-| 403 | `not_a_device` | Enrollment or a passphrase change from anything but a device of the mesh calling as itself over Iroh, or a device presenting another device's note |
-| 403 | `wrong_passphrase` | The passphrase was wrong; counted against the calling device. `retry_after` (seconds) is present when this guess locked the device out |
 | 404 | `not_found` | Missing item, history, or administratively requested installation |
 | 404 | `plugin_not_found` | Unknown plugin or operation |
 | 409 | `revision_conflict` | Stale item or installation revision |
@@ -238,11 +237,7 @@ Branch on the status and `error`; `detail` is human-readable and may change.
 | 422 | `schema_violation` | Item body violates the facet schema |
 | 422 | `plugin_schema_violation` | Plugin input violates its manifest schema |
 | 429 | `too_many_requests` | Shared mint/refresh bucket exhausted |
-| 429 | `locked` | The calling device is locked out by wrong passphrases; `retry_after` and a `Retry-After` header say for how long |
 | 503 | `unavailable` | Change-stream or plugin-process capacity reached |
-| 503 | `no_passphrase` | Enrollment or a passphrase change before the operator set a passphrase |
-| 503 | `not_joined` | Enrollment on a core running without a mesh |
-| 503 | `not_the_erisdb` | Enrollment or a passphrase change at a core whose own approval no longer counts: the mesh approved another ErisDB, or this one's device left |
 | 503 | `plugin_unavailable` | Required allowlisted plugin environment variable is absent |
 | 502 | `plugin_failed` | Plugin startup, header protocol, or timeout failure before headers are committed |
 | 500 | `internal` | Database/internal failure; details remain in operator logs |
@@ -250,14 +245,12 @@ Branch on the status and `error`; `detail` is human-readable and may change.
 Framework rejections can be plain text: malformed JSON (400), wrong/missing JSON
 content type (415), missing/wrongly typed JSON fields (422), invalid UUID/query
 (400), oversized body (413), unknown route (404), or unsupported method (405).
-Authorization normally precedes handler body validation; the enrollment routes,
-which authorize the calling device, read their body first. Plugin responses can
-have their own body and status, including non-JSON errors.
+Authorization precedes handler body validation. Plugin responses can have their
+own body and status, including non-JSON errors.
 
 There is no general idempotency-key API. Retry reads as appropriate; do not
 blindly retry a write after a transport failure with an unknown outcome. An
-explicit core authorization 401 occurs before the mutation. Enrollment is safe to
-repeat: the same note gives the same installation the same grants. Revocation is
+explicit core authorization 401 occurs before the mutation. Revocation is
 idempotent.
 
 ## Health and server state
@@ -584,61 +577,53 @@ rather than a successful empty grant list.
 ## Enrollment
 
 Apps get into ErisDB through a device of its owner's mesh; [the mesh](mesh.md)
-describes the whole path. Both routes here are called by a **device**, over Iroh,
-from its own endpoint: the caller's key must be a member of the mesh as ErisDB's
-copy of the device list stands. Over TCP, or from any other key, they answer
-403 `not_a_device`. The device syncs with ErisDB before calling, so ErisDB's list
-knows it (`Node::connect` does so on its own). Both answer only while this core is
-the mesh's ErisDB: once the mesh approves another, revoking this one's note, they
-answer 503 `not_the_erisdb`.
+describes the whole path. A device lets an app in, and changes the passphrase,
+not over HTTP but over ALPN `eris-enroll/0` on the core's Iroh endpoint: the
+mesh library's enroll protocol (`erisoverlaynetwork::enroll`), one JSON request
+and one JSON answer per QUIC bi-stream. The device calls from its own endpoint,
+as itself, and syncs with ErisDB first so ErisDB's list knows it
+(`enroll::enroll` and `enroll::change` do so on their own).
 
-Both carry the passphrase, and share its refusals: 403 `wrong_passphrase`,
-counted against the calling device, with `retry_after` when that guess locked it
-out; 429 `locked` with `retry_after` and `Retry-After` while it waits, checking
-nothing; and 503 `no_passphrase` before the operator set one. The first three
-wrong guesses in a row cost nothing; the third locks the device out for a minute,
-and each one after doubles the wait, up to a day. A right guess clears the
-device's count; one device's guesses never lock out another.
-
-### `POST /v1/enroll`
-
-Required JSON: `note`, the signed note a device of the mesh issued the app, and
-`passphrase`. Unknown fields are refused.
-
-```json
-{
-  "note": {"by":"9c1e…","body":"eyJtZXNo…","sig":"Qm3t…"},
-  "passphrase":"correct horse battery staple"
-}
+```text
+device → {"op":"enroll","note":{"by":"9c1e…","body":"eyJtZXNo…","sig":"Qm3t…"},"passphrase":"correct horse battery staple"}
+device → {"op":"change","current":"correct horse battery staple","new":"a new passphrase"}
 ```
 
-ErisDB checks, in order: it is itself the mesh's ErisDB, its own note counting
-(503 `not_the_erisdb`); the caller is a device of the mesh (403
-`not_a_device`); the note reads and its signer is the caller (400 `bad_note`, 403
-`not_a_device`); the note counts in ErisDB's list — the same mesh, its device a
-member, not revoked — and approves an app for service `erisdb` that does not serve
-it (400 `bad_note`); the passphrase (above). None of the refusals before the
-passphrase costs the device a guess. Then it creates the installation for the
-note's app, or, when that app has an active one, gives it the note's device, id
-and grants. **200**:
+The library refuses, before ErisDB sees anything and without costing a guess: a
+core whose own note no longer counts (the mesh approved another database, or
+this one's device left) or does not serve anything with a passphrase; a caller
+that is not a device of the mesh as ErisDB's copy of the list stands; and, for
+`enroll`, a note that is not the calling device's own, that does not count in
+ErisDB's list — the same mesh, its device a member, not revoked — or that does
+not use `database/1`. Refusals come back as the library's errors: forbidden, or
+a bad request.
 
-```json
-{"client":"ad6caf6b-ece2-442a-a178-a93cc5aa0802","grants":["notes:read","notes:create"]}
-```
+Everything else ErisDB answers with one of:
 
-The app now calls by its key. Each enrollment appends an installation audit
-event, `created` or `updated`, whose source `addr` is the device. Enrolling the
-same note twice gives the same result. A revoked installation is never updated:
-enrolling its app again creates a new one.
+| Answer | Meaning |
+|---|---|
+| `{"answer":"done"}` | The passphrase was right, and the app is in or the passphrase changed |
+| `{"answer":"wrong"}` | Not the passphrase; counted against the calling device. `retry_after` (seconds) is present when this guess locked the device out |
+| `{"answer":"locked","retry_after":n}` | The device waits `n` seconds more; nothing was checked |
+| `{"answer":"no_passphrase"}` | The operator has not set a passphrase yet |
 
-### `POST /v1/passphrase`
+The first three wrong guesses in a row cost nothing; the third locks the device
+out for a minute, and each one after doubles the wait, up to a day. A right guess
+clears the device's count; one device's guesses never lock out another.
 
-Required JSON: `current` and `new`, strings; unknown fields are refused. `new` is
-at least 8 characters, at most 1024 bytes (400 otherwise, checked before
-`current`, so a short one costs no guess). A wrong `current` counts against the
-device like any wrong guess. **204** with no body; the new passphrase applies to
-the next enrollment. The operator sets the first passphrase, and resets one, on
-the server with `erisdb passphrase set`.
+An `enroll` that passes creates the installation for the note's app, or, when
+that app has an active one, gives it the note's device, id and grants: the
+grants the note holds in `database/1`. The app then calls by its key. Each
+enrollment appends an installation audit event, `created` or `updated`, whose
+source is `{"addr":"iroh:DEVICE_ID","user":null,"client":null,"installation":null}`.
+Enrolling the same note twice gives the same result. A revoked installation is
+never updated: enrolling its app again creates a new one.
+
+A `change` checks `new` first: at least 8 characters, at most 1024 bytes, or a
+bad request, so a short one costs no guess. A wrong `current` counts against the
+device like any wrong guess. The new passphrase applies to the next enrollment.
+The operator sets the first passphrase, and resets one, on the server with
+`erisdb passphrase set`.
 
 ## Installations
 
@@ -670,7 +655,7 @@ fresh enrollment creates a new UUID.
 | `app` | The app's Iroh endpoint id: its credential |
 | `device` | Endpoint id of the device that approved it |
 | `note` | Id of the note it was approved with |
-| `approved` | The note's grants: the most this installation can hold |
+| `approved` | The note's grants in `database/1`: the most this installation can hold |
 | `grants` | What it holds now |
 | `revoked_at` | RFC 3339 timestamp or null; revocation is irreversible |
 | `revision` | Optimistic concurrency version, initially 1 |
@@ -858,7 +843,7 @@ command history. Built-in `--help` lists parser details.
 
 | Command | Main arguments | Example |
 |---|---|---|
-| `erisdb join` | `--database-url`/`DATABASE_URL`, signing/optional Iroh secret; optional `--name` (`ErisDB`); ErisAuth listening at `$XDG_RUNTIME_DIR/erisauth/agent.sock` | `erisdb join` |
+| `erisdb join` | `--database-url`/`DATABASE_URL`, signing/optional Iroh secret; optional `--name` (`ErisDB`); `eon` listening at `$XDG_RUNTIME_DIR/eon/agent.sock` | `erisdb join` |
 | `erisdb serve` | `--database-url`/`DATABASE_URL`, `--secret`/`ERISDB_SECRET`; optional `--listen`/`ERISDB_LISTEN`, `--iroh-secret`/`ERISDB_IROH_SECRET`, `--network`/`ERIS_NETWORK`, `--plugin-dir`/`ERISDB_PLUGIN_DIR`, `--lockout-secs`/`ERISDB_LOCKOUT_SECS` (60) | `erisdb serve --listen 127.0.0.1:7700` |
 | `erisdb passphrase set` | `--database-url`/`DATABASE_URL`; the passphrase typed twice at a terminal, or one line of standard input | `erisdb passphrase set` |
 | `erisdb passphrase unlock [DEVICE]` | `--database-url`/`DATABASE_URL`; a device's endpoint id, or none for every device | `erisdb passphrase unlock` |
@@ -873,8 +858,10 @@ Put parent options before the subcommand, for example
 `erisdb clients --url http://127.0.0.1:7700 list` and
 `erisdb passphrase --database-url … set`. Administration prints JSON.
 `mint --no-expiry` is for manual/operator authority; it has no individually
-revocable installation. `join` waits while the person answers on the device;
-Ctrl-C withdraws the request. `serve` refuses to start before `join`.
+revocable installation. `join` asks to serve `database/1`, single and with a
+passphrase, and waits while the person answers on the device; Ctrl-C withdraws
+the request. `serve` refuses to start before `join`, and with an approval for
+another key.
 
 ## Limits
 
@@ -893,7 +880,7 @@ Ctrl-C withdraws the request. `serve` refuses to start before `join`.
 | Mint and refresh rate | Shared bucket for `/v1/capabilities` and `/v1/capabilities/refresh`: burst 10, replenishes one token per five seconds |
 | Rate identity | Observed TCP **IP**, not source port; authenticated Iroh peer key over Iroh; a local proxy's callers share its IP bucket |
 | Rate durability | Per replica, reset by restart; no `Retry-After` header |
-| Passphrase guesses | Per device, in Postgres: three free, then 1 minute doubling to a day; `Retry-After` on 429 |
+| Passphrase guesses | Per device, in Postgres: three free, then 1 minute doubling to a day |
 | Passphrase length | 8 characters to 1024 bytes |
 | Grant count / size | 1–64 grants, each at most 128 bytes |
 | User / client label | At most 128 bytes; client header additionally printable ASCII |

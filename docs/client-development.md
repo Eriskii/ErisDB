@@ -15,26 +15,33 @@ which routes to the relevant contracts and implementation examples.
 An app holds one Iroh key for as long as it is the same app; generate it once
 and keep it where the platform protects secrets. That key is its credential.
 
-1. Ask the device's ErisAuth to approve the key for service `erisdb`, not
-   serving, with the grants you want: over the agent socket
-   (`$XDG_RUNTIME_DIR/erisauth/agent.sock`, one JSON line, see
-   [ErisOverlayNetwork's agent](https://github.com/Eriskii/ErisOverlayNetwork))
-   on a desktop; through ErisAuth's bound service on Android; by redeeming a
-   device's `eris://pair/` ticket where no ErisAuth runs beside the app.
+1. Ask the device's `eon` to approve the key to use a database, the capability
+   `database/1`, with the grants you want there, serving nothing: over the agent
+   socket on a desktop (`$XDG_RUNTIME_DIR/eon/agent.sock`, one JSON line, see
+   [ErisOverlayNetwork's agent](https://github.com/Eriskii/ErisOverlayNetwork)):
+
+   ```json
+   {"v":3,"op":"approve","name":"Tasks","uses":{"database/1":["tasks:read","tasks:create"]},"serves":[],"app":"<endpoint id>"}
+   ```
+
+   through ErisOverlayNetwork's bound service on Android
+   (`eon.approve(name, mapOf("database/1" to grants), app = …)`); by redeeming a
+   device's `eris://pair/` ticket where no `eon` runs beside the app.
 2. The person approves on the device, possibly fewer grants than asked, and
-   types ErisDB's passphrase. ErisAuth enrolls the app at the mesh's ErisDB
-   and only then answers.
-3. The answer is the app's note and a snapshot of the mesh. The mesh's ErisDB is
-   the app the snapshot shows approved to serve `erisdb` — the most recently
-   approved, should there be more than one; save its address with the key.
-4. Dial that endpoint id with ALPN `erisdb/0`, as the key, and send requests
-   with no `Authorization` header.
+   types ErisDB's passphrase. `eon` enrolls the app at the mesh's database and
+   only then answers.
+3. The answer is the app's note and a snapshot of the mesh. The mesh's database
+   is the app the snapshot shows approved to serve `database/1` — the most
+   recently approved, should there be more than one; save its address with the
+   key.
+4. Dial that endpoint id with ALPN `eris/database/1`, as the key, and send
+   requests with no `Authorization` header.
 
 In Rust, `erisdb_client::sign_in(key, name, grants)` is all four steps, and
 `Client::dial` the last one on later launches. Android apps get the snapshot
-from ErisAuth's service and hand it to the JNI surface's `nativeLocate`, then
+from ErisOverlayNetwork's service and hand it to the JNI surface's `nativeLocate`, then
 `nativeDial`; see the [client library](../erisdb-client/README.md). A denial is
-an answer, not an error; no ErisAuth at all means the app has no way in on this
+an answer, not an error; no `eon` at all means the app has no way in on this
 machine.
 
 Two rules for the manifest, both about the human at the other end:
@@ -183,8 +190,8 @@ it may already have created an item. Retain the uncertain operation for
 reconciliation rather than promising exactly-once delivery.
 
 Reads can be retried. The SDK also retries failures it can identify as occurring
-before transmission. Enrollment is safe to repeat: the same note gives the same
-installation the same grants.
+before transmission. Signing in again is safe: the same app key keeps its
+installation, with the grants of the newest note.
 
 ## 4. Tokens: refresh at half-life
 
@@ -269,17 +276,18 @@ Four clients, four different shapes, all against the same API.
   sources: `lapsed` rows from the poker's sweep, and a local due-check between
   ticks, deduped.
 
-- **`erisdb-client/`** — the Rust client, dialing over Iroh: one QUIC
-  connection, one HTTP/1.1 exchange per bi-stream, ALPN `erisdb/0`. Read it
-  for `sign_in` (getting in through the device's ErisAuth in one call), for
-  `subscribe_changes` (the cursor is the caller's, every event carries its
-  `seq`), and for the retry rule above. The key passed to `dial` is the app:
-  the same 32 bytes every launch is what keeps it the installation a device let
-  in. It also carries the blocking facade and the JNI surface for Android apps,
-  and `enroll`, ErisAuth's side of letting an app in.
+- **`erisdb-client/`** — the Rust client of `database/1`, dialing over Iroh:
+  one QUIC connection, one HTTP/1.1 exchange per bi-stream, ALPN
+  `eris/database/1`. Read it for `sign_in` (getting in through the device's
+  `eon` in one call), for `subscribe_changes` (the cursor is the caller's, every
+  event carries its `seq`), and for the retry rule above. The key passed to
+  `dial` is the app: the same 32 bytes every launch is what keeps it the
+  installation a device let in. It also carries the blocking facade and the JNI
+  surface for Android apps. The device's side of letting an app in is the mesh
+  library's, `erisoverlaynetwork::enroll`.
 
 - **`clients/mcp/`** — a separate client exposing MCP tools over stdio, signed
-  in through ErisAuth. `update_item` and `revert_item` require the same
+  in through `eon`. `update_item` and `revert_item` require the same
   revisions as the server API. Updates still replace the whole body; callers
   must preserve fields they want to keep. `mint_capability` is disabled unless
   explicitly enabled because its result exposes a credential to the MCP host.

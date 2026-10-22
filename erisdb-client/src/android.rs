@@ -2,10 +2,10 @@
 //! app can load it. Thin by design: strings in, JSON strings out, all real
 //! work in [`crate::blocking`].
 //!
-//! An Android app signs in through ErisAuth's bound service, which answers
-//! with the app's note and a snapshot of the mesh. `nativeLocate` reads
-//! where the mesh's ErisDB is from that snapshot; `nativeDial` dials it as
-//! the app's key; the rest is the API.
+//! An Android app signs in through eon's bound service, asking to use
+//! `database/1`; eon answers with the app's note and a snapshot of the mesh.
+//! `nativeLocate` reads where the mesh's database is from that snapshot;
+//! `nativeDial` dials it as the app's key; the rest is the API.
 //!
 //! Every entry point is wrapped in [`crate::blocking::guard`]. Unwinding
 //! out of an `extern "system"` frame aborts the process, so a panic in
@@ -37,7 +37,7 @@ fn out(env: &mut JNIEnv, s: &str) -> jstring {
 }
 
 /// The endpoint id a key dials as, in hex — the `app` an approval asks
-/// ErisAuth for; "" when the key is not 64 hex characters.
+/// eon for; "" when the key is not 64 hex characters.
 #[no_mangle]
 pub extern "system" fn Java_dev_erisdb_client_ErisDB_nativeEndpointId(
     mut env: JNIEnv,
@@ -48,7 +48,7 @@ pub extern "system" fn Java_dev_erisdb_client_ErisDB_nativeEndpointId(
     out(&mut env, &id)
 }
 
-/// Where the mesh's ErisDB is, from the snapshot ErisAuth answered with:
+/// Where the mesh's database is, from the snapshot eon answered with:
 /// `{"ok":true,"server":<address JSON>}` or `{"ok":false,"error":…}`.
 #[no_mangle]
 pub extern "system" fn Java_dev_erisdb_client_ErisDB_nativeLocate(

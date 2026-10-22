@@ -1,15 +1,16 @@
 # erisdb-client
 
-Dials an ErisDB over Iroh as an app its owner's mesh let in. One QUIC
-connection, one HTTP/1.1 exchange per bi-stream, ALPN `erisdb/0` — the same
-router the core serves over TCP, reached from anywhere without a port to forward
-or a certificate to manage. The app's key is its credential: requests carry no
+The client of `database/1`: dials the mesh's database, which ErisDB serves,
+over Iroh as an app its owner's mesh let in. One QUIC connection, one HTTP/1.1
+exchange per bi-stream, ALPN `eris/database/1` — the same router the core serves
+over TCP, reached from anywhere without a port to forward or a certificate to
+manage. The app's key is its credential: requests carry no
 token, and ErisDB knows the app by the key the QUIC handshake proved.
 
 Three layers, each a thin wrapper over the one below:
 
 ```
-Client          async, the real thing: sign in, dial, request, subscribe, enroll
+Client          async, the real thing: sign in, dial, request, subscribe
 blocking        one process-wide runtime and client, every answer a value
 android         the JNI surface, bound to dev.erisdb.client.ErisDB
 ```
@@ -21,26 +22,28 @@ that target and does nothing but marshal strings.
 
 ## Signing in
 
-An app gets into ErisDB through a device of its owner's mesh. `sign_in` asks
-the device's ErisAuth, over its agent socket
-(`$XDG_RUNTIME_DIR/erisauth/agent.sock`), to approve the app's key for service
-`erisdb` with the grants it wants. The person approves on ErisAuth's screen — all
-of them or fewer — and types ErisDB's passphrase there; ErisAuth enrolls the app
-at the mesh's ErisDB and answers once ErisDB has taken it. `sign_in` then dials
-ErisDB, which it finds in the snapshot as the app approved to serve `erisdb`:
+An app gets into ErisDB through a device of its owner's mesh. Apps ask for
+capabilities, not programs: `CAPABILITY` is `"database/1"`, and ErisDB is what
+serves it. `sign_in` asks the device's `eon`, over its agent socket
+(`$XDG_RUNTIME_DIR/eon/agent.sock`), to approve the app's key to use
+`database/1` with the grants it wants, serving nothing. The person approves on
+`eon`'s screen — all of them or fewer — and types ErisDB's passphrase there;
+`eon` enrolls the app at the mesh's database and answers once ErisDB has taken
+it. `sign_in` then dials the database, which it finds in the snapshot as the app
+approved to serve `database/1`:
 
 ```rust
-use erisdb_client::{sign_in, Client, SignIn};
+use erisdb_client::{sign_in, Client, SignIn, CAPABILITY};
 
 let key = load_or_create_the_apps_key()?; // iroh::SecretKey, the same every launch
 let grants = ["tasks:read", "tasks:create"].map(String::from);
 match sign_in(key.clone(), "Tasks (Linux)", &grants).await? {
     Some(SignIn::Approved { client, note, .. }) => {
         save(client.server(), &key)?;          // where ErisDB is, and the key
-        render(&note.body.grants);             // may be fewer than asked
+        render(note.uses(CAPABILITY).unwrap_or_default()); // may be fewer than asked
     }
     Some(SignIn::Denied(why)) => { /* the person said no */ }
-    None => { /* no ErisAuth listening on this machine */ }
+    None => { /* no eon listening on this machine */ }
 }
 ```
 
@@ -58,41 +61,42 @@ takes the network as an argument. `name` is stamped into every write's
 longer, let in: its installation was revoked, its device removed from the mesh,
 or its note revoked. Only a device lets it back in.
 
-`locate(&snapshot)` reads where the mesh's ErisDB is from any snapshot of the
-mesh: the app approved to serve `erisdb` whose note counts, the most recently
-approved should there be more than one. When the person approves a new ErisDB,
-the old one's note is revoked and it lets no more apps in; apps find the new one
-in any later snapshot, from `sign_in` or from ErisAuth's `Agent::snapshot`.
+`locate(&snapshot)` reads where the mesh's database is from any snapshot of the
+mesh: the app approved to serve `database/1` whose note counts, the most
+recently approved should there be more than one (`Snapshot::server`). When the
+person approves a new database, the old one's note is revoked and it lets no
+more apps in; apps find the new one in any later snapshot, from `sign_in` or
+from the agent's `Agent::snapshot`. `alpn()` is the ALPN it answers on,
+`eris/database/1`, derived from `CAPABILITY`.
 `parse_server` reads an address an app kept as text: an
 `EndpointAddr` as JSON, or a bare endpoint id for discovery to resolve.
 
-## Enrolling, as ErisAuth
+## Enrolling, as a device
 
-`enroll` and `change_passphrase` are the device's side, for ErisAuth. They run
-on the device's own endpoint, which is what ErisDB checks against the mesh, so
-the client is built over it with `Client::over`. Sync with ErisDB first so it
-knows the device:
+Letting an app in is the device's side, and the mesh library's, not this
+crate's: `eon` calls `erisoverlaynetwork::enroll` from the device's own
+endpoint, which is what ErisDB checks against the mesh, over ALPN
+`eris-enroll/0`. It syncs with ErisDB first, so ErisDB knows the device:
 
 ```rust
-use erisdb_client::{Client, Guarded};
+use erisoverlaynetwork::enroll::{self, Outcome};
 
-let provider = node.provider("erisdb").expect("the mesh has an ErisDB");
-node.sync_with(provider.id).await?;
-let erisdb = Client::over(node.endpoint().clone(), provider.endpoint_addr(), "ErisAuth");
-match erisdb.enroll(&note, &typed_passphrase).await? {
-    Guarded::Passed(enrolled) => { /* answer the app: approved */ }
-    Guarded::Wrong { retry_after } => { /* ask again; retry_after when this guess locked the device */ }
-    Guarded::Locked { retry_after } => { /* say how long to wait */ }
-    Guarded::NoPassphrase => { /* the operator sets one on the server */ }
+let database = node.server(erisdb_client::CAPABILITY).expect("the mesh has a database");
+match enroll::enroll(&node, database.id, &note, &typed_passphrase).await? {
+    Outcome::Done => { /* answer the app: approved */ }
+    Outcome::Wrong { retry_after } => { /* ask again; retry_after when this guess locked the device */ }
+    Outcome::Locked { retry_after } => { /* say how long to wait */ }
+    Outcome::NoPassphrase => { /* the operator sets one on the server */ }
 }
 ```
 
-The first three wrong guesses in a row from a device cost nothing; the third
-locks it out for a minute, and each one after doubles the wait, up to a day. A
-right guess clears the count. Any other refusal — not a device of the mesh, a
-note ErisDB cannot take, a new passphrase under 8 characters, an ErisDB the mesh
-no longer approves (`503 not_the_erisdb`) — is a `Refused` error carrying the
-status and body.
+`enroll::change(&node, database.id, current, new)` changes the passphrase, with
+the same answers. The first three wrong guesses in a row from a device cost
+nothing; the third locks it out for a minute, and each one after doubles the
+wait, up to a day. A right guess clears the count. Any other refusal — not a
+device of the mesh, a note that is not the device's own or does not use
+`database/1`, a new passphrase under 8 characters, a database the mesh no longer
+approves — is an error.
 
 ## Retries
 
@@ -142,12 +146,12 @@ transport failures carry a message, poisoned locks are opened anyway, and every
 JNI entry point catches unwinding before it can reach a frame where it would
 abort the app rather than return.
 
-An Android app signs in through ErisAuth's bound service, which answers with
-the app's note and a snapshot of the mesh, both JSON. The JNI surface takes it
-from there:
+An Android app signs in through ErisOverlayNetwork's bound service on the phone,
+which answers with the app's note and a snapshot of the mesh, both JSON. The JNI
+surface takes it from there:
 
 ```
-nativeEndpointId(keyHex)                 -> endpoint id hex, the `app` to ask ErisAuth for
+nativeEndpointId(keyHex)                 -> endpoint id hex, the `app` to ask eon for
                                           | ""  (not 64 hex characters)
 nativeLocate(snapshotJson)               -> {"ok": true, "server": <EndpointAddr JSON>}
                                           | {"ok": false, "error": …}
@@ -167,8 +171,7 @@ All bound to `dev.erisdb.client.ErisDB`. The flow:
 
 1. Hold the app's key: 32 bytes, as 64 hex characters, kept in the Android
    Keystore and the same every launch. `nativeEndpointId(keyHex)` is the `app`
-   to hand ErisAuth's `approve` with service `erisdb`, `serves` false, and the
-   grants wanted.
+   to hand `ErisOverlayNetwork.approve(name, mapOf("database/1" to grants), app = …)`.
 2. On `Approved(note, snapshot)`, `nativeLocate(snapshot)` gives `server`.
    Persist it with the key. Once dialed, `nativePermissions()` says what the
    person granted, which may be fewer than asked.
@@ -219,9 +222,9 @@ the Eris monorepo takes ErisOverlayNetwork from its git repository.
 Postgres in a container via testcontainers, the erisdb binary (`ERISDB_BIN`, or
 `../erisdb` built on demand) joined to a mesh and serving over Iroh, a device
 node built from the mesh library in the test process, and this client dialing
-as the apps the device let in. ErisAuth is a stand-in on its agent socket that
-does what ErisAuth does once the person says yes, through this crate: it signs
-the note and enrolls it from the device's endpoint. Every endpoint is on
+as the apps the device let in. `eon` is a stand-in on its agent socket that
+does what `eon` does once the person says yes: it signs the note and enrolls it
+from the device's endpoint with `erisoverlaynetwork::enroll`. Every endpoint is on
 loopback. No mocks.
 
 ```sh
@@ -234,7 +237,7 @@ is checked by using it. One test removes the app's device from the mesh and
 watches the app's next request get 401 and its open feed end.
 
 The retry tests instead put a deliberately broken peer on the wire — a real Iroh
-endpoint speaking `erisdb/0`, itself an app the device let in, forwarding to the
+endpoint speaking `eris/database/1`, itself an app the device let in, forwarding to the
 real core and then dying without answering. Whether a call was safe to repeat is
 invisible from the calling side, where a lost request and a lost response look
 alike; only the server knows how many requests actually arrived.

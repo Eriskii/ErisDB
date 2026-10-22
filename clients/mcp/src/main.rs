@@ -435,7 +435,7 @@ impl ServerHandler for ErisDBMcp {
 }
 
 #[derive(Parser)]
-#[command(version, about = "ErisDB MCP client; sign in once through ErisAuth, then serve MCP on stdio")]
+#[command(version, about = "ErisDB MCP client; sign in once through eon, then serve MCP on stdio")]
 struct Args {
     /// Advanced override for where this app keeps its key and ErisDB's address.
     #[arg(long, env = "ERISDB_PROFILE_FILE", global = true)]
@@ -450,10 +450,10 @@ struct Args {
 
 #[derive(clap::Subcommand)]
 enum Action {
-    /// Ask this machine's ErisAuth to let this app into ErisDB with these
-    /// permissions; the person approves on ErisAuth's screen.
+    /// Ask this machine's eon to let this app use the database with these
+    /// permissions; the person approves on eon's screen.
     SignIn {
-        /// What ErisAuth shows the person. Default: erisdb-mcp (PROFILE).
+        /// What eon shows the person. Default: erisdb-mcp (PROFILE).
         #[arg(long)]
         name: Option<String>,
         #[arg(long = "grant", value_delimiter = ',', required = true)]

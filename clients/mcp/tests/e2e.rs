@@ -2,9 +2,10 @@
 //! testcontainers), a real erisdb binary joined to a mesh and serving over
 //! Iroh, a device node built from the mesh library in this process, and the
 //! erisdb-mcp binary as a real subprocess speaking JSON-RPC over its stdio.
-//! ErisAuth is a stand-in on its agent socket that does what ErisAuth does
-//! once the person says yes: it signs the note and enrolls it at the mesh's
-//! ErisDB from the device's endpoint. Every endpoint is on loopback.
+//! eon is a stand-in on its agent socket that does what eon does once the
+//! person says yes: it signs the note and enrolls it at the mesh's database
+//! from the device's endpoint, over the mesh library's `enroll`. Every
+//! endpoint is on loopback.
 //!
 //! The core is driven as a process and built from the server crate when
 //! needed. Missing prerequisites fail the suite rather than silently skipping.
@@ -14,11 +15,13 @@ use std::process::Stdio;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use erisdb_client::{Client, Guarded};
+use erisdb_client::CAPABILITY;
 use erisoverlaynetwork::agent::{self, Ask, Reply, Request};
 use erisoverlaynetwork::devices::Op;
+use erisoverlaynetwork::enroll::{self, Outcome};
 use erisoverlaynetwork::mesh::{self, Config, Local, MemoryStore, Node};
 use erisoverlaynetwork::net::{self, Network};
+use erisoverlaynetwork::Uses;
 use iroh::protocol::Router;
 use iroh::SecretKey;
 use serde_json::{json, Value};
@@ -52,21 +55,27 @@ fn erisdb_binary() -> PathBuf {
 }
 
 // ---------------------------------------------------------------------
-// The mesh: a device, its ErisAuth, and the ErisDB it let in.
+// The mesh: a device, its eon, and the database it let in.
 // ---------------------------------------------------------------------
 
-/// What the person at the stand-in ErisAuth does with a request: approve
-/// these grants, or say no.
+/// What the person at the stand-in eon does with a request: approve these
+/// grants in the database, or say no.
 type Person = Arc<dyn Fn(&Ask) -> Option<Vec<String>> + Send + Sync>;
 
 fn approves_as_asked() -> Person {
-    Arc::new(|ask: &Ask| Some(ask.grants.clone()))
+    Arc::new(|ask: &Ask| Some(ask.uses.get(CAPABILITY).cloned().unwrap_or_default()))
 }
 
-/// ErisAuth's agent socket on the device, under a runtime directory of its
-/// own: an app approved to serve `erisdb` replaces the ErisDB before it, whose
-/// note is revoked; an app asking to call it is enrolled at the mesh's ErisDB,
-/// and approved only once ErisDB took it.
+/// Using the database with `grants`.
+fn database(grants: Vec<String>) -> Uses {
+    Uses::from([(CAPABILITY.parse().unwrap(), grants)])
+}
+
+/// eon's agent socket on the device, under a runtime directory of its own:
+/// an app approved to serve a capability a mesh has a single server of
+/// replaces the server of it before it, whose note is revoked; an app asking
+/// to use the database is enrolled there, and approved only once the
+/// database took it.
 struct Agent {
     runtime: tempfile::TempDir,
     asked: Arc<std::sync::Mutex<Vec<Ask>>>,
@@ -106,26 +115,25 @@ impl Agent {
 
 async fn answer(node: &Node, ask: &Ask, granted: Option<Vec<String>>) -> Reply {
     let Some(grants) = granted else { return Reply::Denied("the person said no".into()) };
-    let note = node.issue(ask.app, &ask.name, &ask.service, grants, ask.serves, None).unwrap();
-    if ask.serves {
-        let before = node.providers("erisdb").into_iter().filter_map(|p| p.note().map(|n| n.id));
+    if ask.serves.iter().any(|s| s.single) {
+        let note = node.issue(ask.app, &ask.name, ask.uses.clone(), ask.serves.clone(), None).unwrap();
+        let before = node.servers(CAPABILITY).into_iter().filter_map(|p| p.note().map(|n| n.id));
         for old in before.filter(|old| *old != note.id).collect::<Vec<_>>() {
             node.append(Op::Revoke { note: old }).await.unwrap();
         }
-    } else {
-        let provider = node.provider("erisdb").expect("the mesh has an ErisDB");
-        node.sync_with(provider.id).await.unwrap();
-        let erisdb = Client::over(node.endpoint().clone(), provider.endpoint_addr(), "ErisAuth");
-        match erisdb.enroll(&note, PASSPHRASE).await {
-            Ok(Guarded::Passed(_)) => {}
-            other => return Reply::Error(format!("ErisDB did not take the note: {other:?}")),
-        }
+        return Reply::Approved { note, snapshot: node.snapshot().await.unwrap() };
+    }
+    let note = node.issue(ask.app, &ask.name, database(grants), Vec::new(), None).unwrap();
+    let server = node.server(CAPABILITY).expect("the mesh has a database");
+    match enroll::enroll(node, server.id, &note, PASSPHRASE).await {
+        Ok(Outcome::Done) => {}
+        other => return Reply::Error(format!("the database did not take the note: {other:?}")),
     }
     Reply::Approved { note, snapshot: node.snapshot().await.unwrap() }
 }
 
-/// A mesh with an ErisDB in it: Postgres, the device and its ErisAuth, and
-/// the core joined, its passphrase set, serving TCP and Iroh.
+/// A mesh with a database in it: Postgres, the device and its eon, and the
+/// core joined as the database, its passphrase set, serving TCP and Iroh.
 struct Core {
     _pg: ContainerAsync<Postgres>,
     _server: Child,
@@ -133,7 +141,7 @@ struct Core {
     url: String,
     laptop: Node,
     _router: Router,
-    erisauth: Agent,
+    eon: Agent,
 }
 
 impl Core {
@@ -156,11 +164,11 @@ impl Core {
         .unwrap();
         laptop.create("laptop").await.unwrap();
         let router = Router::builder(endpoint).accept(mesh::ALPN, laptop.protocol()).spawn();
-        let erisauth = Agent::on(&laptop, approves_as_asked()).await;
+        let eon = Agent::on(&laptop, approves_as_asked()).await;
 
-        let joined = erisdb(&secret, &database, erisauth.runtime.path()).arg("join").output().await.unwrap();
+        let joined = erisdb(&secret, &database, eon.runtime.path()).arg("join").output().await.unwrap();
         assert!(joined.status.success(), "join: {}", String::from_utf8_lossy(&joined.stderr));
-        let mut set = erisdb(&secret, &database, erisauth.runtime.path())
+        let mut set = erisdb(&secret, &database, eon.runtime.path())
             .args(["passphrase", "set"])
             .stdin(Stdio::piped())
             .spawn()
@@ -171,7 +179,7 @@ impl Core {
         // Claim a port by binding it and letting go: the core takes it next.
         let port = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap().port();
         let url = format!("http://127.0.0.1:{port}");
-        let server = erisdb(&secret, &database, erisauth.runtime.path())
+        let server = erisdb(&secret, &database, eon.runtime.path())
             .args(["serve", "--listen", &format!("127.0.0.1:{port}")])
             .stdout(Stdio::null())
             .spawn()
@@ -179,12 +187,12 @@ impl Core {
         let http = reqwest::Client::new();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
         while !http.get(format!("{url}/v1/health")).send().await.is_ok_and(|r| r.status() == 200)
-            || laptop.provider("erisdb").is_none()
+            || laptop.server(CAPABILITY).is_none()
         {
             assert!(tokio::time::Instant::now() < deadline, "the core never came up on {url}");
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        Core { _pg: pg, _server: server, secret, url, laptop, _router: router, erisauth }
+        Core { _pg: pg, _server: server, secret, url, laptop, _router: router, eon }
     }
 
     /// Cut a token with the same CLI an operator would use. `grants` is
@@ -210,15 +218,15 @@ impl Core {
         serde_json::from_str(&text).unwrap_or(Value::Null)
     }
 
-    /// `erisdb-mcp sign-in` against this mesh's ErisAuth, keeping its
-    /// profile under `config`.
+    /// `erisdb-mcp sign-in` against this mesh's eon, keeping its profile
+    /// under `config`.
     fn sign_in(&self, config: &Path, args: &[&str]) -> Command {
-        self.sign_in_through(&self.erisauth, config, args)
+        self.sign_in_through(&self.eon, config, args)
     }
 
-    fn sign_in_through(&self, erisauth: &Agent, config: &Path, args: &[&str]) -> Command {
+    fn sign_in_through(&self, eon: &Agent, config: &Path, args: &[&str]) -> Command {
         let mut command = mcp_command(config);
-        command.env("XDG_RUNTIME_DIR", erisauth.runtime.path()).arg("sign-in").args(args);
+        command.env("XDG_RUNTIME_DIR", eon.runtime.path()).arg("sign-in").args(args);
         command
     }
 
@@ -481,16 +489,16 @@ async fn a_profile_others_can_read_is_refused() {
 }
 
 // ---------------------------------------------------------------------
-// Signing in, through the device's ErisAuth.
+// Signing in, through the device's eon.
 // ---------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread")]
-async fn signing_in_through_erisauth_keeps_a_private_profile() {
+async fn signing_in_through_eon_keeps_a_private_profile() {
     let core = Core::new().await;
     let config = tempfile::tempdir().unwrap();
     let path = profile(config.path(), "default");
 
-    // No ErisAuth listening: nothing is asked, nothing is written.
+    // No eon listening: nothing is asked, nothing is written.
     let nowhere = tempfile::tempdir().unwrap();
     let out = mcp_command(config.path())
         .env("XDG_RUNTIME_DIR", nowhere.path())
@@ -499,7 +507,7 @@ async fn signing_in_through_erisauth_keeps_a_private_profile() {
         .await
         .unwrap();
     assert!(!out.status.success());
-    assert!(String::from_utf8_lossy(&out.stderr).contains("no ErisAuth"), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("no eon"), "{}", String::from_utf8_lossy(&out.stderr));
     assert!(!path.exists());
 
     // The person approves less than was asked.
@@ -509,10 +517,11 @@ async fn signing_in_through_erisauth_keeps_a_private_profile() {
     assert!(out.stdout.is_empty(), "credentials must not reach stdout");
     match narrowing.asked.lock().unwrap().as_slice() {
         [ask] => {
-            assert_eq!((ask.service.as_str(), ask.serves, ask.name.as_str()), ("erisdb", false, "erisdb-mcp (default)"));
-            assert_eq!(ask.grants, ["tasks:read", "tasks:create"]);
+            assert_eq!(ask.name, "erisdb-mcp (default)");
+            assert_eq!(ask.uses, database(vec!["tasks:read".into(), "tasks:create".into()]), "it asks to use a database");
+            assert!(ask.serves.is_empty(), "it serves nothing: {ask:?}");
         }
-        other => panic!("ErisAuth was asked {other:?}"),
+        other => panic!("eon was asked {other:?}"),
     }
     #[cfg(unix)]
     {
@@ -521,7 +530,7 @@ async fn signing_in_through_erisauth_keeps_a_private_profile() {
     }
     let saved: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
     assert_eq!(saved["key"].as_str().unwrap().len(), 64);
-    assert_eq!(saved["server"]["id"], core.laptop.provider("erisdb").unwrap().id.to_string());
+    assert_eq!(saved["server"]["id"], core.laptop.server(CAPABILITY).unwrap().id.to_string());
 
     // Restarting needs nothing but the profile.
     let mut mcp = Mcp::spawn(config.path(), &[]);

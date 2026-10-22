@@ -1,7 +1,8 @@
 # The core, as a service. Stateless: everything durable is in Postgres, and
 # the iroh identity is derived from ERISDB_SECRET, so this unit owns no state
 # and a restart loses nothing. It refuses to start before `erisdb join` has a
-# device approve the core; run that as yourself, where ErisAuth runs.
+# device approve the core to serve the mesh's database, database/1; run that as
+# yourself, where eon runs.
 [Unit]
 Description=erisdb — stateless personal data core
 Documentation=https://github.com/Eriskii/ErisDB

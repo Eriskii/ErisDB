@@ -1,4 +1,4 @@
-//! HTTP/1.1 on one QUIC bi-stream: the exchange ErisDB serves under ALPN `erisdb/0`.
+//! HTTP/1.1 on one QUIC bi-stream: the exchange the database serves under ALPN `eris/database/1`.
 //!
 //! Each request opens a stream of its own and speaks one HTTP/1.1 exchange on it with hyper's
 //! client connection, driven as a task of the page. The request carries no token: ErisDB knows

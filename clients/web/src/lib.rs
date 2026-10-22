@@ -1,24 +1,25 @@
-//! ErisDB for browser apps, as WebAssembly: an app signs in by an ErisAuth ticket and calls
-//! ErisDB over Iroh, through a relay, as its own key.
+//! ErisDB for browser apps, as WebAssembly: an app signs in by an eon ticket and calls the mesh's
+//! database over Iroh, through a relay, as its own key.
 //!
 //! The app holds a key of its own, which is its endpoint id and, once a device has let it in,
 //! its only credential. It signs in by redeeming a ticket a device of its owner's mesh showed
-//! (ErisAuth's **Add a browser app**): both screens show the request's fingerprint, the person
-//! approves on the device and types ErisDB's passphrase there, the device enrolls the app at
-//! ErisDB, and the app collects its note and a snapshot of the mesh. It finds ErisDB in the
-//! snapshot, as the app approved to serve `erisdb`, and dials it with ALPN `erisdb/0`: one
-//! HTTP/1.1 exchange per QUIC bi-stream, carrying no token.
+//! (eon's **Add a browser app**), asking to use `database/1`: both screens show the request's
+//! fingerprint, the person approves on the device and types the database's passphrase there,
+//! the device enrolls the app at the database, and the app collects its note and a snapshot of
+//! the mesh. It finds the database in the snapshot, as the app approved to serve `database/1`,
+//! and dials it with that capability's ALPN, `eris/database/1`: one HTTP/1.1 exchange per QUIC
+//! bi-stream, carrying no token.
 //!
 //! Everything a call can fail with arrives in JavaScript as an `Error` with a `code`: `bad_key`,
-//! `bad_ticket`, `no_relay`, `no_erisdb`, `unreachable`, `used`, `expired`, `refused`, `bad_request`,
-//! `internal`, and, from a change feed ErisDB would not open, `refused` with the `status` and `body`
-//! it answered.
+//! `bad_ticket`, `no_relay`, `no_database`, `unreachable`, `used`, `expired`, `refused`,
+//! `bad_request`, `internal`, and, from a change feed the database would not open, `refused` with
+//! the `status` and `body` it answered.
 
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use erisoverlaynetwork::Snapshot;
 use erisoverlaynetwork::ticket::Ticket;
+use erisoverlaynetwork::{Capability, Snapshot};
 use iroh::endpoint::Connection;
 use iroh::{Endpoint, EndpointAddr, RelayUrl, SecretKey};
 use js_sys::{Promise, Reflect};
@@ -31,10 +32,13 @@ mod http;
 mod net;
 mod sign_in;
 
-/// ErisDB's wire protocol: HTTP/1.1 inside QUIC bi-streams.
-pub const ALPN: &[u8] = b"erisdb/0";
+/// The ALPN the database answers on, its capability's: `eris/database/1`. The wire is HTTP/1.1
+/// inside QUIC bi-streams.
+fn alpn() -> Vec<u8> {
+    sign_in::CAPABILITY.parse::<Capability>().expect("database/1 is a capability").alpn()
+}
 
-/// How long dialing ErisDB may take.
+/// How long dialing the database may take.
 const DIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 #[wasm_bindgen(start)]
@@ -87,7 +91,7 @@ pub fn generate_key() -> Vec<u8> {
     SecretKey::generate().to_bytes().to_vec()
 }
 
-/// The endpoint id `key` calls as, in hex: what ErisAuth and ErisDB know the app by.
+/// The endpoint id `key` calls as, in hex: what eon and the database know the app by.
 #[wasm_bindgen(js_name = appId)]
 pub fn app_id(key: &[u8]) -> Result<String, JsValue> {
     Ok(secret(key)?.public().to_string())
@@ -184,8 +188,8 @@ impl Joining {
     }
 }
 
-/// Sign in by `ticket` as the app holding `key`, called `name`, asking for `grants` in ErisDB.
-/// Resolves to a `Joining` once the device has the request.
+/// Sign in by `ticket` as the app holding `key`, called `name`, asking to use the database with
+/// `grants`. Resolves to a `Joining` once the device has the request.
 #[wasm_bindgen(js_name = signIn)]
 pub fn sign_in(key: &[u8], ticket_text: &str, name: &str, grants: Vec<String>) -> Promise {
     let parts = secret(key).and_then(|key| ticket(ticket_text).map(|(ticket, relay)| (key, ticket, relay)));
@@ -250,10 +254,10 @@ impl Inner {
         if let Some(conn) = slot.as_ref().filter(|conn| conn.close_reason().is_none()) {
             return Ok(conn.clone());
         }
-        let conn = n0_future::time::timeout(DIAL_TIMEOUT, self.endpoint.connect(self.server.clone(), ALPN))
+        let conn = n0_future::time::timeout(DIAL_TIMEOUT, self.endpoint.connect(self.server.clone(), &alpn()))
             .await
-            .map_err(|_| error("unreachable", "ErisDB did not answer in time"))?
-            .map_err(|e| error("unreachable", format!("could not reach ErisDB: {e}")))?;
+            .map_err(|_| error("unreachable", "the database did not answer in time"))?
+            .map_err(|e| error("unreachable", format!("could not reach the database: {e}")))?;
         *slot = Some(conn.clone());
         Ok(conn)
     }
@@ -289,28 +293,28 @@ impl Inner {
     }
 }
 
-/// The app's connection to its mesh's ErisDB.
+/// The app's connection to its mesh's database.
 #[wasm_bindgen]
 pub struct Client {
     inner: Rc<Inner>,
 }
 
-/// Connect to the ErisDB in `snapshot` as the app holding `key`, stamping `name` into every
-/// write's source. ErisDB is the app approved to serve `erisdb`; the snapshot says which relay
-/// reaches it. Dialing happens with the first request.
+/// Connect to the database in `snapshot` as the app holding `key`, stamping `name` into every
+/// write's source. The database is the app approved to serve `database/1`, the most recently
+/// approved; the snapshot says which relay reaches it. Dialing happens with the first request.
 #[wasm_bindgen]
 pub fn connect(key: &[u8], snapshot: JsValue, name: &str) -> Promise {
     let parts = secret(key).and_then(|key| {
         let snapshot: Snapshot = from_js(&snapshot, "the snapshot")?;
-        let erisdb = snapshot
-            .provider(sign_in::SERVICE)
-            .ok_or_else(|| error("no_erisdb", "this mesh has no ErisDB, or the snapshot does not say where it is"))?;
-        let relay = erisdb
+        let database = snapshot.server(sign_in::CAPABILITY).ok_or_else(|| {
+            error("no_database", "this mesh has no database, or the snapshot does not say where it is")
+        })?;
+        let relay = database
             .relay
             .as_deref()
             .and_then(|relay| relay.parse::<RelayUrl>().ok())
-            .ok_or_else(|| error("no_relay", "the mesh names no relay that reaches its ErisDB"))?;
-        Ok((key, net::through(erisdb.id, &relay), relay))
+            .ok_or_else(|| error("no_relay", "the mesh names no relay that reaches its database"))?;
+        Ok((key, net::through(database.id, &relay), relay))
     });
     let name = name.to_string();
     future_to_promise(async move {

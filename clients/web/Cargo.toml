@@ -2,7 +2,7 @@
 name = "erisdb-web"
 version = "0.1.0"
 edition = "2024"
-description = "ErisDB for browser apps: sign in by an ErisAuth ticket and call ErisDB over Iroh, through a relay, as the app's own key."
+description = "ErisDB for browser apps: sign in by an ErisOverlayNetwork ticket and call ErisDB over Iroh, through a relay, as the app's own key."
 license = "MIT"
 repository = "https://github.com/Eriskii/ErisDB"
 readme = "README.md"
@@ -14,7 +14,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 console_error_panic_hook = "0.1"
-erisoverlaynetwork = { git = "https://github.com/Eriskii/ErisOverlayNetwork", tag = "v0.2.0", default-features = false }
+erisoverlaynetwork = { git = "https://github.com/Eriskii/ErisOverlayNetwork", tag = "v0.3.0", default-features = false }
 http-body-util = "0.1"
 hyper = { version = "1", features = ["client", "http1"] }
 iroh = { version = "1", default-features = false, features = ["tls-ring"] }

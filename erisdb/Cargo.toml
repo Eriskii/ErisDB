@@ -27,7 +27,7 @@ chrono = { version = "0.4", features = ["serde"] }
 # the rest at registration.
 jsonschema = { version = "0.49", default-features = false }
 thiserror = "2"
-erisoverlaynetwork = { git = "https://github.com/Eriskii/ErisOverlayNetwork", tag = "v0.2.0" }
+erisoverlaynetwork = { git = "https://github.com/Eriskii/ErisOverlayNetwork", tag = "v0.3.0" }
 argon2 = "0.5"
 password-hash = { version = "0.5", features = ["getrandom"] }
 rpassword = "7"

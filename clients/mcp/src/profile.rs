@@ -1,4 +1,4 @@
-//! A profile: one app's key and where its ErisDB is, kept on this machine.
+//! A profile: one app's key and where its database is, kept on this machine.
 //!
 //! The key is the app's credential — ErisDB knows the app by it alone — so
 //! the file is the user's own (mode 0600 on Unix), is replaced atomically,
@@ -35,7 +35,7 @@ pub fn path(explicit: Option<PathBuf>, profile: &str) -> Result<PathBuf> {
 pub struct Profile {
     /// The app's key, 64 hex characters.
     pub key: String,
-    /// The mesh's ErisDB, as the device said when the app signed in.
+    /// The mesh's database, as the device said when the app signed in.
     pub server: EndpointAddr,
 }
 
@@ -69,9 +69,9 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Sign in through this machine's ErisAuth and keep the profile. Runs
-/// outside MCP: the person answers on ErisAuth's screen and types ErisDB's
-/// passphrase there. The saved profile is replaced only once ErisDB has
+/// Sign in through this machine's eon and keep the profile. Runs outside
+/// MCP: the person answers on eon's screen and types the database's
+/// passphrase there. The saved profile is replaced only once the database has
 /// taken the app; a denial or a cancel leaves it as it was.
 pub async fn sign_in(path: &Path, name: &str, grants: &[String]) -> Result<()> {
     if grants.is_empty() {
@@ -108,14 +108,14 @@ pub async fn sign_in(path: &Path, name: &str, grants: &[String]) -> Result<()> {
     // Prove local storage is writable before asking anyone. On failure the
     // old profile stays intact; readers see either the old or the new one.
     let mut file = tempfile::NamedTempFile::new_in(parent)?;
-    eprintln!("Asking ErisAuth to let {name} into ErisDB. Approve it on the device and type the passphrase there.");
+    eprintln!("Asking eon to let {name} use the database. Approve it on the device and type the passphrase there.");
     let answer = tokio::select! {
         answer = erisdb_client::sign_in(key.clone(), name, grants) => answer?,
         _ = tokio::signal::ctrl_c() => bail!("cancelled; the request is withdrawn"),
     };
     match answer {
-        None => bail!("no ErisAuth is listening here ($XDG_RUNTIME_DIR/erisauth/agent.sock): sign in where ErisAuth runs"),
-        Some(SignIn::Denied(why)) => bail!("ErisAuth said no: {why}"),
+        None => bail!("no eon is listening here ($XDG_RUNTIME_DIR/eon/agent.sock): sign in where eon runs"),
+        Some(SignIn::Denied(why)) => bail!("eon said no: {why}"),
         Some(SignIn::Approved { client, note, .. }) => {
             let profile = Profile { key: hex(&key.to_bytes()), server: client.server().clone() };
             file.write_all(&serde_json::to_vec_pretty(&profile)?)?;
@@ -132,7 +132,8 @@ pub async fn sign_in(path: &Path, name: &str, grants: &[String]) -> Result<()> {
             }
             #[cfg(unix)]
             std::fs::File::open(parent)?.sync_all()?;
-            eprintln!("Signed in. ErisDB lets {name} {}.", note.body.grants.join(", "));
+            let grants = note.uses(erisdb_client::CAPABILITY).unwrap_or_default();
+            eprintln!("Signed in. The database lets {name} {}.", grants.join(", "));
             Ok(())
         }
     }

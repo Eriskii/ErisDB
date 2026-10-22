@@ -1,30 +1,30 @@
-package dev.eris.auth.client
+package dev.eris.eon.client
 
 import android.os.Binder
 import android.os.IBinder
 import android.os.Parcel
 
 /**
- * ErisAuth's Binder protocol, written out rather than generated from AIDL, so that the app and
- * ErisAuth share one definition and an app vendors it as one file. Every call is one-way.
+ * ErisOverlayNetwork's Binder protocol, written out rather than generated from AIDL, so that the app and
+ * ErisOverlayNetwork share one definition and an app vendors it as one file. Every call is one-way.
  *
- * To ErisAuth's service, interface [SERVICE]:
+ * To ErisOverlayNetwork's service, interface [SERVICE]:
  * - [ASK]: a request id the app chose, the request as JSON, then the app's callback binder. The
- *   JSON is exactly the line an app sends on ErisAuth's agent socket:
- *   `{"op":"approve","v":2,"service","name","grants","serves","app"}` or `{"op":"snapshot","v":2}`.
+ *   JSON is exactly the line an app sends on ErisOverlayNetwork's agent socket:
+ *   `{"op":"approve","v":3,"name","uses","serves","app"}` or `{"op":"snapshot","v":3}`.
  * - [WITHDRAW]: a request id. Only the app that asked can withdraw its request.
  *
  * To the app's callback, interface [CALLBACK]:
  * - [ANSWER]: the answer as JSON, exactly the agent socket's reply line:
  *   `{"approved":{"note","snapshot"}}`, `{"denied":"why"}`, `{"snapshot":{…}}` or `{"error":"why"}`.
  *
- * Android tells ErisAuth which app is calling, by the Binder calling uid: its package and the
+ * Android tells ErisOverlayNetwork which app is calling, by the Binder calling uid: its package and the
  * SHA-256 of its signing certificate are what the person sees and what the note records. An app
  * whose callback dies withdraws its requests.
  */
 object Wire {
-    const val SERVICE = "dev.eris.auth.IErisAuth"
-    const val CALLBACK = "dev.eris.auth.IErisAuthCallback"
+    const val SERVICE = "dev.eris.eon.IErisOverlayNetwork"
+    const val CALLBACK = "dev.eris.eon.IErisOverlayNetworkCallback"
     const val ASK = IBinder.FIRST_CALL_TRANSACTION
     const val WITHDRAW = IBinder.FIRST_CALL_TRANSACTION + 1
     const val ANSWER = IBinder.FIRST_CALL_TRANSACTION
@@ -63,7 +63,7 @@ object Wire {
         }
     }
 
-    /** ErisAuth's end: hears requests and withdrawals, each with the uid and pid Android says sent it. */
+    /** ErisOverlayNetwork's end: hears requests and withdrawals, each with the uid and pid Android says sent it. */
     abstract class Service : Binder() {
         abstract fun onAsk(requestId: String, requestJson: String, callback: IBinder, uid: Int, pid: Int)
         abstract fun onWithdraw(requestId: String, uid: Int)

@@ -1,18 +1,20 @@
 //! ErisDB's place in its owner's mesh.
 //!
-//! `erisdb join` asks the device's ErisAuth to approve this core's Iroh key
-//! as the app serving `erisdb`: the mesh's ErisDB. A mesh has one; approving
-//! another revokes this one's note, and apps find the newest approved. The
-//! note and the core's copy of the device list live in Postgres, and `erisdb
-//! serve` runs a [`Node`] under that note, which keeps the list current:
-//! devices push every addition, removal and revocation to it the moment they
-//! make one.
+//! `erisdb join` asks the device's eon to approve this core's Iroh key as an
+//! app serving `database/1`: single, so the mesh has one database, and
+//! taking a passphrase, so apps get into it only with ErisDB's. Approving
+//! another database revokes this one's note, and apps find the newest
+//! approved. The note and the core's copy of the device list live in
+//! Postgres, and `erisdb serve` runs a [`Node`] under that note, which keeps
+//! the list current: devices push every addition, removal and revocation to
+//! it the moment they make one.
 //!
 //! The list is what ErisDB trusts. A device in it may enroll apps and change
-//! the passphrase, while this core's own note counts; an installation counts
-//! while its device is in it and its note is not revoked in it. [`watch`]
-//! revokes the installations a removal or a revocation ends, as soon as the
-//! list carries it, and says so when this core's own note stops counting.
+//! the passphrase ([`crate::enroll`]), while this core's own note counts; an
+//! installation counts while its device is in it and its note is not
+//! revoked in it. [`watch`] revokes the installations a removal or a
+//! revocation ends, as soon as the list carries it, and says so when this
+//! core's own note stops counting.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -126,20 +128,14 @@ impl Mesh {
         &self.node
     }
 
-    /// Whether this core is the mesh's ErisDB: its own note counts, so apps
-    /// find it. A newer ErisDB's approval revokes it, as does its device
-    /// leaving the mesh.
-    pub fn is_erisdb(&self) -> bool {
+    /// Whether this core is the mesh's database: its own note counts, so
+    /// apps find it. Approving another database revokes it, as does its
+    /// device leaving the mesh.
+    pub fn is_the_database(&self) -> bool {
         match self.node.local() {
             Local::App(note) => self.node.counts(note),
             Local::Device(_) => false,
         }
-    }
-
-    /// Whether `device` is in the mesh now.
-    pub fn is_member(&self, device: &DeviceId) -> bool {
-        self.node
-            .with_list(|list| list.is_some_and(|list| list.is_member(device)))
     }
 
     /// Whether an installation approved by `device` with `note` still
@@ -150,16 +146,6 @@ impl Mesh {
         };
         self.node.with_list(|list| {
             list.is_some_and(|list| list.is_member(&device) && !list.is_revoked(&note))
-        })
-    }
-
-    /// Whether `note` counts in the list as it stands, and why not.
-    pub fn check(&self, note: &Note) -> erisoverlaynetwork::Result<()> {
-        self.node.with_list(|list| match list {
-            Some(list) => note.check(list),
-            None => Err(erisoverlaynetwork::Error::Conflict(
-                "this ErisDB is in no mesh".into(),
-            )),
         })
     }
 }
@@ -181,17 +167,17 @@ pub async fn watch(mesh: Mesh, pool: PgPool) {
 /// One pass: every active installation whose device the list removed, or
 /// whose note it revoked, is revoked here too, each with its audit event.
 async fn sweep(mesh: &Mesh, pool: &PgPool) -> Result<()> {
-    let counts = mesh.is_erisdb();
+    let counts = mesh.is_the_database();
     if mesh.counted.swap(counts, Ordering::SeqCst) != counts {
         if counts {
             tracing::info!(
-                "this ErisDB's approval counts again: it is the mesh's ErisDB and lets apps in"
+                "this ErisDB's approval counts again: it is the mesh's database and lets apps in"
             );
         } else {
             tracing::error!(
-                "this ErisDB's approval no longer counts: the mesh approved another ErisDB, or the device that \
-                 approved this one left. Apps find the other one, and this one lets no more apps in; \
-                 `erisdb join` makes it the mesh's ErisDB again"
+                "this ErisDB's approval no longer counts: the mesh approved another database, or the device \
+                 that approved this one left. Apps find the other one, and this one lets no more apps in; \
+                 `erisdb join` makes it the mesh's database again"
             );
         }
     }

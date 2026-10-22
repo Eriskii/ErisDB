@@ -24,9 +24,9 @@ tempfile = "3"
 
 # The end-to-end suite drives a real core and a real Postgres, both as
 # processes: a container to run the store, and the erisdb binary itself.
-# A device node from the mesh library plays the device ErisAuth runs on.
+# A device node from the mesh library plays the device ErisOverlayNetwork runs on.
 # Nothing here links the erisdb crate.
 [dev-dependencies]
-erisoverlaynetwork = { git = "https://github.com/Eriskii/ErisOverlayNetwork", tag = "v0.2.0" }
+erisoverlaynetwork = { git = "https://github.com/Eriskii/ErisOverlayNetwork", tag = "v0.3.0" }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 testcontainers-modules = { version = "0.15", features = ["postgres"] }

@@ -1,4 +1,4 @@
-package dev.eris.auth.client
+package dev.eris.eon.client
 
 import android.content.ComponentName
 import android.content.Context
@@ -11,33 +11,41 @@ import org.json.JSONArray
 import org.json.JSONObject
 
 /**
- * Asking ErisAuth on this phone to approve an app, as an app beside ErisAuth on a computer asks
+ * Asking ErisOverlayNetwork on this phone to approve an app, as an app beside ErisOverlayNetwork on a computer asks
  * over its agent socket. Vendor this file and [Wire] as they are.
  *
  * ```
- * ErisAuth.connect(context) { erisAuth ->
- *     if (erisAuth == null) return@connect askByTicket()          // no ErisAuth on this phone
- *     erisAuth.approve("erisdb", "Tasks", listOf("tasks:read"), serves = false, app = myEndpointIdHex) { answer ->
+ * ErisOverlayNetwork.connect(context) { eon ->
+ *     if (eon == null) return@connect askByTicket()          // no ErisOverlayNetwork on this phone
+ *     eon.approve("Tasks", mapOf("database/1" to listOf("tasks:read")), app = myEndpointIdHex) { answer ->
  *         when (answer) {
- *             is ErisAuth.Answer.Approved -> keep(answer.note, answer.snapshot)
- *             is ErisAuth.Answer.Denied -> tellThePerson(answer.why)
- *             is ErisAuth.Answer.Failed -> tellThePerson(answer.why)
+ *             is ErisOverlayNetwork.Answer.Approved -> keep(answer.note, answer.snapshot)
+ *             is ErisOverlayNetwork.Answer.Denied -> tellThePerson(answer.why)
+ *             is ErisOverlayNetwork.Answer.Failed -> tellThePerson(answer.why)
  *         }
  *     }
  * }
  * ```
  *
- * The person sees the app as Android names it, by its package and the SHA-256 of its signing
- * certificate, and approves it as asked, approves part of its grants, or denies it. An app for
- * ErisDB is approved only once the person has typed the ErisDB passphrase and ErisDB has accepted
- * the app's note. The note names [approve]'s `app`, the app's own Iroh key as its endpoint id in
- * hex, and only that key can use it. Answers arrive on a binder thread.
+ * An app asks for capabilities, named for what they are, `database/1`, `files/1`, not for the
+ * programs serving them. The person sees the app as Android names it, by its package and the
+ * SHA-256 of its signing certificate, and approves it as asked, approves part of its grants, or
+ * denies it. An app using something whose server takes a passphrase, such as a database, is
+ * approved only once the person has typed that passphrase and the server has accepted the app's
+ * note. The note names [approve]'s `app`, the app's own Iroh key as its endpoint id in hex, and
+ * only that key can use it. Answers arrive on a binder thread.
  */
-class ErisAuth private constructor(
+class ErisOverlayNetwork private constructor(
     private val context: Context,
     private val connection: ServiceConnection,
     private val service: IBinder,
 ) {
+    /**
+     * Serving [capability]: [single] when a mesh has one server of it, the most recently approved;
+     * [passphrase] when apps using it also need the server's passphrase.
+     */
+    data class Serves(val capability: String, val single: Boolean = false, val passphrase: Boolean = false)
+
     sealed class Answer {
         /** The app's note and a snapshot of the mesh, each as its JSON text. */
         data class Approved(val note: String, val snapshot: String) : Answer()
@@ -54,13 +62,13 @@ class ErisAuth private constructor(
                     }
                     reply.has("denied") -> Denied(reply.getString("denied"))
                     reply.has("error") -> Failed(reply.getString("error"))
-                    else -> Failed("ErisAuth answered something else: $json")
+                    else -> Failed("ErisOverlayNetwork answered something else: $json")
                 }
-            }.getOrElse { Failed("ErisAuth sent something unreadable") }
+            }.getOrElse { Failed("ErisOverlayNetwork sent something unreadable") }
         }
     }
 
-    /** One request to ErisAuth; [withdraw] takes it back. */
+    /** One request to ErisOverlayNetwork; [withdraw] takes it back. */
     inner class Request internal constructor(val id: String) {
         fun withdraw() {
             if (open.remove(id) != null) runCatching { Wire.withdraw(service, id) }
@@ -70,9 +78,9 @@ class ErisAuth private constructor(
     /** The requests waiting for an answer, each with what to do with it. */
     private val open = ConcurrentHashMap<String, (String) -> Unit>()
 
-    /** Should ErisAuth go away, every open request fails. */
+    /** Should ErisOverlayNetwork go away, every open request fails. */
     private val gone = IBinder.DeathRecipient {
-        val failed = """{"error":"ErisAuth went away"}"""
+        val failed = """{"error":"ErisOverlayNetwork went away"}"""
         open.keys.toList().forEach { id -> open.remove(id)?.invoke(failed) }
     }
 
@@ -89,31 +97,30 @@ class ErisAuth private constructor(
             }
         }
         runCatching { Wire.ask(service, id, line, callback) }.onFailure {
-            open.remove(id)?.invoke(JSONObject().put("error", "could not reach ErisAuth: ${it.message}").toString())
+            open.remove(id)?.invoke(JSONObject().put("error", "could not reach ErisOverlayNetwork: ${it.message}").toString())
         }
         return Request(id)
     }
 
     /**
-     * Ask to approve the app holding the key [app] (its endpoint id, in hex) for [service], under
-     * [name], with [grants], serving the service to other apps when [serves]. [listener] hears the
-     * answer once.
+     * Ask to approve the app holding the key [app] (its endpoint id, in hex), under [name], to use
+     * each capability in [uses] with the grants it lists, and to serve those in [serves].
+     * [listener] hears the answer once.
      */
     fun approve(
-        service: String,
         name: String,
-        grants: List<String>,
-        serves: Boolean,
+        uses: Map<String, List<String>>,
+        serves: List<Serves> = emptyList(),
         app: String,
         listener: (Answer) -> Unit,
-    ): Request = ask(approveJson(service, name, grants, serves, app)) { listener(Answer.parse(it)) }
+    ): Request = ask(approveJson(name, uses, serves, app)) { listener(Answer.parse(it)) }
 
-    /** The mesh as this phone's ErisAuth has it, as a snapshot's JSON text; null when it has none. */
+    /** The mesh as this phone's ErisOverlayNetwork has it, as a snapshot's JSON text; null when it has none. */
     fun snapshot(ready: (String?) -> Unit) {
         ask(SNAPSHOT) { reply -> ready(runCatching { JSONObject(reply).getJSONObject("snapshot").toString() }.getOrNull()) }
     }
 
-    /** Let ErisAuth go. Requests still open are withdrawn. */
+    /** Let ErisOverlayNetwork go. Requests still open are withdrawn. */
     fun close() {
         open.keys.toList().forEach { Request(it).withdraw() }
         runCatching { service.unlinkToDeath(gone, 0) }
@@ -121,37 +128,46 @@ class ErisAuth private constructor(
     }
 
     companion object {
-        const val PACKAGE = "dev.eris.auth"
-        const val ACTION = "dev.eris.auth.SIGN_IN"
+        const val PACKAGE = "dev.eris.eon"
+        const val ACTION = "dev.eris.eon.SIGN_IN"
 
         /** The version of the agent protocol these requests speak. */
-        const val VERSION = 2
+        const val VERSION = 3
 
         /** The agent socket's snapshot request line. */
         val SNAPSHOT: String get() = JSONObject().put("op", "snapshot").put("v", VERSION).toString()
 
         /** The agent socket's approve request line. */
-        fun approveJson(service: String, name: String, grants: List<String>, serves: Boolean, app: String): String =
-            JSONObject()
+        fun approveJson(name: String, uses: Map<String, List<String>>, serves: List<Serves>, app: String): String {
+            val used = JSONObject()
+            uses.forEach { (capability, grants) -> used.put(capability, JSONArray(grants)) }
+            val served = JSONArray()
+            serves.forEach { s ->
+                val one = JSONObject().put("capability", s.capability)
+                if (s.single) one.put("single", true)
+                if (s.passphrase) one.put("passphrase", true)
+                served.put(one)
+            }
+            return JSONObject()
                 .put("op", "approve")
                 .put("v", VERSION)
-                .put("service", service)
                 .put("name", name)
-                .put("grants", JSONArray(grants))
-                .put("serves", serves)
+                .put("uses", used)
+                .put("serves", served)
                 .put("app", app)
                 .toString()
+        }
 
         private fun intent() = Intent(ACTION).setPackage(PACKAGE)
 
-        /** Whether ErisAuth is installed here. */
+        /** Whether ErisOverlayNetwork is installed here. */
         fun isInstalled(context: Context): Boolean = context.packageManager.resolveService(intent(), 0) != null
 
         /**
-         * Connect to ErisAuth. [ready] hears it, or null when it is not installed or will not
+         * Connect to ErisOverlayNetwork. [ready] hears it, or null when it is not installed or will not
          * connect, in which case the app asks a device by ticket instead.
          */
-        fun connect(context: Context, ready: (ErisAuth?) -> Unit) {
+        fun connect(context: Context, ready: (ErisOverlayNetwork?) -> Unit) {
             val app = context.applicationContext
             val connection = object : ServiceConnection {
                 private var delivered = false
@@ -159,7 +175,7 @@ class ErisAuth private constructor(
                 override fun onServiceConnected(name: ComponentName, binder: IBinder) {
                     if (delivered) return
                     delivered = true
-                    ready(ErisAuth(app, this, binder))
+                    ready(ErisOverlayNetwork(app, this, binder))
                 }
 
                 override fun onServiceDisconnected(name: ComponentName) {}

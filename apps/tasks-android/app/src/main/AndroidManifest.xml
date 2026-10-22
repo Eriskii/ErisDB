@@ -6,10 +6,10 @@
     <!-- A due date passing is worth interrupting someone for. -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
-    <!-- ErisAuth is how this app gets into ErisDB. Android shows an app
+    <!-- ErisOverlayNetwork is how this app gets into ErisDB. Android shows an app
          only the packages it says it looks for. -->
     <queries>
-        <package android:name="dev.eris.auth" />
+        <package android:name="dev.eris.eon" />
     </queries>
 
     <!--

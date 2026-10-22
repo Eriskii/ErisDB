@@ -1,6 +1,6 @@
-// Tasks and Lists in a real browser, signing in through a real ErisAuth and working against a
+// Tasks and Lists in a real browser, signing in through a real ErisOverlayNetwork and working against a
 // real ErisDB, every participant reaching the others through one Iroh relay. The tests act as
-// the person at the device (ErisAuth's socket, as its approval page does) and, where they look
+// the person at the device (ErisOverlayNetwork's socket, as its approval page does) and, where they look
 // at what ErisDB holds, as its operator over HTTP. Nothing is intercepted or simulated.
 "use strict";
 const { test, expect } = require("@playwright/test");
@@ -16,11 +16,14 @@ const APPS = {
   lists: { name: "Lists (Web)", client: "Lists (Web) v0.3", list: "#entries", label: body => body.name },
 };
 
+/** What Tasks and Lists use: the mesh's database. */
+const DATABASE = "database/1";
+
 const wanted = app => ["read", "create", "update", "delete"].map(action => `${app}:${action}`);
 
-/** One command to ErisAuth on the person's device. */
-async function erisauth(request, line) {
-  const response = await request.post("/harness/erisauth", { data: line });
+/** One command to ErisOverlayNetwork on the person's device. */
+async function eon(request, line) {
+  const response = await request.post("/harness/eon", { data: line });
   expect(response.ok()).toBe(true);
   return response.json();
 }
@@ -29,7 +32,7 @@ async function erisauth(request, line) {
 async function waiting(request) {
   let prompt;
   await expect.poll(async () => {
-    prompt = (await erisauth(request, { op: "state" })).approvals[0];
+    prompt = (await eon(request, { op: "state" })).approvals[0];
     return prompt ?? null;
   }, { timeout: 30_000 }).not.toBeNull();
   return prompt;
@@ -57,7 +60,7 @@ async function stored(request, app, label) {
 
 /** Open a ticket on the device, as "Add a browser app" does, and hand it to the page. */
 async function askByTicket(page, request) {
-  const opened = await erisauth(request, { op: "add_app" });
+  const opened = await eon(request, { op: "add_app" });
   expect(opened.ticket).toMatch(/^eris:\/\/pair\//);
   await page.locator("#cfg-ticket").fill(opened.ticket);
   await page.locator("#cfg-pair").click();
@@ -90,10 +93,11 @@ for (const app of ["tasks", "lists"]) {
     const facet = await page.evaluate(() => FACET_BODY);
     expect(await registration(request, app)).toBeUndefined();
 
-    // Both screens show the same fingerprint, and the device knows the app by its key.
+    // Both screens show the same fingerprint, and the device knows the app by its key. It asks
+    // to use the database, serving nothing, so approving it takes the database's passphrase.
     const prompt = await askByTicket(page, request);
     const id = await appId(page);
-    expect(prompt).toMatchObject({ kind: "app", via: "ticket", name, key: id, service: "erisdb", grants: wanted(app), serves: false, passphrase: true });
+    expect(prompt).toMatchObject({ kind: "app", via: "ticket", name, key: id, uses: { [DATABASE]: wanted(app) }, serves: [], passphrase: true });
     await expect(page.locator("#pair-fingerprint")).toHaveText(prompt.fingerprint);
     await expect(page.locator("#pair-wait-who")).toHaveText("laptop");
 
@@ -103,11 +107,11 @@ for (const app of ["tasks", "lists"]) {
     await expect(page.locator("#pair-wait")).toBeVisible();
 
     // A wrong passphrase lets the person try again, and the app hears nothing until ErisDB accepts.
-    const wrong = await erisauth(request, { op: "decide", id: prompt.id, passphrase: "a wrong guess" });
+    const wrong = await eon(request, { op: "decide", id: prompt.id, passphrase: "a wrong guess" });
     expect(wrong.error).toBe("wrong_passphrase");
-    expect((await erisauth(request, { op: "state" })).approvals.map(a => a.id)).toEqual([prompt.id]);
+    expect((await eon(request, { op: "state" })).approvals.map(a => a.id)).toEqual([prompt.id]);
     await expect(page.locator("#pair-wait")).toBeVisible();
-    expect(await erisauth(request, { op: "decide", id: prompt.id, passphrase: world.passphrase })).toEqual({ ok: true });
+    expect(await eon(request, { op: "decide", id: prompt.id, passphrase: world.passphrase })).toEqual({ ok: true });
     await expect(page.locator("#pair-wait")).toBeHidden({ timeout: 30_000 });
     await expect(page.locator("body")).not.toHaveClass(/signed-out/);
     await expect(page.locator("#cfg-state")).toContainText("laptop");
@@ -148,8 +152,8 @@ for (const app of ["tasks", "lists"]) {
 
     // The person revokes the app's note on the device: ErisDB cuts it off at once, and the
     // page says so.
-    const note = (await erisauth(request, { op: "state" })).notes.find(note => note.app === id);
-    expect(await erisauth(request, { op: "revoke", note: note.id })).toEqual({ ok: true });
+    const note = (await eon(request, { op: "state" })).notes.find(note => note.app === id);
+    expect(await eon(request, { op: "revoke", note: note.id })).toEqual({ ok: true });
     await expect(page.locator("#status")).toContainText("no longer lets this app in", { timeout: 30_000 });
     await expect(page.locator("#pair-msg")).toContainText("revoked");
     // Its next request fails the same way, and what it tried to write waits on this device.
@@ -164,7 +168,7 @@ for (const app of ["tasks", "lists"]) {
     // write that waited lands.
     const again = await askByTicket(page, request);
     expect(again.key).toBe(id);
-    expect(await erisauth(request, { op: "decide", id: again.id, passphrase: world.passphrase })).toEqual({ ok: true });
+    expect(await eon(request, { op: "decide", id: again.id, passphrase: world.passphrase })).toEqual({ ok: true });
     await expect.poll(async () => (await stored(request, app, refused))?.source.addr, { timeout: 30_000 }).toBe("iroh:" + id);
     await expect(page.locator("#status")).not.toContainText("no longer lets this app in");
 
@@ -180,7 +184,7 @@ for (const app of ["tasks", "lists"]) {
 test("the person approves part of what an app asks, and the app offers only that", async ({ page, request }) => {
   await page.goto("/lists/");
   const prompt = await askByTicket(page, request);
-  const decided = await erisauth(request, { op: "decide", id: prompt.id, grants: ["lists:read"], passphrase: world.passphrase });
+  const decided = await eon(request, { op: "decide", id: prompt.id, grants: { [DATABASE]: ["lists:read"] }, passphrase: world.passphrase });
   expect(decided).toEqual({ ok: true });
   await expect(page.locator("#perm-banner")).toContainText("Read-only", { timeout: 30_000 });
   await expect(page.locator("#add-card")).toBeHidden();
@@ -197,12 +201,12 @@ test("a ticket that is not one is refused, and the person saying no gives the ap
 
   const prompt = await askByTicket(page, request);
   const id = await appId(page);
-  expect(await erisauth(request, { op: "deny", id: prompt.id })).toEqual({ ok: true });
+  expect(await eon(request, { op: "deny", id: prompt.id })).toEqual({ ok: true });
   await expect(page.locator("#pair-msg")).toContainText("said no", { timeout: 30_000 });
   await expect(page.locator("#pair-wait")).toBeHidden();
   await expect(page.locator("body")).toHaveClass(/signed-out/);
   expect(await page.evaluate(() => localStorage.getItem("erisdb.tasks.config"))).toBeNull();
-  expect((await erisauth(request, { op: "state" })).notes.some(note => note.app === id)).toBe(false);
+  expect((await eon(request, { op: "state" })).notes.some(note => note.app === id)).toBe(false);
 });
 
 test("writes made while ErisDB is away wait on the device, outlive a reload, and land once it is back", async ({ context, request }) => {
@@ -211,7 +215,7 @@ test("writes made while ErisDB is away wait on the device, outlive a reload, and
     const page = pages[app] = await context.newPage();
     await page.goto(`/${app}/`);
     const prompt = await askByTicket(page, request);
-    expect(await erisauth(request, { op: "decide", id: prompt.id, passphrase: world.passphrase })).toEqual({ ok: true });
+    expect(await eon(request, { op: "decide", id: prompt.id, passphrase: world.passphrase })).toEqual({ ok: true });
     await expect(page.locator("#status")).toContainText("live", { timeout: 30_000 });
   }
   // ErisDB goes away, and the apps' schemas with it.

@@ -13,7 +13,7 @@ module.exports = defineConfig({
   webServer: {
     command: "node tests/browser/server.cjs",
     url: "http://127.0.0.1:18770/ready",
-    timeout: 1_800_000, // Includes cold Rust builds of ErisDB, ErisAuth and the relay.
+    timeout: 1_800_000, // Includes cold Rust builds of ErisDB, ErisOverlayNetwork and the relay.
     reuseExistingServer: false,
     // The harness removes its database container and scratch directories as it stops.
     gracefulShutdown: { signal: "SIGTERM", timeout: 30_000 },

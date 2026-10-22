@@ -30,7 +30,8 @@ pub struct Installation {
     pub device: String,
     /// The id of the note it was approved with.
     pub note: String,
-    /// What the note approved: the most the installation can ever hold.
+    /// What the note granted it in the database: the most the installation
+    /// can ever hold.
     pub approved: Vec<String>,
     /// What it holds now.
     pub grants: Vec<String>,
@@ -95,10 +96,11 @@ pub async fn authorize(pool: &PgPool, mesh: Option<&Mesh>, cap: &mut Capability)
 }
 
 /// Enroll the app `note` approves: its active installation takes the note's
-/// device, id and grants, or a new one is made with them. A revoked
-/// installation stays revoked; enrolling again makes another.
+/// device, id and grants in the database, or a new one is made with them. A
+/// revoked installation stays revoked; enrolling again makes another.
 pub async fn enroll(pool: &PgPool, note: &Note, source: serde_json::Value) -> Result<Installation> {
     let app = note.app().to_string();
+    let grants = note.uses(crate::CAPABILITY).unwrap_or_default();
     let mut tx = Write::begin(pool, source).await?;
     // Serialize enrollments of one app, its first included.
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 7))")
@@ -121,7 +123,7 @@ pub async fn enroll(pool: &PgPool, note: &Note, source: serde_json::Value) -> Re
             .bind(&note.body.name)
             .bind(note.device().to_string())
             .bind(note.id.to_string())
-            .bind(&note.body.grants)
+            .bind(grants)
             .fetch_one(tx.db())
             .await?,
             "updated",
@@ -136,7 +138,7 @@ pub async fn enroll(pool: &PgPool, note: &Note, source: serde_json::Value) -> Re
             .bind(&app)
             .bind(note.device().to_string())
             .bind(note.id.to_string())
-            .bind(&note.body.grants)
+            .bind(grants)
             .fetch_one(tx.db())
             .await?,
             "created",

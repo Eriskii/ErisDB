@@ -13,7 +13,7 @@ cargo build --release --manifest-path clients/mcp/Cargo.toml
 
 ## Sign in
 
-Where ErisAuth runs:
+Where `eon` runs:
 
 ```sh
 erisdb-mcp sign-in --grant tasks:read,tasks:create,meta:facets:read
@@ -21,10 +21,11 @@ erisdb-mcp sign-in --grant tasks:read,tasks:create,meta:facets:read
 erisdb-mcp
 ```
 
-`sign-in` asks this machine's ErisAuth to let the app into ErisDB with those
-permissions, under the name `erisdb-mcp (PROFILE)` unless `--name` says
-otherwise. The person approves all of them or fewer on the device and types
-ErisDB's passphrase there; ErisAuth enrolls the app and answers. `sign-in` then
+`sign-in` asks this machine's `eon` to approve the app to use the mesh's
+database, `database/1`, with those permissions, under the name
+`erisdb-mcp (PROFILE)` unless `--name` says otherwise. The person approves all
+of them or fewer on the device and types ErisDB's passphrase there; `eon`
+enrolls the app at ErisDB and answers. `sign-in` then
 keeps the app's key and where ErisDB is in a profile. Starting the client needs
 no token, URL or file-path setup.
 
@@ -182,9 +183,9 @@ than the app does, and stops working when the app is cut off.
 `cargo test` runs the e2e suite: real Postgres via testcontainers (Docker
 required), a real `erisdb` binary joined to a mesh and serving over Iroh, a
 device node built from the mesh library in the test process, and the erisdb-mcp
-binary as a real subprocess driven over its stdio. ErisAuth is a stand-in on
-its agent socket that signs the note and enrolls it from the device's endpoint,
-as ErisAuth does once the person says yes. Every endpoint is on loopback. No
+binary as a real subprocess driven over its stdio. `eon` is a stand-in on its
+agent socket that signs the note and enrolls it from the device's endpoint over
+`eris-enroll/0`, as `eon` does once the person says yes. Every endpoint is on loopback. No
 mocks.
 
 Nothing in the suite links the erisdb crate — the core is a process, not a

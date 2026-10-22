@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Exercise the launcher with real processes, Docker PostgreSQL, CLI and HTTP.
 
-ErisAuth is a stand-in (erisdb/examples/stand_in_erisauth.rs): one device in a mesh of its
+ErisOverlayNetwork is a stand-in (erisdb/examples/stand_in_eon.rs): one device in a mesh of its
 own on loopback endpoints, approving what the launcher's `erisdb join` asks.
 """
 
@@ -30,22 +30,22 @@ PASSPHRASE = "a launcher passphrase"
 
 
 @contextmanager
-def erisauth():
-    """A stand-in ErisAuth listening under a runtime directory of its own."""
+def eon():
+    """A stand-in ErisOverlayNetwork listening under a runtime directory of its own."""
     # Built as the launcher builds ErisDB: as locked, from the filesystem root.
     subprocess.run(["cargo", "build", "--locked", "--manifest-path", ROOT / "erisdb/Cargo.toml",
-                    "--example", "stand_in_erisauth", "--target-dir", ROOT / "erisdb/target"],
+                    "--example", "stand_in_eon", "--target-dir", ROOT / "erisdb/target"],
                    cwd=ROOT.anchor, check=True)
-    with tempfile.TemporaryDirectory(prefix="erisdb-erisauth-") as runtime:
-        process = subprocess.Popen([ROOT / "erisdb/target/debug/examples/stand_in_erisauth"],
+    with tempfile.TemporaryDirectory(prefix="erisdb-eon-") as runtime:
+        process = subprocess.Popen([ROOT / "erisdb/target/debug/examples/stand_in_eon"],
                                    env={**os.environ, "XDG_RUNTIME_DIR": runtime},
                                    stdout=subprocess.DEVNULL)
         try:
-            socket_path = Path(runtime) / "erisauth/agent.sock"
+            socket_path = Path(runtime) / "eon/agent.sock"
             until = time.monotonic() + 60
             while not socket_path.exists():
                 if time.monotonic() >= until or process.poll() is not None:
-                    raise AssertionError("the stand-in ErisAuth never listened")
+                    raise AssertionError("the stand-in ErisOverlayNetwork never listened")
                 time.sleep(0.1)
             yield {"XDG_RUNTIME_DIR": runtime, "ERIS_NETWORK": "loopback"}
         finally:
@@ -141,7 +141,7 @@ class LauncherTests(unittest.TestCase):
                 resources.callback(subprocess.run, ["docker", "run", "--rm", "--volume", f"{base}:/cleanup",
                     "--entrypoint", "chown", "postgres:17-alpine", "-R", f"{os.getuid()}:{os.getgid()}",
                     "/cleanup"], check=True, capture_output=True)
-                mesh = resources.enter_context(erisauth())
+                mesh = resources.enter_context(eon())
 
                 def start(joining=False, **env):
                     session = Session(directory, unused_port(), **mesh, **env)
@@ -228,7 +228,7 @@ class LauncherTests(unittest.TestCase):
             resources.callback(subprocess.run, ["docker", "run", "--rm", "--volume", f"{base}:/cleanup",
                 "--entrypoint", "chown", "postgres:17-alpine", "-R", f"{os.getuid()}:{os.getgid()}",
                 "/cleanup"], check=True, capture_output=True)
-            mesh = resources.enter_context(erisauth())
+            mesh = resources.enter_context(eon())
             session = Session(base / "db", unused_port(), terminal=True, **mesh)
             resources.callback(session.close)
             printed = session.read_until("New passphrase: ", timeout=600)
@@ -277,7 +277,7 @@ class LauncherTests(unittest.TestCase):
                 "executable": "/bin/sh", "args": ["-c", "cat"], "environment": {}, "timeout_secs": 10,
                 "operations": {"say": {"description": "Say it back", "permission": "echo:say",
                                        "request_schema": {"type": "object"}}}}))
-            mesh = resources.enter_context(erisauth())
+            mesh = resources.enter_context(eon())
             session = Session(directory, unused_port(), cwd=outer, **mesh)
             resources.callback(session.close)
             started = session.joins() + session.read_until("erisdb> ", timeout=600)

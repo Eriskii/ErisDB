@@ -25,7 +25,7 @@
   BarcodeDetector reads the <video> element directly with no canvas and
   no blob: URL in between.
 -->
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'wasm-unsafe-eval' 'sha256-eg7Wab0vd9XQsFfsaPMkzSzVxPeKNrwJk7vbEKyhuNc=' 'sha256-Vfq1PF3DPATFB0XIQXROOkC8viDzTX51wfRWOu9p8l0='; style-src 'unsafe-inline'; connect-src * ws: wss:; base-uri 'none'; form-action 'none'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'wasm-unsafe-eval' 'sha256-bLxLYGBScL8J+XeTkRI+WMf3qw7a9KrDl43xcGpn81s=' 'sha256-6Cij06yg6J2BBBppYGBOr8O7LguPYO6xgi/QS8HtKRw='; style-src 'unsafe-inline'; connect-src * ws: wss:; base-uri 'none'; form-action 'none'">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>ErisDB · lists</title>
 <style>
@@ -160,9 +160,9 @@
       <summary>connection</summary>
       <div class="row-s">
         <div id="pair-intro">
-          <h2 class="pairhead">Sign in through ErisAuth</h2>
+          <h2 class="pairhead">Sign in through ErisOverlayNetwork</h2>
           <div class="hint">On a device in your mesh, choose <b>Add a browser app</b> in
-            ErisAuth (or run <code>erisauth add-app</code>) and scan or paste the ticket it
+            ErisOverlayNetwork (or run <code>eon add-app</code>) and scan or paste the ticket it
             shows. The ticket grants nothing on its own: this app asks for what it needs, and
             you approve it on that device with ErisDB's passphrase.</div>
         </div>
@@ -198,7 +198,7 @@
   </div>
 </main>
 
-<script src="../shared/erisdb-web/erisdb_web.js" integrity="sha256-eg7Wab0vd9XQsFfsaPMkzSzVxPeKNrwJk7vbEKyhuNc="></script>
+<script src="../shared/erisdb-web/erisdb_web.js" integrity="sha256-bLxLYGBScL8J+XeTkRI+WMf3qw7a9KrDl43xcGpn81s="></script>
 <script>
 "use strict";
 // The facet name is the permission namespace, so it carries no version:
@@ -295,7 +295,7 @@ if (typeof selected !== "string") selected = null;
 // defines `ErisDBWeb`; the module itself is fetched under the integrity
 // below and compiled once.
 const WASM = "../shared/erisdb-web/erisdb_web_bg.wasm";
-const WASM_INTEGRITY = "sha256-PA1r6BZMq4ik/FB6WLe41qP53gU51deew+c0oBAJB4k=";
+const WASM_INTEGRITY = "sha256-Wn9TxpUaEq94CuhJ1Ejvr4L4fQcjs7AOijmYoaqQm/Y=";
 
 let webLoading = null;
 function erisdbWeb() {
@@ -416,7 +416,7 @@ async function loadPermissions() {
 function cutOff() {
   setStatus("ErisDB no longer lets this app in · sign in again");
   pairMsg("ErisDB refused this app: its approval was revoked, or the device that gave it " +
-    "left the mesh. Sign in again with a new ticket from ErisAuth.", "bad");
+    "left the mesh. Sign in again with a new ticket from ErisOverlayNetwork.", "bad");
   $("#settings").open = true;
 }
 
@@ -443,7 +443,7 @@ function signOut() {
 }
 
 // ---------------------------------------------------------------- signing in
-// A ticket is `eris://pair/…`, shown by ErisAuth's "Add a browser app" on a
+// A ticket is `eris://pair/…`, shown by ErisOverlayNetwork's "Add a browser app" on a
 // device in the person's mesh: the device, the relay that reaches it, and a
 // one-time code. The code is worth a request and nothing more:
 //
@@ -514,7 +514,7 @@ async function resumeSignIn(saved) {
 async function awaitAnswer(mine) {
   const { handle } = mine;
   showWaiting(handle.host,
-    `Check that ErisAuth on ${handle.host} shows this same code, then approve there ` +
+    `Check that ErisOverlayNetwork on ${handle.host} shows this same code, then approve there ` +
     "with ErisDB's passphrase.", handle.fingerprint);
   let approval;
   try { approval = await handle.approval(); }
@@ -525,7 +525,7 @@ async function awaitAnswer(mine) {
   if (!mine.live) return;
   endSignIn();
   if (!approval) {
-    failSignIn(`ErisAuth on ${handle.host} said no, so this app was given nothing. ` +
+    failSignIn(`ErisOverlayNetwork on ${handle.host} said no, so this app was given nothing. ` +
       "Open a new ticket there to ask again.");
     return;
   }
@@ -539,23 +539,23 @@ async function awaitAnswer(mine) {
 function ticketError(e) {
   if (e?.code === "no_relay") {
     return "This ticket names no relay, and a browser reaches a device only through one. " +
-      "Open a new ticket in ErisAuth on a device that is online.";
+      "Open a new ticket in ErisOverlayNetwork on a device that is online.";
   }
-  return `This ticket is damaged or is not one from ErisAuth (${e?.message ?? e}). ` +
-    `A ticket starts with ${PAIR_PREFIX}; paste it again, or open a new one in ErisAuth.`;
+  return `This ticket is damaged or is not one from ErisOverlayNetwork (${e?.message ?? e}). ` +
+    `A ticket starts with ${PAIR_PREFIX}; paste it again, or open a new one in ErisOverlayNetwork.`;
 }
 
 /** Why a sign-in ended without an answer. */
 function signInError(e, who) {
   switch (e?.code) {
     case "unreachable":
-      return `Could not reach ${who} through its relay. Check that ErisAuth is running ` +
+      return `Could not reach ${who} through its relay. Check that ErisOverlayNetwork is running ` +
         "there and that this device is online, then try again.";
     case "used":
       return "That ticket has been used already: each one lets in one app, once. " +
-        "Open a new one in ErisAuth.";
+        "Open a new one in ErisOverlayNetwork.";
     case "expired":
-      return "That ticket ran out before anyone answered. Open a new one in ErisAuth.";
+      return "That ticket ran out before anyone answered. Open a new one in ErisOverlayNetwork.";
     default:
       return `${who} would not take this sign-in: ${e?.message ?? e}`;
   }
@@ -678,13 +678,13 @@ async function initScanning() {
   if (window.isSecureContext === false) {
     why = "Scanning needs the camera, and a browser only grants one over https or on " +
       "localhost. This page is plain http, so paste the ticket instead — " +
-      "ErisAuth shows it as text under the QR code.";
+      "ErisOverlayNetwork shows it as text under the QR code.";
   } else if (!navigator.mediaDevices?.getUserMedia) {
     why = "This browser gives the page no camera, so paste the ticket instead — " +
-      "ErisAuth shows it as text under the QR code.";
+      "ErisOverlayNetwork shows it as text under the QR code.";
   } else if (!await qrDecoderAvailable()) {
     why = "This browser has no built-in QR decoder — Chrome, Edge and the Android app " +
-      "do. Paste the ticket instead: ErisAuth shows it as text under the QR code.";
+      "do. Paste the ticket instead: ErisOverlayNetwork shows it as text under the QR code.";
   }
   scanAvailable = why === null;
   $("#scan-btn").hidden = !scanAvailable;
@@ -731,7 +731,7 @@ async function startScan() {
   const video = $("#cam");
   video.srcObject = camStream;
   try { await video.play(); } catch {}
-  pairMsg("point the camera at the QR code ErisAuth shows");
+  pairMsg("point the camera at the QR code ErisOverlayNetwork shows");
   scanFrame(detector, video);
 }
 
@@ -746,7 +746,7 @@ async function scanFrame(detector, video) {
       typeof c.rawValue === "string" && c.rawValue.trim().startsWith(PAIR_PREFIX));
     if (hit) { stopScan(); signIn(hit.rawValue); return; }
     if (codes.length) {
-      pairMsg("that QR code is not a ticket from ErisAuth — choose Add a browser app there");
+      pairMsg("that QR code is not a ticket from ErisOverlayNetwork — choose Add a browser app there");
     }
   } catch {}                  // a frame read before the video has one
   if (scanning) scanTimer = setTimeout(() => scanFrame(detector, video), 120);
