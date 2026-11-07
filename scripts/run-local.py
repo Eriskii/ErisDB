@@ -198,7 +198,8 @@ def launch(args, resources):
     status = execute(["cargo", "build", "--locked", "--manifest-path", ROOT / "erisdb/Cargo.toml",
                       "--bin", "erisdb", "--target-dir", ROOT / "erisdb/target"], cwd=ROOT.anchor)
     if status:
-        raise RuntimeError("ErisDB build failed.")
+        raise RuntimeError("ErisDB build failed. If a build inside a workspace rewrote "
+                           "erisdb/Cargo.lock, git restore puts it back.")
     binary = ROOT / "erisdb/target/debug/erisdb"
     postgres = directory / "postgres"
     postgres.mkdir(exist_ok=True)

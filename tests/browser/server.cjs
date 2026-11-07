@@ -56,8 +56,11 @@ async function until(what, check, ms = 120_000) {
   }
 }
 
+// From the filesystem root, as scripts/run-local.py builds: Cargo reads configuration from every
+// directory above the one it runs in, and a workspace around this checkout that patches its
+// dependencies would otherwise rewrite the lockfiles.
 function cargo(args, env = {}) {
-  execFileSync("cargo", args, { cwd: root, stdio: "inherit", env: { ...process.env, ...env } });
+  execFileSync("cargo", args, { cwd: path.parse(root).root, stdio: "inherit", env: { ...process.env, ...env } });
 }
 
 /** A child that lives as long as the harness, its output on ours. */
@@ -201,7 +204,7 @@ async function serve(request, response) {
   const relayBinary = process.env.ERISDB_RELAY_BIN || path.join(target, "debug/erisdb-test-relay");
   if (!process.env.ERISDB_RELAY_BIN) cargo(["build", "--manifest-path", path.join(__dirname, "relay/Cargo.toml")], { CARGO_TARGET_DIR: target });
   const coreBinary = process.env.ERISDB_BIN || path.join(root, "erisdb/target/debug/erisdb");
-  if (!process.env.ERISDB_BIN) cargo(["build", "--manifest-path", "erisdb/Cargo.toml", "--bin", "erisdb"]);
+  if (!process.env.ERISDB_BIN) cargo(["build", "--manifest-path", path.join(root, "erisdb/Cargo.toml"), "--bin", "erisdb"]);
   const eonBinary = process.env.EON_BIN || path.join(target, "debug/eon");
   if (!process.env.EON_BIN) {
     if (!fs.existsSync(path.join(eonSource, "eon/Cargo.toml"))) {
